@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 from asyncio import to_thread
+from copy import deepcopy
+from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -68,6 +70,28 @@ class ConnectionRegistry:
 
 
 registry = ConnectionRegistry()
+dispatched_contracts: dict[str, dict[str, Any]] = {}
+
+
+def _remember_dispatched_contract(frame: dict[str, Any]) -> None:
+    """Cache the cloud-generated dispatch by goal_id for later UI context."""
+    goal_id = frame.get("goal_id")
+    if isinstance(goal_id, str) and goal_id:
+        dispatched_contracts[goal_id] = deepcopy(frame)
+
+
+def _knew_from_contract(contract: dict[str, Any] | None) -> dict[str, Any]:
+    """Build the UI-facing personalization summary from a dispatch contract."""
+    constraints = contract.get("constraints", {}) if contract else {}
+    hard = constraints.get("hard", {}) if isinstance(constraints, dict) else {}
+    soft = constraints.get("soft", {}) if isinstance(constraints, dict) else {}
+    context_hints = contract.get("context_hints", {}) if contract else {}
+    return {
+        "dietary": list(hard.get("dietary", [])) if isinstance(hard, dict) else [],
+        "dislikes": list(soft.get("dislikes", [])) if isinstance(soft, dict) else [],
+        "prefer": list(soft.get("prefer", [])) if isinstance(soft, dict) else [],
+        "notes": str(context_hints.get("notes", "")) if isinstance(context_hints, dict) else "",
+    }
 
 
 @app.websocket("/ws")
@@ -111,11 +135,13 @@ async def route_message(sender_role: Role, message: dict) -> None:
 
     if sender_role == "device" and message_type == "plan_ready":
         plan_ready = PlanReady(**message)
+        payload = _dump_model(plan_ready.payload)
+        payload["knew"] = _knew_from_contract(dispatched_contracts.get(plan_ready.goal_id))
         present_plan = PresentPlan(
             goal_id=plan_ready.goal_id,
             correlation_id=plan_ready.correlation_id,
             task_status=plan_ready.task_status,
-            payload=plan_ready.payload,
+            payload=payload,
             display_hints={"surface": "meal_plan"},
         )
         await registry.send_to("ui", _dump_model(present_plan))
@@ -142,4 +168,5 @@ async def route_message(sender_role: Role, message: dict) -> None:
 async def handle_user_goal(text: str) -> None:
     """Turn a user goal into a graph-produced ``dispatch`` and send it."""
     frame = await to_thread(build_dispatch_frame, text)
+    _remember_dispatched_contract(frame)
     await registry.send_to("device", frame)

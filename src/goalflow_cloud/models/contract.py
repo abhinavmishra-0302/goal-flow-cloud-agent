@@ -18,7 +18,7 @@ Design notes
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, Union
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field
 
@@ -160,6 +160,8 @@ class PlanPayload(BaseModel):
     plan: list[PlanItem]
     proposals: list[PlanProposal]
     safety: SafetyResult
+    impact: dict[str, Any] | None = None
+    knew: dict[str, Any] | None = None
 
 
 class PlanReady(BaseModel):
