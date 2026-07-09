@@ -1,0 +1,20 @@
+{
+  "family_id": "family-hub-demo",
+  "members": [
+    { "name": "Priya", "role": "parent" },
+    { "name": "Aarav", "role": "son" }
+  ],
+  "hard": {
+    "allergens": [],
+    "dietary": ["no_pork"],
+    "medical": []
+  },
+  "soft": {
+    "dislikes": ["mushrooms"],
+    "prefer": ["more_vegetables", "more_protein"],
+    "notes": ["vegetarian weekday dinners", "reduce processed food"]
+  },
+  "context": [
+    "son Aarav has football practice Wednesday 18:00"
+  ]
+}

@@ -1,0 +1,25 @@
+[project]
+name = "goalflow-cloud-agent"
+version = "0.1.0"
+description = "GoalFlow POC cloud agent: conversation, memory, goal decomposition, and WebSocket hub between UI and on-device agent."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "websockets",
+    "langgraph",
+    "langchain-openai",
+    "pydantic",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
