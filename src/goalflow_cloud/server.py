@@ -1,29 +1,24 @@
-"""FastAPI app + WebSocket hub for GoalFlow M1."""
+"""FastAPI app + WebSocket hub for GoalFlow."""
 
 from __future__ import annotations
 
 import logging
+from asyncio import to_thread
 from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
-from goalflow_cloud.memory.store import load_family_profile
+from goalflow_cloud.graph.nodes import build_dispatch_frame
 from goalflow_cloud.models.contract import (
     Approval,
-    Dispatch,
-    DispatchConstraints,
-    DispatchScope,
-    HardConstraints,
     Hello,
     HelloAck,
     PlanReady,
     PresentPlan,
     Proposal,
     Role,
-    SoftConstraints,
     Status,
-    TimeWindow,
     UserGoal,
 )
 
@@ -145,36 +140,6 @@ async def route_message(sender_role: Role, message: dict) -> None:
 
 
 async def handle_user_goal(text: str) -> None:
-    """Turn a user goal into a hardcoded M1 ``dispatch`` and send it."""
-    del text
-
-    profile = load_family_profile()
-    hard = profile.get("hard", {})
-    soft = profile.get("soft", {})
-    context = profile.get("context", [])
-
-    dispatch = Dispatch(
-        goal_id="meal-2026-w29",
-        objective="healthier family dinners, less food waste",
-        scope=DispatchScope(meal="dinner", days=["Mon", "Tue", "Wed", "Thu", "Fri"]),
-        time_window=TimeWindow(start="2026-07-13", end="2026-07-17"),
-        constraints=DispatchConstraints(
-            hard=HardConstraints(
-                allergens=hard.get("allergens", []),
-                dietary=hard.get("dietary", []),
-                medical=hard.get("medical", []),
-            ),
-            soft=SoftConstraints(
-                dislikes=soft.get("dislikes", []),
-                prefer=soft.get("prefer", []),
-            ),
-        ),
-        optimization=["reduce_processed", "reduce_waste"],
-        autonomy="propose_all",
-        context_hints={"notes": "; ".join(context) if context else "son has sports Wednesday"},
-        reply_to="kb/device/meal-2026-w29",
-    )
-
-    frame = _dump_model(dispatch)
-    frame["correlation_id"] = "disp-001"
+    """Turn a user goal into a graph-produced ``dispatch`` and send it."""
+    frame = await to_thread(build_dispatch_frame, text)
     await registry.send_to("device", frame)

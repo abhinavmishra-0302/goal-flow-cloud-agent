@@ -11,6 +11,7 @@ dependencies = [
     "websockets",
     "langgraph",
     "langchain-openai",
+    "python-dotenv",
     "pydantic",
 ]
 
