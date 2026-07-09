@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from goalflow_cloud.graph.nodes import build_dispatch_frame
 from goalflow_cloud.models.contract import (
     Approval,
+    Control,
     Hello,
     HelloAck,
     PlanReady,
@@ -131,6 +132,11 @@ async def route_message(sender_role: Role, message: dict) -> None:
     if sender_role == "ui" and message_type == "user_goal":
         user_goal = UserGoal(**message)
         await handle_user_goal(user_goal.text)
+        return
+
+    if sender_role == "ui" and message_type == "control":
+        Control(**message)
+        await registry.send_to("device", message)
         return
 
     if sender_role == "device" and message_type == "plan_ready":

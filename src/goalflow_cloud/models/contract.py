@@ -29,12 +29,13 @@ from pydantic import BaseModel, Field
 Role = Literal["ui", "device"]
 
 #: Task-status lifecycle:
-#: created -> planning -> awaiting_approval -> executing -> adapting -> done
+#: created -> planning -> awaiting_approval -> executing -> monitoring -> adapting -> done
 TaskStatus = Literal[
     "created",
     "planning",
     "awaiting_approval",
     "executing",
+    "monitoring",
     "adapting",
     "done",
 ]
@@ -70,6 +71,15 @@ class UserGoal(BaseModel):
 
     type: Literal["user_goal"] = "user_goal"
     text: str
+
+
+class Control(BaseModel):
+    """UI/operator -> cloud -> device: deterministic device control command."""
+
+    type: Literal["control"] = "control"
+    goal_id: str
+    command: Literal["advance_day", "reset"]
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +273,7 @@ ContractMessage = Annotated[
         Hello,
         HelloAck,
         UserGoal,
+        Control,
         Dispatch,
         PlanReady,
         PresentPlan,
