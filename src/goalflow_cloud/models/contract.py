@@ -30,7 +30,7 @@ Role = Literal["ui", "device"]
 #: auto  = reversible, do without asking (still reported);
 #: light = cheap/low-risk, one-tap approval;
 #: firm  = costly/irreversible (e.g. spends money), explicit approval required.
-Tier = Literal["auto", "light", "firm"]
+Tier = Literal["auto", "light", "firm", "adapt"]
 
 #: Task-status lifecycle (CONTRACT v2):
 #: created -> interpreting -> grounding -> planning -> checking ->

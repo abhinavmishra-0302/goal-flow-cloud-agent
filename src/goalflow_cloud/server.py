@@ -187,8 +187,17 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         while True:
             frame = await websocket.receive_json()
             log_frame("in", role, frame)
-            await route_message(role, frame)
+            try:
+                await route_message(role, frame)
+            except ValidationError:
+                # A single malformed/mismatched frame must NOT drop the whole
+                # connection — that closes the peer's socket and crashes the
+                # device. Log the offending frame and keep the session alive.
+                logger.exception(
+                    "frame_validation_error role=%s type=%s", role, frame.get("type")
+                )
     except ValidationError:
+        # Only the initial hello handshake reaches here now.
         logger.exception("websocket_protocol_error role=%s", role or "unknown")
         await websocket.close(code=1003, reason="invalid contract frame")
     except WebSocketDisconnect:
