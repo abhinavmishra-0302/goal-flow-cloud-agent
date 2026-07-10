@@ -47,17 +47,20 @@ def load_family_profile(path: Path = DEFAULT_PROFILE_PATH) -> dict[str, Any]:
 def hard_safety_block(profile: dict[str, Any]) -> dict[str, Any]:
     """Return the verbatim hard safety policy for constraints.hard.
 
-    TODO(v2-M1): shallow-copy profile["hard"] (defaulting missing keys per
-    models.contract.HardConstraints) WITHOUT any transformation of values —
-    this is the verbatim injection channel.
+    The values are intentionally not normalized or paraphrased. Pydantic's
+    HardConstraints model supplies defaults later when the Dispatch validates.
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    return dict(profile.get("hard", {}))
 
 
 def soft_bias_block(profile: dict[str, Any]) -> dict[str, Any]:
     """Return the soft-preference + family-context bundle for planning bias.
 
-    TODO(v2-M1): {"members": ..., "soft": ..., "context": ...} — fed to the
-    LLM as context; never safety-enforced.
+    This block is planning context only; the device Safety filter never enforces
+    it as policy.
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    return {
+        "members": list(profile.get("members", [])),
+        "soft": dict(profile.get("soft", {})),
+        "context": list(profile.get("context", [])),
+    }

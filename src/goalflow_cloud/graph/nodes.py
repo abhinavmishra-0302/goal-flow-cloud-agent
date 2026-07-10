@@ -25,12 +25,20 @@ Key invariants:
 from __future__ import annotations
 
 import logging
+from datetime import date
 from operator import add
 from typing import Annotated, Any, TypedDict
+from uuid import uuid4
 
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
-from langgraph.types import interrupt
+from langgraph.types import Command, interrupt
+from pydantic import BaseModel, Field, ValidationError
+
+from goalflow_cloud.config import get_settings
+from goalflow_cloud.memory.store import hard_safety_block, load_family_profile, soft_bias_block
+from goalflow_cloud.models.contract import Dispatch
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +74,30 @@ class GraphState(TypedDict, total=False):
     correlation_id: str
     #: Structured failure — LLM-only design: errors surface, never faked.
     error: str
+    approval_frame: dict[str, Any]
+    monitor_frame: dict[str, Any]
+    explanation: dict[str, Any]
+
+
+class InterpretedIntent(BaseModel):
+    """Structured LLM output for the generic goal interpreter."""
+
+    domain: str = Field(description="Short generic domain id, e.g. meal_plan, chores, errands.")
+    objective: str = Field(description="A concise normalized objective.")
+    success_criteria: list[str] = Field(default_factory=list)
+    scope: dict[str, Any] = Field(default_factory=dict)
+    time_window: dict[str, str] = Field(
+        description="ISO start/end dates or datetimes, relative to the supplied real today."
+    )
+
+
+def _event(state: GraphState, event: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "event": event,
+        "goal_id": state.get("goal_id"),
+        "correlation_id": state.get("correlation_id"),
+        "payload": payload or {},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +115,62 @@ def interpret_goal(state: GraphState) -> GraphState:
     - On LLM failure: set state["error"] (routes to explain_block). NO
       scripted fallback.
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    goal_text = state.get("goal_text", "").strip()
+    logger.info("graph_node_enter node=interpret_goal")
+    if not goal_text:
+        return {
+            "error": "user_goal.text is required",
+            "task_status": "interpreting",
+            "event_log": [_event(state, "interpret_error", {"error": "empty_goal"})],
+        }
+
+    settings = get_settings()
+    today = date.today()
+    try:
+        llm = ChatOpenAI(
+            model=settings.openrouter_model,
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+            temperature=0,
+            timeout=45,
+            max_retries=1,
+        )
+        structured_llm = llm.with_structured_output(InterpretedIntent, method="function_calling")
+        intent = structured_llm.invoke(
+            [
+                (
+                    "system",
+                    "You are the GoalFlow cloud goal interpreter. Convert the user's natural-language "
+                    "goal into a generic, domain-agnostic task intent. Do not invent safety constraints. "
+                    f"Real today is {today.isoformat()}; resolve phrases like this week, today, "
+                    "tomorrow, weekend, next week into time_window.start/end ISO dates relative to it. "
+                    "For actionable goals, the start date must be real today or later; interpret "
+                    "'this week' as the remaining week starting today. "
+                    "Keep scope flexible and generic for the device planner.",
+                ),
+                ("human", goal_text),
+            ]
+        )
+        intent_dict = intent.model_dump(mode="json")
+        if not intent_dict.get("time_window", {}).get("start") or not intent_dict.get("time_window", {}).get("end"):
+            return {
+                "error": "LLM goal interpretation failed: missing time_window.start/end",
+                "task_status": "interpreting",
+                "event_log": [_event(state, "interpret_error", {"error": "missing_time_window"})],
+            }
+        logger.info("graph_node_exit node=interpret_goal domain=%s", intent_dict.get("domain"))
+        return {
+            "intent": intent_dict,
+            "task_status": "interpreting",
+            "event_log": [_event(state, "intent_interpreted", {"domain": intent_dict.get("domain")})],
+        }
+    except Exception as exc:  # LLM-only: fail loudly, never synthesize a fallback intent.
+        logger.exception("graph_node_error node=interpret_goal")
+        return {
+            "error": f"LLM goal interpretation failed: {type(exc).__name__}: {exc}",
+            "task_status": "interpreting",
+            "event_log": [_event(state, "interpret_error", {"error": str(exc)})],
+        }
 
 
 def load_memory(state: GraphState) -> GraphState:
@@ -95,7 +182,19 @@ def load_memory(state: GraphState) -> GraphState:
       budget_cap, quiet_hours): kept as DATA for verbatim injection.
     - profile["soft"] + members + context: planning bias only.
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    logger.info("graph_node_enter node=load_memory")
+    profile = load_family_profile()
+    memory = {
+        "family_id": profile.get("family_id"),
+        "hard": hard_safety_block(profile),
+        "bias": soft_bias_block(profile),
+    }
+    logger.info("graph_node_exit node=load_memory family_id=%s", memory.get("family_id"))
+    return {
+        "memory": memory,
+        "task_status": "grounding",
+        "event_log": [_event(state, "memory_loaded", {"family_id": memory.get("family_id")})],
+    }
 
 
 def build_contract(state: GraphState) -> GraphState:
@@ -107,7 +206,51 @@ def build_contract(state: GraphState) -> GraphState:
     - autonomy = "tiered"; mint goal_id + correlation_id.
     - Validate via Dispatch(**frame); stash the frame in state["contract"].
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    logger.info("graph_node_enter node=build_contract")
+    intent = state["intent"]
+    memory = state["memory"]
+    goal_id = state.get("goal_id") or str(uuid4())
+    correlation_id = state.get("correlation_id") or str(uuid4())
+
+    context = {
+        "family_id": memory.get("family_id"),
+        **memory.get("bias", {}),
+    }
+    frame = {
+        "type": "dispatch",
+        "goal_id": goal_id,
+        "correlation_id": correlation_id,
+        "domain": intent["domain"],
+        "objective": intent["objective"],
+        "success_criteria": intent.get("success_criteria", []),
+        "constraints": {
+            "hard": memory.get("hard", {}),
+            "soft": memory.get("bias", {}).get("soft", {}),
+        },
+        "scope": intent.get("scope", {}),
+        "time_window": intent.get("time_window"),
+        "autonomy": "tiered",
+        "context": context,
+    }
+    try:
+        dispatch = Dispatch(**frame)
+    except ValidationError as exc:
+        logger.exception("graph_node_error node=build_contract")
+        return {
+            "error": f"Dispatch validation failed: {exc}",
+            "task_status": "checking",
+            "event_log": [_event(state, "dispatch_validation_error", {"error": str(exc)})],
+        }
+
+    contract = dispatch.model_dump(mode="json", exclude_none=True)
+    logger.info("graph_node_exit node=build_contract goal_id=%s", goal_id)
+    return {
+        "goal_id": goal_id,
+        "correlation_id": correlation_id,
+        "contract": contract,
+        "task_status": "planning",
+        "event_log": [_event(state, "dispatch_built", {"domain": contract.get("domain")})],
+    }
 
 
 def dispatch_to_device(state: GraphState) -> GraphState:
@@ -116,7 +259,11 @@ def dispatch_to_device(state: GraphState) -> GraphState:
     TODO(v2-M1): mark task_status="planning"; the hub sends the frame and
     relays the device's agent_event stream while the graph waits.
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    logger.info("graph_node_enter node=dispatch_to_device")
+    return {
+        "task_status": "planning",
+        "event_log": [_event(state, "dispatch_ready", {"goal_id": state.get("goal_id")})],
+    }
 
 
 def collect_plan(state: GraphState) -> GraphState:
@@ -125,7 +272,24 @@ def collect_plan(state: GraphState) -> GraphState:
     TODO(v2-M1): record payload into state["plan"]; extract proposals with
     requires_approval into state["pending_approvals"]; task_status="checking".
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    logger.info("graph_node_enter node=collect_plan")
+    incoming = interrupt(
+        {
+            "kind": "await_plan_ready",
+            "goal_id": state.get("goal_id"),
+            "correlation_id": state.get("correlation_id"),
+        }
+    )
+    payload = incoming.get("payload", incoming) if isinstance(incoming, dict) else {}
+    proposals = payload.get("proposals", []) if isinstance(payload, dict) else []
+    pending = [proposal for proposal in proposals if proposal.get("requires_approval", True)]
+    logger.info("graph_node_exit node=collect_plan pending_approvals=%s", len(pending))
+    return {
+        "plan": payload,
+        "pending_approvals": pending,
+        "task_status": "checking",
+        "event_log": [_event(state, "plan_collected", {"pending_approvals": len(pending)})],
+    }
 
 
 def hitl_approval(state: GraphState) -> GraphState:
@@ -139,8 +303,27 @@ def hitl_approval(state: GraphState) -> GraphState:
     user's approval decisions (Command(resume=...)). Nothing firm executes
     until this returns. ``interrupt`` imported above is the real primitive.
     """
-    _ = interrupt  # design anchor: this node is the interrupt() site
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    logger.info("graph_node_enter node=hitl_approval pending_approvals=%s", len(state.get("pending_approvals", [])))
+    decisions = interrupt(
+        {
+            "kind": "approval_required",
+            "goal_id": state.get("goal_id"),
+            "correlation_id": state.get("correlation_id"),
+            "pending_approvals": state.get("pending_approvals", []),
+            "plan": state.get("plan", {}),
+        }
+    )
+    if isinstance(decisions, dict) and "payload" in decisions:
+        decisions = decisions.get("payload", {}).get("decisions", [])
+    elif isinstance(decisions, dict) and "decisions" in decisions:
+        decisions = decisions["decisions"]
+    decisions = decisions or []
+    logger.info("graph_node_exit node=hitl_approval decisions=%s", len(decisions))
+    return {
+        "decisions": decisions,
+        "task_status": "awaiting_approval",
+        "event_log": [_event(state, "approval_received", {"decisions": len(decisions)})],
+    }
 
 
 def relay_decisions(state: GraphState) -> GraphState:
@@ -149,7 +332,26 @@ def relay_decisions(state: GraphState) -> GraphState:
     TODO(v2-M1): build the Approval frame from state["decisions"];
     task_status="executing" then "monitoring".
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    logger.info("graph_node_enter node=relay_decisions")
+    decisions = state.get("decisions")
+    if decisions is None:
+        decisions = [
+            {"proposal_id": proposal["proposal_id"], "approved": True}
+            for proposal in state.get("plan", {}).get("proposals", [])
+            if proposal.get("tier") == "auto"
+        ]
+    frame = {
+        "type": "approval",
+        "goal_id": state["goal_id"],
+        "correlation_id": state["correlation_id"],
+        "payload": {"decisions": decisions},
+    }
+    logger.info("graph_node_exit node=relay_decisions decisions=%s", len(decisions))
+    return {
+        "approval_frame": frame,
+        "task_status": "executing",
+        "event_log": [_event(state, "decisions_relay_ready", {"decisions": len(decisions)})],
+    }
 
 
 def monitor(state: GraphState) -> GraphState:
@@ -159,7 +361,34 @@ def monitor(state: GraphState) -> GraphState:
     (or an adaptation proposal) populates pending_approvals for the adapt
     loop; task_status="monitoring"|"adapting"|"done".
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    logger.info("graph_node_enter node=monitor")
+    incoming = interrupt(
+        {
+            "kind": "await_monitor_frame",
+            "goal_id": state.get("goal_id"),
+            "correlation_id": state.get("correlation_id"),
+        }
+    )
+    if not isinstance(incoming, dict):
+        return {"task_status": "monitoring"}
+
+    frame_type = incoming.get("type")
+    payload = incoming.get("payload", {})
+    update: GraphState = {
+        "monitor_frame": incoming,
+        "task_status": incoming.get("task_status", "monitoring"),
+        "event_log": [_event(state, "monitor_frame", {"type": frame_type})],
+    }
+    if frame_type == "proposal" and payload.get("requires_approval", True):
+        update["pending_approvals"] = [payload]
+        update["task_status"] = "adapting"
+    elif frame_type == "status":
+        if payload.get("material"):
+            update["task_status"] = "adapting"
+        if incoming.get("task_status") == "done":
+            update["task_status"] = "done"
+    logger.info("graph_node_exit node=monitor frame_type=%s task_status=%s", frame_type, update.get("task_status"))
+    return update
 
 
 def explain_block(state: GraphState) -> GraphState:
@@ -168,7 +397,20 @@ def explain_block(state: GraphState) -> GraphState:
     TODO(v2-M1): compose the explanation from safety.violations or
     state["error"]; never silently retry or fake a plan.
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    logger.info("graph_node_enter node=explain_block")
+    safety = state.get("plan", {}).get("safety", {})
+    violations = safety.get("violations", [])
+    message = state.get("error") or state.get("plan", {}).get("explanation") or "Plan blocked by safety policy."
+    explanation = {
+        "type": "blocked",
+        "message": message,
+        "violations": violations,
+    }
+    return {
+        "explanation": explanation,
+        "task_status": "done",
+        "event_log": [_event(state, "explain_block", explanation)],
+    }
 
 
 def finalize(state: GraphState) -> GraphState:
@@ -176,7 +418,11 @@ def finalize(state: GraphState) -> GraphState:
 
     TODO(v2-M1): summarize event_log for the Trace/Explain surface.
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    logger.info("graph_node_enter node=finalize")
+    return {
+        "task_status": "done",
+        "event_log": [_event(state, "finalized", {"events": len(state.get("event_log", []))})],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -186,22 +432,27 @@ def finalize(state: GraphState) -> GraphState:
 
 def route_after_interpret(state: GraphState) -> str:
     """error -> explain_block (LLM-only, fail loudly); else -> load_memory."""
-    # TODO(v2-M1): return "explain_block" if state.get("error") else "load_memory"
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    return "explain_block" if state.get("error") else "load_memory"
 
 
 def route_on_safety(state: GraphState) -> str:
     """After collect_plan: blocked -> explain_block; approvals pending ->
     hitl_approval; auto-tier only -> relay_decisions."""
-    # TODO(v2-M1): inspect state["plan"]["safety"]["gate"] + pending_approvals.
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    if state.get("plan", {}).get("safety", {}).get("gate") == "blocked":
+        return "explain_block"
+    if state.get("pending_approvals"):
+        return "hitl_approval"
+    return "relay_decisions"
 
 
 def route_on_monitor(state: GraphState) -> str:
     """After monitor: material change -> hitl_approval (adapt loop);
     done -> finalize; else keep monitoring."""
-    # TODO(v2-M1): inspect task_status / pending_approvals / material flag.
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    if state.get("pending_approvals") and state.get("task_status") == "adapting":
+        return "hitl_approval"
+    if state.get("task_status") == "done":
+        return "finalize"
+    return "monitor"
 
 
 # ---------------------------------------------------------------------------
@@ -274,17 +525,28 @@ def build_graph(checkpointer: Any | None = None) -> Any:
 def start_goal(graph: Any, goal_text: str, goal_id: str) -> dict[str, Any]:
     """Kick off a goal run; returns the dispatch frame for the hub to send.
 
-    TODO(v2-M1): graph.invoke({"goal_text": goal_text, "goal_id": goal_id},
-    config={"configurable": {"thread_id": goal_id}}) and pull
-    state["contract"] out (the run pauses at the device hand-off).
+    graph.invoke({"goal_text": goal_text, "goal_id": goal_id},
+    config={"configurable": {"thread_id": goal_id}}) and pull state["contract"]
+    out after the run pauses at the device hand-off.
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    config = {"configurable": {"thread_id": goal_id}}
+    graph.invoke(
+        {"goal_text": goal_text, "goal_id": goal_id, "task_status": "created", "event_log": []},
+        config=config,
+    )
+    state = graph.get_state(config).values
+    if state.get("error"):
+        return dict(state)
+    if not state.get("contract"):
+        raise RuntimeError("graph did not produce a dispatch contract")
+    return dict(state)
 
 
 def resume_goal(graph: Any, goal_id: str, resume_value: Any) -> dict[str, Any]:
     """Resume a paused run (plan_ready arrival, approval, adapt decision).
 
-    TODO(v2-M1): graph.invoke(Command(resume=resume_value),
-    config={"configurable": {"thread_id": goal_id}}).
+    Resume with Command(resume=resume_value), preserving the thread_id.
     """
-    raise NotImplementedError("v2 design stub — implemented in the build pass")
+    config = {"configurable": {"thread_id": goal_id}}
+    graph.invoke(Command(resume=resume_value), config=config)
+    return dict(graph.get_state(config).values)
