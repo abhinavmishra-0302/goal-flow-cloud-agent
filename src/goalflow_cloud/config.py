@@ -33,6 +33,12 @@ class Settings:
     openrouter_model: str = field(
         default_factory=lambda: os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b")
     )
+    #: Cap the per-request token reservation. Left uncapped, OpenRouter reserves
+    #: the model max (~65k) and a low-credit key hits HTTP 402. 2500 is plenty
+    #: to interpret a goal into a small structured intent.
+    openrouter_max_tokens: int = field(
+        default_factory=lambda: int(os.getenv("OPENROUTER_MAX_TOKENS", "2500"))
+    )
 
     # --- Structured logging ---
     #: Standard logging level name (DEBUG/INFO/WARNING/ERROR).

@@ -132,6 +132,11 @@ def interpret_goal(state: GraphState) -> GraphState:
             api_key=settings.openrouter_api_key,
             base_url=settings.openrouter_base_url,
             temperature=0,
+            # Cap the token reservation. Interpreting a goal into a small
+            # structured intent needs little; leaving this unset makes OpenRouter
+            # reserve the model max (~65k), which a low-credit key can't afford
+            # (HTTP 402). Configurable via OPENROUTER_MAX_TOKENS.
+            max_tokens=settings.openrouter_max_tokens,
             timeout=45,
             max_retries=1,
         )
