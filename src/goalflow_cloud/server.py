@@ -352,12 +352,35 @@ def build_knew(contract: dict[str, Any] | None) -> dict[str, Any]:
     """
     if not contract:
         return {}
-    return {
-        "constraints": contract.get("constraints", {}),
-        "context": contract.get("context", {}),
-        "scope": contract.get("scope", {}),
-        "time_window": contract.get("time_window", {}),
-    }
+    hard = (contract.get("constraints") or {}).get("hard") or {}
+    soft = (contract.get("constraints") or {}).get("soft") or {}
+    context = contract.get("context") or {}
+
+    knew: dict[str, Any] = {}
+
+    def add(label: str, value: Any) -> None:
+        # Only surface flat, display-ready values (str / list[str]); never raw
+        # nested objects — the UI renders these as chips.
+        if isinstance(value, list):
+            items = [str(v) for v in value if str(v).strip()]
+            if items:
+                knew[label] = items
+        elif isinstance(value, str) and value.strip():
+            knew[label] = value
+        elif isinstance(value, (int, float)) and value:
+            knew[label] = str(value)
+
+    add("allergens", hard.get("allergens"))
+    add("dietary", hard.get("dietary"))
+    add("medical", hard.get("medical"))
+    if hard.get("budget_cap"):
+        knew["budget"] = f"${hard.get('budget_cap')}"
+    if hard.get("quiet_hours"):
+        knew["quiet hours"] = str(hard.get("quiet_hours"))
+    add("dislikes", soft.get("dislikes"))
+    add("prefer", soft.get("prefer"))
+    add("notes", context.get("notes"))
+    return knew
 
 
 async def graph_resume_monitor(goal_id: str, frame: dict[str, Any]) -> None:
