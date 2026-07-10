@@ -206,9 +206,14 @@ async def route_message(sender_role: Role, frame: dict[str, Any]) -> None:
     if sender_role == "device":
         goal_id = frame.get("goal_id")
         correlation_id = frame.get("correlation_id")
-        if goal_id and correlation_id:
-            suffix = frame.get("seq") if frame_type == "agent_event" else ""
-            dedupe_key = f"{frame_type}:{correlation_id}:{suffix}"
+        # Dedupe ONLY plan_ready — a device reconnect replay would otherwise
+        # double-resume the graph. status/proposal/agent_event legitimately RECUR
+        # within a goal (every approval execution, every sustain tick, streaming)
+        # and MUST all reach the UI; the device also resets agent_event seq per
+        # execution, so a (type,correlation,seq) key wrongly collided and dropped
+        # the 2nd approval's confirmation. The UI reducer dedupes agent_events by seq.
+        if frame_type == "plan_ready" and goal_id and correlation_id:
+            dedupe_key = f"{frame_type}:{correlation_id}"
             seen = seen_correlation_ids.setdefault(goal_id, set())
             if dedupe_key in seen:
                 logger.info("frame_dedupe_drop role=device type=%s", frame_type)
