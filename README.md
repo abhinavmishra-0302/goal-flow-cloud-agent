@@ -1,50 +1,62 @@
 # goal-flow-cloud-agent
 
-Cloud agent for the **GoalFlow** POC — a two-tier, goal-based agent orchestration
-demo (Samsung Tizen Family Hub). The cloud agent owns **conversation + memory**,
-resolves ambiguity, decomposes the user's goal into a **Task Contract**, and
-relays messages between the UI and the on-device agent.
-
-> POC ethos: *"fake the world; make the mechanism real."*
+Cloud agent for **GoalFlow v2** — a two-tier, **general goal-based agent** for the
+Samsung Family Hub. GoalFlow is not a meal app: meal planning and guest dinner prep
+are just *domains* riding the same domain-agnostic harness. The cloud tier owns
+**conversation + memory**, LLM-interprets the user's fuzzy goal into a **generic
+Task Contract**, drives an advanced **LangGraph StateGraph** (conditional edges,
+`interrupt()`-based HITL, checkpointer), dispatches to the on-device agent, and
+relays its live `agent_event` stream to the UI.
 
 ## Role in the system
 
 ```
-UI (tablet chat)  <--WS-->  CLOUD (this repo, hub)  <--WS-->  DEVICE agent
+UI (tablet chat)  <--WS-->  CLOUD (this repo, hub)  <--WS-->  DEVICE agent (SK planner)
 ```
 
-- The cloud is the **WebSocket hub/server**. The UI and the device each open
-  one outbound WS connection to it and register a role via a `hello` frame.
+- The cloud is the **WebSocket hub/server**. The UI and the device each open one
+  outbound WS to it and register a role via a `hello` frame.
 - **The UI and the device NEVER talk directly** — everything routes through here.
-- Cloud owns talk/memory; device owns local truth.
-- Two distinct gates: the **safety gate** is deterministic *code on the device*
-  (blocks); the **approval gate** is the *user via the cloud* (waits).
-  Slogan: **"LLM plans, code checks."**
+- Cloud owns talk/memory/HITL; device owns local truth, the SK function-calling
+  planner, capability modules, and the deterministic Safety filter.
+- Two distinct gates — **"LLM plans, code checks"**:
+  - **Safety gate**: deterministic *code on the device*; enforces only
+    `constraints.hard`; *blocks*.
+  - **Approval gate**: the *user via the cloud* (a durable LangGraph
+    `interrupt()`); *waits*.
 
-The shared protocol is frozen as **Contract v0** — see [`CONTRACT.md`](CONTRACT.md)
-(this file is the canonical copy; the UI repo mirrors it as TypeScript types).
+The shared protocol is **CONTRACT v2** — see [`CONTRACT.md`](CONTRACT.md) (this file
+is the canonical copy; the UI and device repos mirror it as typed definitions). The
+protocol is **generic and domain-agnostic**: no meal-specific fields anywhere. A
+`domain` string (`"meal_plan"`, `"guest_dinner"`, ...) names the use case; domain
+specifics live in the device's capability modules plus the free-form
+`scope` / `context` objects.
 
-## Scope by milestone
+## What the cloud does per goal
 
-### M1 — thin vertical slice (current)
-- FastAPI + WebSocket hub (`/ws`), connection registry keyed by role (`ui`, `device`).
-- UI sends `user_goal` → cloud dispatches a **HARDCODED** Task Contract to the
-  device → device returns a **CANNED** `plan_ready` → cloud relays `present_plan`
-  to the UI, which renders it.
-- Family memory is read only to inject `constraints.hard` and
-  `constraints.soft` into the fake dispatch.
-- No LLM, no LangGraph in M1.
+1. **Interprets** the natural-language goal via a real LLM structured-output call
+   (OpenRouter) into `{domain, objective, success_criteria, scope, time_window}` —
+   the time window computed **relative to real today**, never hardcoded.
+2. **Loads memory** (`data/memory/family_profile.json`) with a strict split:
+   the **hard** block (allergens, medical, dietary, budget_cap, quiet_hours) is
+   injected **verbatim** into `constraints.hard` as pure data — the LLM never
+   generates, edits, or paraphrases the safety policy; **soft** preferences and
+   family context only bias planning.
+3. **Builds + validates** the generic `dispatch` Task Contract and sends it to the
+   device, which does the actual planning (SK auto function calling).
+4. **Relays the live stream**: the device's `agent_event` frames (thinking,
+   tool calls, plan progress) pass through to the UI untouched.
+5. **Presents the plan**: on `plan_ready`, resumes the graph, adds the
+   personalization `knew` block ("what it knew"), and sends `present_plan` to the UI.
+6. **Holds the HITL pause**: the graph parks at `interrupt()` with the tiered
+   proposals; the user's `approval` resumes it and is forwarded to the device.
+   Nothing firm executes until approval.
+7. **Monitors + adapts**: `status` / `proposal` frames relay to the UI and feed the
+   graph's monitor node; a material change re-enters the approval loop.
 
-### M2+ — the real mechanism
-- LangGraph pipeline: `ambiguity → memory → decompose → relay` nodes
-  (see `src/goalflow_cloud/graph/`).
-- Family memory (`data/memory/family_profile.json`): **hard constraints** are
-  injected verbatim into the contract's `constraints.hard` (never left to
-  LLM semantics); **soft preferences** only bias planning.
-- LLM via **OpenRouter** (OpenAI-compatible), default model
-  `anthropic/claude-sonnet-5` (configurable via `OPENROUTER_MODEL`), with a
-  scripted/mock fallback behind the same interface.
-- Approval routing (`approval` → device), adaptation (`proposal` → UI), status relay.
+**LLM-only, no fallbacks.** There is no scripted/mock planner behind the LLM call.
+If the LLM fails, the goal fails loudly with a structured error surfaced to the UI —
+it is never faked.
 
 ## How to run
 
@@ -53,7 +65,7 @@ Requires Python 3.11+.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
-cp .env.example .env          # fill in OPENROUTER_API_KEY (not needed for M1)
+cp .env.example .env          # set OPENROUTER_API_KEY (required — LLM-only)
 ./run.sh                      # uvicorn goalflow_cloud.server:app
 ```
 
@@ -73,28 +85,42 @@ Connect clients to `ws://localhost:8000/ws`. The first frame must be one of:
 { "type": "hello", "role": "device" }
 ```
 
+Sanity-check the graph without the hub (runs interpret → memory → contract and
+prints the dispatched Task Contract for any goal text):
+
+```bash
+python scripts/run_graph_demo.py "we've got 6 people over Saturday for dinner - sort it"
+```
+
 ## Environment variables
 
-| Variable              | Default                          | Notes                       |
-|-----------------------|----------------------------------|-----------------------------|
-| `OPENROUTER_API_KEY`  | —                                | M2+; not needed for M1      |
-| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1`   | OpenAI-compatible endpoint  |
-| `OPENROUTER_MODEL`    | `anthropic/claude-sonnet-5`      | Any OpenRouter model id     |
-| `WS_HOST`             | `0.0.0.0`                        |                             |
-| `WS_PORT`             | `8000`                           |                             |
+| Variable              | Default                        | Notes                                        |
+|-----------------------|--------------------------------|----------------------------------------------|
+| `OPENROUTER_API_KEY`  | —                              | **Required** — goal interpretation is LLM-only |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint                   |
+| `OPENROUTER_MODEL`    | `openai/gpt-oss-120b`          | Any OpenRouter model id                      |
+| `WS_HOST`             | `0.0.0.0`                      |                                              |
+| `WS_PORT`             | `8000`                         |                                              |
+| `LOG_LEVEL`           | `INFO`                         | Structured, correlation-id-tagged logging    |
 
 ## Repo layout
 
 ```
-CONTRACT.md                     # canonical frozen Contract v0
-docs/ARCHITECTURE.md            # cloud agent architecture
+CONTRACT.md                     # canonical CONTRACT v2 (generic wire protocol)
+docs/ARCHITECTURE.md            # cloud architecture: graph, memory, hub, logging
 docs/diagrams.md                # Mermaid sequence + component diagrams
+scripts/run_graph_demo.py       # run the graph on a goal, print the contract
 src/goalflow_cloud/
-  config.py                     # env-backed settings (stub)
-  server.py                     # FastAPI app + WS hub (M1)
-  models/contract.py            # Pydantic mirror of Contract v0
-  graph/nodes.py                # LangGraph node signatures (M2)
-  memory/store.py               # family profile loader signature (M2)
-data/memory/family_profile.json # mocked family memory
+  config.py                     # env-backed settings (OPENROUTER_*, WS_*, LOG_LEVEL)
+  server.py                     # FastAPI WS hub: registry, routing, relays, graph driving
+  models/contract.py            # Pydantic mirror of every CONTRACT v2 message
+  graph/nodes.py                # the LangGraph StateGraph: nodes, routers, interrupts
+  memory/store.py               # family profile loader + hard/soft split
+data/memory/family_profile.json # generic family memory (hard + soft + context)
 run.sh
 ```
+
+See [`CODE_GUIDE.md`](CODE_GUIDE.md) for the code walkthrough and
+`docs/ARCHITECTURE.md` for the full design. The system-level v2 framing (the 11
+harness modules, demo pair, decisions) lives in
+`../goal-flow-agents/docs/V2_DESIGN_PROPOSAL.md`.

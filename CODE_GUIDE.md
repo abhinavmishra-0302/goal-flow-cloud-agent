@@ -1,72 +1,155 @@
-# Code Guide — goal-flow-cloud-agent
+# Code Guide — goal-flow-cloud-agent (v2)
 
-The **cloud agent** is the hub of GoalFlow: a FastAPI WebSocket server that owns the conversation
-and memory, turns the user's fuzzy goal into a **Task Contract** via a LangGraph + LLM pipeline,
-and relays every message between the UI and the device. See the repo `README.md` for run steps and
-`../goal-flow-agents/docs/SYSTEM_OVERVIEW.md` for the whole system.
+The **cloud agent** is the hub tier of GoalFlow v2, a general goal-based agent. It owns
+the conversation and family memory, LLM-interprets the user's fuzzy goal into a **generic
+Task Contract**, drives an advanced **LangGraph StateGraph** (conditional edges,
+`interrupt()`-based HITL, checkpointer), and relays every frame between the UI and the
+on-device agent. Domain-agnostic by design: meal planning and guest dinner prep are just
+`domain` strings — no meal-specific fields exist in the protocol or the code paths.
 
-> **Note:** `README.md` describes M1 scope; this guide reflects the finished M1–M4 build.
+See `README.md` for run steps, `CONTRACT.md` for the canonical wire protocol, and
+`docs/ARCHITECTURE.md` for the full design (node table, Mermaid state diagram).
 
 ## File map
 
 ```
-CONTRACT.md                       # canonical frozen wire protocol (source of truth)
-scripts/run_graph_demo.py         # runs the graph on the sample goal, prints the contract
-data/memory/family_profile.json   # mocked family memory (hard + soft + context)
+CONTRACT.md                       # canonical CONTRACT v2 (source of truth; generic)
+scripts/run_graph_demo.py         # run the graph on any goal text, print the contract
+data/memory/family_profile.json   # generic family memory (hard + soft + context)
 src/goalflow_cloud/
-  config.py                       # env-backed settings (OPENROUTER_*, WS_HOST/PORT)
-  server.py                       # FastAPI app + WS hub: registry, routing, relays  ← start here
-  models/contract.py              # Pydantic models mirroring every CONTRACT.md message
-  memory/store.py                 # loads family_profile.json
-  graph/nodes.py                  # LangGraph nodes: ambiguity → memory → decompose
+  config.py                       # Settings dataclass from env (OPENROUTER_*, WS_*, LOG_LEVEL)
+  server.py                       # FastAPI WS hub: registry, routing, relays, graph driving  ← start here
+  models/contract.py              # Pydantic mirror of every CONTRACT v2 message (lenient extras)
+  memory/store.py                 # profile loader + hard_safety_block / soft_bias_block
+  graph/nodes.py                  # the StateGraph: nodes, routers, interrupts, checkpointer
 docs/ARCHITECTURE.md, docs/diagrams.md
 ```
 
-## How it works (request flow)
+## The LangGraph StateGraph (`graph/nodes.py`)
 
-1. **`server.py`** hosts the WS endpoint `/ws`. Each client connects and sends a `hello` frame
-   (`role: ui | device`); the server keeps an in-memory **connection registry** keyed by role
-   (one active connection per role) and replies `hello_ack`. It **routes purely on the `type`
-   field** and logs every frame (this log feeds the UI presenter mode).
-2. On **`user_goal`** (from the UI), the server calls **`graph.nodes.build_dispatch_frame(text)`**,
-   which runs the LangGraph graph:
-   - **ambiguity node** — normalizes the fuzzy goal into a concrete intent (weekday dinners, this week).
-   - **memory node** — loads `family_profile.json` (hard block + soft block + context).
-   - **decompose node** — calls the LLM (OpenRouter) to fill objective/scope/optimization/context
-     and produce the Task Contract.
-   - **Deterministic guardrails:** `constraints.hard` is copied **verbatim** from memory (never
-     LLM-sourced — a missed allergen is a health incident); `autonomy` is hard-set to `propose_all`.
-   - The server then sends the contract to the device as a **`dispatch`** frame.
-3. On **`plan_ready`** (from the device), the server attaches a **`knew`** summary (the "what it
-   knew" personalization, built from the contract it dispatched for that `goal_id`), passes the
-   device's **`impact`** metrics through untouched, and relays it to the UI as **`present_plan`**.
-4. **`approval`** and **`control`** frames from the UI are forwarded to the device; **`status`** and
-   **`proposal`** frames from the device are forwarded to the UI. The cloud is a pure relay for
-   these — it never touches device state.
+One graph run per goal, `thread_id = goal_id`, compiled with a **`MemorySaver`
+checkpointer** (`build_graph()`), so every `interrupt()` pause is durable and resumable
+(swap in a persistent checkpointer without touching the graph).
 
-## Key design points
+**State** (`GraphState`, a `TypedDict`): `goal_text`, `intent`, `memory`, `contract`,
+`plan`, `pending_approvals`, `decisions`, `task_status` (the CONTRACT v2 lifecycle),
+`event_log` (append-only, `Annotated[..., add]` reducer), `goal_id`, `correlation_id`,
+`error`, plus `approval_frame` / `monitor_frame` / `explanation` outputs.
 
-- **Hard vs soft memory split.** `family_profile.json` has a `hard` block (safety-critical, injected
-  verbatim) and a `soft` block (preferences, only bias the LLM). This split is enforced in
-  `graph/nodes.py`.
-- **Demo-safe LLM.** The LLM call is wrapped: on 429 / timeout / empty content / JSON parse failure,
-  the graph falls back to a scripted contract and logs it — the demo never hangs on an LLM hiccup.
-- **Reasoning model.** `OPENROUTER_MODEL=openai/gpt-oss-120b` spends tokens reasoning; the graph uses
-  a generous token budget and reads the final `content`.
+**Nodes and edges:**
 
-## Run & verify
-
-```bash
-python3 -m venv .venv && source .venv/bin/activate && pip install -e .
-python scripts/run_graph_demo.py                          # prints the real LLM-built contract
-uvicorn goalflow_cloud.server:app --host 127.0.0.1 --port 8000
 ```
+interpret_goal ─(error? → explain_block)→ load_memory → build_contract
+  → dispatch_to_device → collect_plan ─(route_on_safety)→ hitl_approval | relay_decisions | explain_block
+hitl_approval → relay_decisions → monitor ─(route_on_monitor)→ hitl_approval (adapt loop) | monitor | finalize
+explain_block → finalize → END
+```
+
+- **`interpret_goal`** — the only LLM call in this repo: `ChatOpenAI` (OpenRouter
+  base_url/model from `config.py`) with `with_structured_output(InterpretedIntent)`,
+  producing `{domain, objective, success_criteria, scope, time_window}`. The prompt
+  passes **real today** so `time_window` is always relative, never hardcoded.
+  **LLM-only:** any failure (exception, missing time_window) sets `state["error"]` and
+  `route_after_interpret` sends the run to `explain_block` — there is no scripted
+  fallback anywhere.
+- **`load_memory`** — loads the profile via `memory/store.py`; keeps the `hard` block as
+  data and bundles `soft` + members + context as planning bias.
+- **`build_contract`** — merges intent + memory into a `dispatch` frame:
+  `constraints.hard` copied **verbatim** from memory (never LLM output),
+  `constraints.soft` from soft prefs, `autonomy = "tiered"`, mints
+  `goal_id`/`correlation_id`, and validates via `Dispatch(**frame)`.
+- **`collect_plan`** — first `interrupt()`: the graph parks until the hub resumes it
+  with the device's `plan_ready` payload; extracts proposals with
+  `requires_approval` into `pending_approvals`.
+- **`hitl_approval`** — the HITL pause: `interrupt()` with the tiered proposals; the
+  checkpointer persists the paused state; the hub resumes with the user's decisions
+  (`Command(resume=...)`). Nothing firm executes until this returns.
+- **`relay_decisions`** — builds the `approval` frame for the device (defaults to
+  approving auto-tier proposals when no explicit decisions exist).
+- **`monitor`** — third `interrupt()`: fed by the hub on each device `status`/`proposal`
+  frame. An adaptation `proposal` (or a `material` status) sets `task_status="adapting"`
+  and `route_on_monitor` loops back into `hitl_approval` — the **adapt loop**;
+  `task_status == "done"` routes to `finalize`.
+- **`explain_block` / `finalize`** — the Trace/Explain surface: user-facing explanation
+  for safety-blocked plans or LLM errors, then close-out.
+
+**Hub-facing entry points:** `start_goal(graph, goal_text, goal_id)` invokes the graph
+until it pauses at the device hand-off and returns the state (with `contract` or
+`error`); `resume_goal(graph, goal_id, resume_value)` resumes any paused interrupt with
+`Command(resume=...)` on the same thread.
+
+## The WebSocket hub (`server.py`)
+
+FastAPI, single `/ws` endpoint. First frame must be `hello` (`role: ui|device`); the
+`ConnectionRegistry` keeps one active socket per role (a reconnect replaces and closes
+the old one) and replies `hello_ack` with a `session_id`. Routing is on
+**`type` + sender role** (`route_message`):
+
+| Incoming `type` | From   | Cloud action |
+|-----------------|--------|--------------|
+| `user_goal`     | ui     | `start_goal` runs the graph (in a thread) → send the `dispatch` contract to the device; on graph `error`, send a terminal `status` frame to the UI instead. |
+| `approval`      | ui     | `resume_goal` resumes the `hitl_approval` interrupt with the decisions; forward the frame to the device. |
+| `control`       | ui     | Forward to the device (generic clock: `advance_day` / `reset` / `set_date`). |
+| `capabilities`  | device | Cache the module registry; relay to the UI (also replayed to late-joining UIs on `hello`). |
+| `agent_event`   | device | **Passthrough relay** to the UI; best-effort append into the graph's `event_log` via `graph.update_state`. The stream never blocks the graph — streaming lives at the hub layer while the graph waits at its interrupts. |
+| `plan_ready`    | device | `resume_goal` (resumes `collect_plan`); re-wrap as `present_plan` with `payload.knew` added; send to UI. If the run auto-advanced past approval (auto-tier only), forward the resulting `approval_frame` to the device. |
+| `proposal` / `status` | device | Relay to the UI, then feed the graph's `monitor` interrupt (best-effort). |
+
+Device frames are **deduped** per goal on `correlation_id` (plus `seq` for
+`agent_event`) so reconnect replays are dropped.
+
+**`build_knew(contract)`** produces the UI's "what it knew" personalization from the
+dispatched contract — generically: it surfaces `constraints.hard` (allergens, dietary,
+medical, budget, quiet hours), `constraints.soft` (dislikes, prefer), and `context`
+notes as flat display-ready chips. No domain-specific logic.
+
+## Memory: the hard-vs-soft split (`memory/store.py`)
+
+`data/memory/family_profile.json` is generic (serves any domain):
+
+- **`hard`** — the safety policy (`allergens`, `medical`, `dietary`, `budget_cap`,
+  `quiet_hours`). `hard_safety_block()` returns it **verbatim** and `build_contract`
+  copies it as data into `dispatch.constraints.hard` — a pure data path the LLM never
+  generates, edits, or paraphrases. The device's deterministic Safety filter enforces
+  exactly this block and nothing else ("LLM plans, code checks").
+  `scripts/run_graph_demo.py` asserts this invariant on every run.
+- **`soft` + `members` + `context`** — `soft_bias_block()` bundles these as planning
+  bias only; `soft` lands in `constraints.soft`, the rest grounds `dispatch.context`.
+  Never safety-enforced.
+
+## Structured logging (first-class)
+
+Configured in `server.setup_logging()` from `LOG_LEVEL`:
+
+- Every record is stamped with `correlation_id` and `goal_id` via a
+  `contextvars`-backed `CorrelationIdFilter`, so one goal's trail is grep-able across
+  hub, graph, and LLM calls.
+- `log_frame()` emits one INFO line per inbound/outbound frame
+  (`direction`, `role`, `type`); full frame bodies at DEBUG.
+- Graph nodes log enter/exit (`graph_node_enter` / `graph_node_exit` / `graph_node_error`)
+  — this is the Trace/Explain harness surface and the debugging story.
+
+## Config (`config.py`)
+
+Frozen `Settings` dataclass from env (`.env` via python-dotenv): `OPENROUTER_API_KEY`
+(required — LLM-only, no fallback), `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`
+(default `openai/gpt-oss-120b`), `WS_HOST`/`WS_PORT`, `LOG_LEVEL`.
 
 ## Extending it
 
-- **New message type:** add a Pydantic model in `models/contract.py`, add a route branch in
-  `server.py`, and update `CONTRACT.md` (+ the UI/device mirrors).
-- **Smarter clarification:** flesh out the ambiguity node in `graph/nodes.py` into a real multi-turn
-  loop (it's currently a single scripted pass).
-- **Real memory:** replace `memory/store.py`'s JSON read with a vector store for soft prefs — but
-  keep the hard block a deterministic, non-semantic lookup.
+- **New graph node:** add the node function in `graph/nodes.py` (return partial state;
+  append to `event_log` via `_event`), register it in `build_graph()` with its edges or
+  a router function. If it pauses for external input, use `interrupt()` and have the
+  hub resume it via `resume_goal` — the checkpointer makes the pause durable for free.
+- **New message type:** add the Pydantic model in `models/contract.py` (extend
+  `ContractMessage`), add a `route_message` branch in `server.py`, and update
+  `CONTRACT.md` first (it is the canonical anchor; the UI/device repos mirror it —
+  any change is a contract version bump). Models allow extra fields, so purely
+  additive payload keys don't break older peers.
+- **New domain:** nothing to change here — the contract is generic. The device
+  advertises new capability modules via `capabilities`; the LLM interpreter emits the
+  new `domain` string and a free-form `scope`.
+- **Real memory:** replace `memory/store.py`'s JSON read with a vector store for soft
+  prefs — but keep the hard block a deterministic, non-semantic lookup.
+- **Durable restarts:** swap `MemorySaver` for a persistent LangGraph checkpointer in
+  `build_graph()` — the interrupt/resume contract is unchanged.
