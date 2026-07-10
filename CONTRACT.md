@@ -1,30 +1,32 @@
-# GoalFlow Contract v0 (FROZEN)
+# GoalFlow CONTRACT v2 — generic goal-agent WebSocket protocol
 
-**This file is the CANONICAL copy of the shared protocol.** The UI repo
-(`goal-flow-agent-chat-ui/src/types/contract.ts`) and the device repo mirror it
-as typed definitions; any change here is a contract version bump.
+**This file is the CANONICAL copy of the shared protocol (the anchor — obey exactly).**
+The Python mirror is `src/goalflow_cloud/models/contract.py`; the UI and device repos
+mirror it as typed definitions. Any change here is a contract version bump.
 
 ## Transport
 
-- **WebSocket.** The cloud is the hub/server. The UI and the Device each open
-  **ONE outbound WS** connection to the cloud.
-- On connect, a client sends a `hello` frame to register its **role**.
-- All messages are JSON objects; the field **`type`** discriminates the message.
-- Every task-related message carries **`goal_id`**.
-- Device↔cloud messages carry **`correlation_id`** — a dedupe key that also
-  correlates an approval back to its proposal.
-- The cloud routes on `type` + role.
-- On drop: **reconnect**; dedupe on `correlation_id`.
+- **WebSocket, JSON text frames.** The cloud is the hub/server; the UI and the Device
+  each open **ONE outbound WS** to the cloud and register via `hello`.
+- The field **`type`** discriminates every message.
+- Task messages carry **`goal_id`**; device↔cloud messages carry **`correlation_id`**.
+- Route on `type` + role; **dedupe on `correlation_id`**; on drop: **reconnect**.
 
-## Handshake
+## Generic & domain-agnostic
 
-`hello` (UI → cloud):
+**NO meal-specific fields in the protocol.** A `domain` string carries the use case
+(`"meal_plan"`, `"guest_dinner"`, ...); domain specifics live in **capability modules**
+plus the free-form `scope` / `context` objects. The same protocol must serve any goal.
+
+## Messages
+
+### Handshake
+
+`hello` (client → cloud):
 
 ```json
 { "type": "hello", "role": "ui" }
 ```
-
-`hello` (device → cloud):
 
 ```json
 { "type": "hello", "role": "device" }
@@ -36,120 +38,150 @@ as typed definitions; any change here is a contract version bump.
 { "type": "hello_ack", "role": "ui|device", "session_id": "..." }
 ```
 
-## Messages
+### `capabilities` (device → cloud → ui)
 
-### 1) `user_goal` (UI → cloud)
+The device advertises its **MODULE REGISTRY** — the extensibility/discovery surface.
+Modules are either `capability` (tools the planner may call) or `steering` (harness
+modules that guard/steer, e.g. the deterministic Safety filter).
 
 ```json
-{ "type": "user_goal", "text": "help my family eat healthier this week and reduce food waste" }
+{ "type": "capabilities", "modules": [
+    { "name": "Inventory", "kind": "capability",
+      "functions": [
+        { "name": "GetExpiringItems", "description": "...", "side_effecting": false },
+        { "name": "Add", "description": "...", "side_effecting": true, "tier": "light" }
+      ] },
+    { "name": "Safety", "kind": "steering",
+      "description": "deterministic hard-constraint filter" }
+] }
 ```
 
-### 2) `dispatch` (cloud → device) — the Task Contract
+### `user_goal` (ui → cloud)
 
-`constraints.hard` is the **ONLY** thing the safety gate reads.
+The raw natural-language goal.
 
 ```json
-{
-  "type": "dispatch",
-  "goal_id": "meal-2026-w29",
-  "objective": "healthier family dinners, less food waste",
-  "scope": { "meal": "dinner", "days": ["Mon", "Tue", "Wed", "Thu", "Fri"] },
-  "time_window": { "start": "2026-07-13", "end": "2026-07-17" },
+{ "type": "user_goal", "text": "..." }
+```
+
+### `dispatch` (cloud → device) — the GENERIC Task Contract
+
+```json
+{ "type": "dispatch", "goal_id": "...", "domain": "meal_plan",
+  "objective": "...",
+  "success_criteria": ["..."],
   "constraints": {
-    "hard": { "allergens": [], "dietary": ["no_pork"], "medical": [] },
-    "soft": { "dislikes": ["mushrooms"], "prefer": ["more_vegetables", "more_protein"] }
+    "hard": { "allergens": [], "medical": [], "dietary": [],
+              "budget_cap": null, "quiet_hours": null },
+    "soft": { }
   },
-  "optimization": ["reduce_processed", "reduce_waste"],
-  "autonomy": "propose_all",
-  "context_hints": { "notes": "son has sports Wednesday" },
-  "reply_to": "kb/device/meal-2026-w29"
-}
+  "scope": { },
+  "time_window": { "start": "<ISO>", "end": "<ISO>" },
+  "autonomy": "tiered",
+  "context": { "notes": "..." } }
 ```
 
-### 3) `plan_ready` (device → cloud)
+- `constraints.hard` is a **safety policy** object (allergens, medical, dietary,
+  budget_cap, quiet_hours, ...). It is the **ONLY** thing the Safety filter enforces.
+- `constraints.soft` holds preferences: they bias planning, never gate it.
+- `scope` is a **domain-flexible** object (whatever the domain needs — no fixed shape).
+- `time_window` is **RELATIVE to real today** (or the control-set clock) — never a
+  hardcoded date.
+- `autonomy` is `"tiered"`: side-effects are proposed with tiers (see invariants).
+
+### `agent_event` (device → cloud → ui) — the live stream
+
+**STREAMED as the device works**; drives the wow UI (progress rail, tool-call chips,
+"watch it think"). The cloud relays these **passthrough** to the UI.
 
 ```json
-{
-  "type": "plan_ready",
-  "goal_id": "meal-2026-w29",
-  "correlation_id": "disp-001",
+{ "type": "agent_event", "goal_id": "...", "correlation_id": "...", "seq": 1,
+  "event": "phase" | "thinking" | "tool_call" | "tool_result" | "plan_progress",
+  "payload": { } }
+```
+
+Payload shapes by `event`:
+
+| `event`         | `payload`                                                 |
+|-----------------|-----------------------------------------------------------|
+| `phase`         | `{ "phase": "grounding" \| "planning" \| "checking" \| "awaiting_approval" }` |
+| `thinking`      | `{ "text": "..." }`                                       |
+| `tool_call`     | `{ "module": "...", "function": "...", "args": { } }`     |
+| `tool_result`   | `{ "module": "...", "function": "...", "summary": "..." }`|
+| `plan_progress` | `{ "item": { } }`                                         |
+
+### `plan_ready` (device → cloud) — generic plan + TIERED proposals
+
+```json
+{ "type": "plan_ready", "goal_id": "...", "correlation_id": "...",
   "task_status": "awaiting_approval",
   "payload": {
     "plan": [
-      { "day": "Mon", "dish": "spinach dal rice bowl", "why": ["more_vegetables", "uses_inventory"] }
+      { "id": "s1", "title": "...", "detail": "...", "when": "<ISO?>",
+        "why": ["..."], "tags": ["..."] }
     ],
     "proposals": [
-      {
-        "proposal_id": "p1",
-        "action": "add_to_shopping_list",
-        "items": ["bell peppers", "lentils", "yogurt"],
-        "reason": "needed for Tue & Thu dishes",
-        "requires_approval": true
-      }
+      { "proposal_id": "p1", "action": "...", "module": "ShoppingList",
+        "function": "Add", "args": { }, "tier": "auto" | "light" | "firm",
+        "reason": "...", "requires_approval": true }
     ],
-    "safety": { "gate": "passed", "hard_violations": [] }
-  }
-}
+    "safety": { "gate": "passed" | "blocked", "violations": [] },
+    "impact": [ { "label": "...", "value": "..." } ],
+    "explanation": "..."
+  } }
 ```
 
-### 4) `present_plan` (cloud → UI)
+### `present_plan` (cloud → ui)
 
-Same payload as `plan_ready`, relayed for rendering (the cloud may add display
-hints).
+`plan_ready` relayed, **plus** `payload.knew` — the personalization "what it knew"
+(what memory/constraints the cloud injected).
 
-### 5) `proposal` (device → cloud) — adaptation
+### `approval` (ui → cloud → device)
 
 ```json
-{
-  "type": "proposal",
-  "goal_id": "meal-2026-w29",
-  "correlation_id": "evt-014",
+{ "type": "approval", "goal_id": "...", "correlation_id": "...",
+  "payload": { "decisions": [ { "proposal_id": "p1", "approved": true } ] } }
+```
+
+### `proposal` (device → cloud → ui) — adaptation (generic)
+
+```json
+{ "type": "proposal", "goal_id": "...", "correlation_id": "...",
   "task_status": "adapting",
-  "payload": {
-    "proposal_id": "p7",
-    "action": "add_prep_task",
-    "detail": "marinate Wed's chicken on Tue night",
-    "trigger": "calendar: son football Wed 18:00 — prep window shrinks",
-    "requires_approval": true
-  }
-}
+  "payload": { "proposal_id": "a1", "action": "...", "detail": "...",
+               "trigger": "...", "tier": "...", "requires_approval": true } }
 ```
 
-### 6) `approval` (cloud → device)
+### `status` (device → cloud → ui)
 
 ```json
-{
-  "type": "approval",
-  "goal_id": "meal-2026-w29",
-  "correlation_id": "evt-014",
-  "payload": { "decisions": [{ "proposal_id": "p7", "approved": true }] }
-}
+{ "type": "status", "goal_id": "...", "correlation_id": "...",
+  "task_status": "...",
+  "payload": { "day": "?", "sim_date": "?", "material": false,
+               "executed": [], "note": "..." } }
 ```
 
-### 7) `status` (device → cloud)
+### `control` (ui → cloud → device)
 
 ```json
-{
-  "type": "status",
-  "goal_id": "meal-2026-w29",
-  "correlation_id": "disp-001",
-  "task_status": "executing",
-  "payload": { "note": "added 3 items to shopping list" }
-}
+{ "type": "control", "goal_id": "...",
+  "command": "advance_day" | "reset" | "set_date",
+  "payload": { "date": "<ISO?>" } }
 ```
 
 ## Task-status lifecycle
 
 ```
-created → planning → awaiting_approval → executing → adapting → done
+created -> interpreting -> grounding -> planning -> checking ->
+awaiting_approval -> executing -> monitoring -> adapting -> done
 ```
 
 ## Invariants
 
-- **Proposals are proposals, not actions** — the device executes nothing until
-  an `approval` returns.
-- **The UI and the device never talk directly** — everything routes through the
-  cloud hub.
-- **The safety gate (deterministic device code) is separate from the approval
-  gate (the user, via the cloud).** The safety gate blocks; the approval gate
-  waits. *"LLM plans, code checks."*
+1. **Tiered proposals:** side-effecting tool calls are PROPOSED with a tier
+   (`auto` / `light` / `firm`); **nothing firm executes until approval**.
+2. **Hub-only:** UI and device NEVER talk directly; all traffic goes via the cloud.
+3. **"LLM plans, code checks":** the Safety filter is deterministic code SEPARATE
+   from the LLM planner; it enforces `constraints.hard` and nothing else.
+4. **Generic clock:** the device reads a GENERIC clock (real today, or set via
+   `control set_date` / `advance_day`) — NEVER a hardcoded date.

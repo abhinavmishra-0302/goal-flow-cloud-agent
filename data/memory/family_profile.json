@@ -2,19 +2,25 @@
   "family_id": "family-hub-demo",
   "members": [
     { "name": "Priya", "role": "parent" },
-    { "name": "Aarav", "role": "son" }
+    { "name": "Rohan", "role": "parent" },
+    { "name": "Aarav", "role": "son", "age": 12 }
   ],
   "hard": {
-    "allergens": [],
+    "allergens": ["peanuts"],
+    "medical": ["rohan_low_sodium"],
     "dietary": ["no_pork"],
-    "medical": []
+    "budget_cap": 120.0,
+    "quiet_hours": { "start": "21:30", "end": "07:00" }
   },
   "soft": {
     "dislikes": ["mushrooms"],
-    "prefer": ["more_vegetables", "more_protein"],
-    "notes": ["vegetarian weekday dinners", "reduce processed food"]
+    "prefer": ["more_vegetables", "more_protein", "reduce_processed_food"],
+    "habits": ["vegetarian_weekday_dinners", "grocery_run_saturday_morning"],
+    "hosting_style": "casual, kid-friendly"
   },
   "context": [
-    "son Aarav has football practice Wednesday 18:00"
+    "son Aarav has football practice Wednesday 18:00",
+    "family calendar is the shared source of evening availability",
+    "robot vacuum and dishwasher run on SmartThings schedules"
   ]
 }

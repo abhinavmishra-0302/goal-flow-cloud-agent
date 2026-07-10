@@ -1,5 +1,10 @@
-"""LangGraph goal-decomposition pipeline (M2 — design stubs only).
+"""v2 LangGraph pipeline (design skeletons).
 
-Node chain: ambiguity -> memory -> decompose -> relay. See graph/nodes.py and
-docs/ARCHITECTURE.md. Not used in M1 (M1 dispatches a hardcoded contract).
+StateGraph: interpret_goal -> load_memory -> build_contract ->
+dispatch_to_device -> [device plans] -> collect_plan -> hitl_approval
+(interrupt()) -> relay_decisions -> monitor (adapt loop) -> finalize.
+Conditional edges route safety-blocked plans (and LLM errors — LLM-only,
+no fallback) to explain_block. Compiled with a checkpointer
+(thread_id = goal_id) so the approval pause is durable.
+See graph/nodes.py and docs/ARCHITECTURE.md.
 """

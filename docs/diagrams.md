@@ -1,45 +1,59 @@
-# GoalFlow Diagrams
+# GoalFlow v2 Diagrams
+
+(The cloud StateGraph diagram lives in [ARCHITECTURE.md](ARCHITECTURE.md).)
 
 ## 1. Full flow (sequence)
 
-Happy path plus a later calendar-triggered adaptation. Note the two gates:
-the **safety gate** runs as deterministic code on the device before anything
-is surfaced; the **approval gate** is the user, reached via the cloud.
+Happy path plus a later adaptation. Note the two gates: the **safety filter**
+runs as deterministic code on the device before anything is surfaced; the
+**approval gate** is the user, reached via the cloud's LangGraph `interrupt()`.
+New in v2: the device advertises `capabilities`, and `agent_event`s stream live
+(device → cloud → UI passthrough) while the device plans.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant UI as UI (tablet chat)
-    participant Cloud as Cloud Agent (WS hub)
-    participant Device as Device Agent
+    participant UI as UI (wow UI)
+    participant Cloud as Cloud Agent (WS hub + LangGraph)
+    participant Device as Device Agent (SK planner)
 
     Note over UI,Device: Handshake (each client opens ONE outbound WS to the cloud)
     UI->>Cloud: hello { role: "ui" }
     Cloud-->>UI: hello_ack { session_id }
     Device->>Cloud: hello { role: "device" }
     Cloud-->>Device: hello_ack { session_id }
+    Device->>Cloud: capabilities { modules: [Inventory, ShoppingList, Safety…] }
+    Cloud->>UI: capabilities (relayed)
 
-    Note over UI,Cloud: Goal intake
-    UI->>Cloud: user_goal { "help my family eat healthier…" }
-    Note over Cloud: M1: hardcoded contract<br/>M2: ambiguity → memory → decompose → relay
-    Cloud->>Device: dispatch { goal_id, constraints.hard, … }
+    Note over UI,Cloud: Goal intake (ANY domain — meal_plan, guest_dinner, …)
+    UI->>Cloud: user_goal { "we've got 6 people over Saturday — sort it" }
+    Note over Cloud: interpret_goal (LLM structured output)<br/>→ load_memory (hard verbatim / soft bias)<br/>→ build_contract → dispatch
+    Cloud->>Device: dispatch { goal_id, domain, objective, success_criteria,<br/>constraints{hard,soft}, scope, time_window, autonomy:"tiered", context }
 
-    Note over Device: Harness pipeline plans.<br/>SAFETY GATE (code) checks constraints.hard — blocks on violation.
-    Device->>Cloud: plan_ready { correlation_id: disp-001,<br/>task_status: awaiting_approval, plan + proposals }
-    Cloud->>UI: present_plan { same payload + display hints }
+    Note over Device: SK function-calling planner works;<br/>SAFETY FILTER (code) enforces constraints.hard only.
+    Device-->>Cloud: agent_event { seq:1, phase: grounding }
+    Cloud-->>UI: agent_event (passthrough)
+    Device-->>Cloud: agent_event { seq:2, tool_call: Inventory.GetExpiringItems }
+    Cloud-->>UI: agent_event (passthrough)
+    Device-->>Cloud: agent_event { seq:3, thinking / tool_result / plan_progress… }
+    Cloud-->>UI: agent_event (passthrough)
 
-    Note over UI: APPROVAL GATE (user) — waits.
+    Device->>Cloud: plan_ready { task_status: awaiting_approval,<br/>plan + TIERED proposals + safety + impact + explanation }
+    Note over Cloud: graph resumes → hitl_approval = interrupt()<br/>(state checkpointed, thread_id = goal_id)
+    Cloud->>UI: present_plan { payload + knew ("what it knew") }
+
+    Note over UI: APPROVAL GATE (user) — waits. Nothing firm executes.
     UI->>Cloud: approval { decisions: [ {p1, approved:true} ] }
+    Note over Cloud: interrupt() resumed with decisions
     Cloud->>Device: approval { correlation_id, decisions }
-    Note over Device: Only now does the device act on p1.
-    Device->>Cloud: status { task_status: executing,<br/>"added 3 items to shopping list" }
+    Device->>Cloud: status { task_status: executing, executed:[…] }
     Cloud->>UI: status (relayed)
 
-    Note over UI,Device: Later — adaptation (calendar event shrinks Wed prep window)
-    Device->>Cloud: proposal { correlation_id: evt-014, task_status: adapting,<br/>p7: add_prep_task, requires_approval:true }
-    Cloud->>UI: proposal (relayed for decision)
-    UI->>Cloud: approval { decisions: [ {p7, approved:true} ] }
-    Cloud->>Device: approval { correlation_id: evt-014 }
+    Note over UI,Device: Later — adaptation (a material world change)
+    Device->>Cloud: proposal { task_status: adapting, trigger, tier, requires_approval }
+    Cloud->>UI: proposal (relayed — the adapt loop re-enters hitl_approval)
+    UI->>Cloud: approval { decisions: [ {a1, approved:true} ] }
+    Cloud->>Device: approval
     Device->>Cloud: status { task_status: done }
     Cloud->>UI: status (relayed)
 ```
@@ -48,37 +62,39 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    subgraph UIT["UI tier — goal-flow-agent-chat-ui"]
-        Chat[ChatView]
-        Plan[PlanCard]
-        Mic[MicButton / Web Speech STT]
-        WSC[ws.ts client]
-        Chat --> WSC
+    subgraph UIT["UI tier — wow UI"]
+        Stream[Live stream: progress rail,<br/>tool-call chips, thinking]
+        Plan[Plan-as-hero + tiered approvals]
+        WSC[WS client]
+        Stream --> WSC
         Plan --> WSC
-        Mic --> Chat
     end
 
     subgraph CLOUD["Cloud tier — goal-flow-cloud-agent (WS HUB)"]
-        Hub[FastAPI /ws hub<br/>connection registry by role]
-        Router[Router: type + role]
-        Graph["LangGraph pipeline (M2)<br/>ambiguity → memory → decompose → relay"]
-        Mem[(family_profile.json<br/>hard vs soft memory)]
-        LLM[OpenRouter LLM<br/>anthropic/claude-sonnet-5<br/>+ mock fallback]
+        Hub[FastAPI /ws hub<br/>registry by role · correlation-id logs]
+        Router[Router: type + role<br/>agent_event = passthrough]
+        Graph["LangGraph StateGraph<br/>interpret_goal → load_memory → build_contract<br/>→ dispatch → collect_plan → hitl_approval (interrupt)<br/>→ relay_decisions → monitor (adapt loop)"]
+        CP[(Checkpointer<br/>thread_id = goal_id)]
+        Mem[(family_profile.json<br/>hard safety block vs soft prefs)]
+        LLM[OpenRouter LLM<br/>openai/gpt-oss-120b<br/>LLM-only, no fallback]
         Hub --> Router
         Router --> Graph
+        Graph --> CP
         Graph --> Mem
         Graph --> LLM
     end
 
     subgraph DEV["Device tier — on-device agent (other repo)"]
-        Harness[Harness pipeline]
-        Gate[["SAFETY GATE<br/>deterministic code<br/>reads constraints.hard only"]]
-        Act[Actuators / local state<br/>sole authority]
-        Harness --> Gate --> Act
+        Caps[Capability modules (SK plugins)<br/>advertised via capabilities]
+        Planner[SK auto function-calling planner]
+        Gate[["SAFETY FILTER<br/>deterministic code<br/>enforces constraints.hard only"]]
+        Act[Actuators / local state<br/>sole authority · generic clock]
+        Planner --> Gate --> Act
+        Caps --> Planner
     end
 
     WSC <-- "one outbound WS" --> Hub
-    Hub <-- "one outbound WS" --> Harness
+    Hub <-- "one outbound WS" --> Planner
 
     UIT -. "NEVER directly" .- DEV
 ```

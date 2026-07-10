@@ -1,327 +1,290 @@
-"""LangGraph nodes for M2 goal decomposition.
+"""GoalFlow v2 LangGraph — node signatures + graph skeleton (DESIGN PASS).
 
-Pipeline: user_goal -> ambiguity -> memory -> decompose -> relay -> dispatch.
+Advanced LangGraph StateGraph: conditional edges, ``interrupt()``-based HITL,
+and a checkpointer so the approval pause (and the adapt loop) survive across
+frames/reconnects. One graph run per goal; ``thread_id = goal_id``.
 
-Key invariant: hard constraints flow through the MEMORY node as data, straight
-into contract.constraints.hard. The LLM never generates, edits, or paraphrases
-allergens/dietary/medical constraints. "LLM plans, code checks."
+Pipeline (see docs/ARCHITECTURE.md for the full design + Mermaid diagram):
+
+    interpret_goal -> load_memory -> build_contract -> dispatch_to_device
+        -> [device plans; agent_events stream through the hub]
+        -> collect_plan -> (safety route) -> hitl_approval [interrupt()]
+        -> relay_decisions -> monitor -> (adapt loop | finalize)
+
+Key invariants:
+- LLM-ONLY: interpret_goal is a real structured-output LLM call via OpenRouter;
+  there is NO scripted fallback. Failure sets state["error"] and routes to
+  explain_block.
+- Hard constraints flow through load_memory as DATA, verbatim into
+  contract.constraints.hard. The LLM never generates, edits, or paraphrases
+  the safety policy. "LLM plans, code checks."
+- The device does the actual planning (SK function calling); the cloud graph
+  pauses at its hand-off points and is resumed by the WS hub.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import re
-from datetime import date, timedelta
-from typing import Any, TypedDict
+from operator import add
+from typing import Annotated, Any, TypedDict
 
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
-
-from goalflow_cloud.config import get_settings
-from goalflow_cloud.memory.store import load_family_profile
-from goalflow_cloud.models.contract import (
-    Dispatch,
-    DispatchConstraints,
-    DispatchScope,
-    HardConstraints,
-    SoftConstraints,
-    TimeWindow,
-)
+from langgraph.types import interrupt
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# State schema
+# ---------------------------------------------------------------------------
+
+
 class GraphState(TypedDict, total=False):
-    user_goal_text: str
-    normalized_intent: dict[str, Any]
-    family_profile: dict[str, Any]
-    hard_constraints: dict[str, list[str]]
-    soft_preferences: dict[str, Any]
-    contract: Dispatch
-    dispatch_frame: dict[str, Any]
-    fallback_used: bool
-    fallback_reason: str
+    """Durable per-goal state, checkpointed across interrupts."""
+
+    #: Raw user_goal text from the UI.
+    goal_text: str
+    #: Normalized intent (LLM structured output): domain, objective,
+    #: success_criteria, scope, time_window (relative to real today).
+    intent: dict[str, Any]
+    #: Loaded memory profile: hard safety block + soft prefs + family context.
+    memory: dict[str, Any]
+    #: The assembled generic Dispatch frame (models.contract.Dispatch shape).
+    contract: dict[str, Any]
+    #: plan_ready payload from the device (plan + tiered proposals + safety).
+    plan: dict[str, Any]
+    #: Proposals awaiting user decisions (requires_approval == True).
+    pending_approvals: list[dict[str, Any]]
+    #: Approval decisions returned by the interrupt() resume.
+    decisions: list[dict[str, Any]]
+    #: CONTRACT v2 lifecycle value (created ... done).
+    task_status: str
+    #: Append-only trace of agent_events / node transitions (reducer: add).
+    event_log: Annotated[list[dict[str, Any]], add]
+    goal_id: str
+    correlation_id: str
+    #: Structured failure — LLM-only design: errors surface, never faked.
+    error: str
 
 
-WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri"]
-CORRELATION_ID = "disp-001"
+# ---------------------------------------------------------------------------
+# Nodes (harness modules) — signatures + TODO stubs
+# ---------------------------------------------------------------------------
 
 
-def _dump_model(model: object) -> dict[str, Any]:
-    if hasattr(model, "model_dump"):
-        return model.model_dump(exclude_none=True)  # type: ignore[attr-defined]
-    return model.dict(exclude_none=True)  # type: ignore[attr-defined]
+def interpret_goal(state: GraphState) -> GraphState:
+    """Goal Interpreter: fuzzy goal text -> structured intent (LLM ONLY).
 
-
-def _next_weekday_dinner_window(today: date | None = None) -> dict[str, str]:
-    """Return the next complete Mon-Fri planning window.
-
-    For the demo goal "this week", a Thursday request plans the next full
-    weekday dinner block rather than a partial week.
+    TODO(v2-M1):
+    - ChatOpenAI (OpenRouter base_url/model from config) with structured
+      output: {domain, objective, success_criteria, scope, time_window}.
+    - time_window computed RELATIVE to real today (never hardcoded).
+    - On LLM failure: set state["error"] (routes to explain_block). NO
+      scripted fallback.
     """
-    anchor = today or date.today()
-    days_until_monday = (7 - anchor.weekday()) % 7
-    start = anchor + timedelta(days=days_until_monday)
-    end = start + timedelta(days=4)
-    return {"start": start.isoformat(), "end": end.isoformat()}
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
 
 
-def _goal_id_from_time_window(time_window: dict[str, str]) -> str:
-    start = date.fromisoformat(time_window["start"])
-    iso_year, iso_week, _ = start.isocalendar()
-    return f"meal-{iso_year}-w{iso_week:02d}"
+def load_memory(state: GraphState) -> GraphState:
+    """Memory & Constraints: load the generic profile, split hard/soft.
 
-
-def _normalize_hard_constraints(hard: dict[str, Any]) -> dict[str, list[str]]:
-    return {
-        "allergens": list(hard.get("allergens", [])),
-        "dietary": list(hard.get("dietary", [])),
-        "medical": list(hard.get("medical", [])),
-    }
-
-
-def _normalize_soft_constraints(soft: dict[str, Any]) -> dict[str, list[str]]:
-    return {
-        "dislikes": list(soft.get("dislikes", [])),
-        "prefer": list(soft.get("prefer", [])),
-    }
-
-
-def _build_dispatch(
-    *,
-    llm_fields: dict[str, Any],
-    normalized_intent: dict[str, Any],
-    hard_constraints: dict[str, list[str]],
-    soft_preferences: dict[str, Any],
-) -> Dispatch:
-    time_window = llm_fields.get("time_window")
-    if not isinstance(time_window, dict):
-        time_window = normalized_intent["time_window"]
-
-    start = str(time_window.get("start") or normalized_intent["time_window"]["start"])
-    end = str(time_window.get("end") or normalized_intent["time_window"]["end"])
-    normalized_window = {"start": start, "end": end}
-    goal_id = _goal_id_from_time_window(normalized_window)
-
-    scope = llm_fields.get("scope") if isinstance(llm_fields.get("scope"), dict) else {}
-    days = scope.get("days") if isinstance(scope.get("days"), list) else normalized_intent["days"]
-    meal = scope.get("meal") or normalized_intent["meal"]
-
-    optimization = llm_fields.get("optimization")
-    if not isinstance(optimization, list) or not optimization:
-        optimization = ["reduce_processed", "reduce_waste"]
-
-    context_hints = llm_fields.get("context_hints")
-    if isinstance(context_hints, dict):
-        notes = str(context_hints.get("notes") or "")
-    else:
-        notes = str(context_hints or "")
-    if not notes:
-        notes = "; ".join(soft_preferences.get("context", [])) or "son has sports Wednesday"
-
-    return Dispatch(
-        goal_id=goal_id,
-        objective=str(llm_fields.get("objective") or "healthier family dinners, less food waste"),
-        scope=DispatchScope(meal=str(meal), days=[str(day) for day in days]),
-        time_window=TimeWindow(start=start, end=end),
-        constraints=DispatchConstraints(
-            # HARD MEMORY CHANNEL: deterministic copy from family_profile["hard"].
-            # Do not source these fields from LLM output.
-            hard=HardConstraints(**hard_constraints),
-            # SOFT MEMORY CHANNEL: planning preferences only; not safety enforced.
-            soft=SoftConstraints(**_normalize_soft_constraints(soft_preferences.get("soft", {}))),
-        ),
-        optimization=[str(item) for item in optimization],
-        # AUTONOMY is a control-vocabulary field, not an LLM decision. For the POC
-        # every side-effect is proposed for approval, so it is deterministically
-        # "propose_all" (ignore any LLM-suggested value).
-        autonomy="propose_all",
-        context_hints={"notes": notes},
-        reply_to=f"kb/device/{goal_id}",
-    )
-
-
-def _scripted_dispatch(state: GraphState, reason: str) -> Dispatch:
-    logger.warning("using scripted dispatch fallback: %s", reason)
-    normalized_intent = state["normalized_intent"]
-    return _build_dispatch(
-        llm_fields={
-            "objective": "healthier family dinners, less food waste",
-            "scope": {"meal": "dinner", "days": WEEKDAY_NAMES},
-            "time_window": normalized_intent["time_window"],
-            "optimization": ["reduce_processed", "reduce_waste"],
-            "autonomy": "propose_all",
-            "context_hints": {
-                "notes": "; ".join(state.get("soft_preferences", {}).get("context", []))
-                or "son Aarav has football practice Wednesday 18:00"
-            },
-        },
-        normalized_intent=normalized_intent,
-        hard_constraints=state["hard_constraints"],
-        soft_preferences=state["soft_preferences"],
-    )
-
-
-def _extract_json_object(content: str) -> dict[str, Any]:
-    if not content or not content.strip():
-        raise ValueError("empty LLM content")
-
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", content, flags=re.DOTALL)
-        if match is None:
-            raise
-        parsed = json.loads(match.group(0))
-
-    if not isinstance(parsed, dict):
-        raise ValueError("LLM response was not a JSON object")
-    return parsed
-
-
-def _call_llm_for_contract_fields(state: GraphState) -> dict[str, Any]:
-    settings = get_settings()
-    if not settings.openrouter_api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set")
-
-    from langchain_openai import ChatOpenAI
-
-    llm = ChatOpenAI(
-        model=settings.openrouter_model,
-        api_key=settings.openrouter_api_key,
-        base_url=settings.openrouter_base_url,
-        temperature=0,
-        max_tokens=1600,
-        timeout=20,
-        model_kwargs={"response_format": {"type": "json_object"}},
-    )
-
-    normalized = state["normalized_intent"]
-    soft_preferences = state["soft_preferences"]
-    prompt = {
-        "role": "user",
-        "content": (
-            "Return STRICT JSON only. Build the non-safety fields for a GoalFlow dispatch "
-            "contract from this family goal. Do not include constraints.hard and do not invent "
-            "allergens, dietary rules, or medical constraints. Reflect soft preferences in the "
-            "objective, optimization, and context notes.\n\n"
-            "Required JSON keys: objective, scope, time_window, optimization, autonomy, "
-            "context_hints.\n"
-            "scope must be {\"meal\": string, \"days\": [\"Mon\", ...]}.\n"
-            "time_window must be {\"start\": ISO_DATE, \"end\": ISO_DATE}.\n"
-            "context_hints must be {\"notes\": string}.\n\n"
-            f"User goal: {state['user_goal_text']}\n"
-            f"Normalized intent defaults: {json.dumps(normalized, sort_keys=True)}\n"
-            f"Soft preferences and context: {json.dumps(soft_preferences, sort_keys=True)}\n"
-        ),
-    }
-    response = llm.invoke([prompt])
-    return _extract_json_object(str(response.content))
-
-
-def ambiguity_node(state: GraphState) -> GraphState:
-    """Normalize the user's fuzzy goal into demo-sensible defaults."""
-    text = state["user_goal_text"].strip()
-    time_window = _next_weekday_dinner_window()
-    return {
-        **state,
-        "normalized_intent": {
-            "raw_goal": text,
-            "meal": "dinner",
-            "days": WEEKDAY_NAMES,
-            "time_window": time_window,
-            "assumptions": ["weekday dinners", "next complete Mon-Fri planning window"],
-        },
-    }
-
-
-def memory_node(state: GraphState) -> GraphState:
-    """Load the family profile and split it into the two constraint channels.
-
-    M2: via memory.store.load_family_profile():
-      - profile["hard"]  -> state["hard_constraints"]  (injected VERBATIM into
-        the contract's constraints.hard — a data path, never LLM semantics;
-        the device safety gate reads exactly this block).
-      - profile["soft"] + members + context -> state["soft_preferences"]
-        (bias planning only, as prompt context for decompose).
+    TODO(v2-M1):
+    - memory.store.load_family_profile() -> state["memory"].
+    - profile["hard"] is the safety policy (allergens, medical, dietary,
+      budget_cap, quiet_hours): kept as DATA for verbatim injection.
+    - profile["soft"] + members + context: planning bias only.
     """
-    profile = load_family_profile()
-    hard_constraints = _normalize_hard_constraints(profile.get("hard", {}))
-    soft_preferences = {
-        "members": profile.get("members", []),
-        "soft": profile.get("soft", {}),
-        "context": profile.get("context", []),
-    }
-    return {
-        **state,
-        "family_profile": profile,
-        # HARD MEMORY CHANNEL: copied verbatim into Dispatch.constraints.hard.
-        "hard_constraints": hard_constraints,
-        # SOFT MEMORY CHANNEL: prompt/context only; never safety-gated.
-        "soft_preferences": soft_preferences,
-    }
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
 
 
-def decompose_node(state: GraphState) -> GraphState:
-    """LLM call that fills the rest of the Task Contract.
+def build_contract(state: GraphState) -> GraphState:
+    """Assemble + validate the generic Task Contract (models.contract.Dispatch).
 
-    M2: produce objective, scope, time_window, optimization, autonomy and
-    context_hints from the goal text + soft preferences. Merge with the
-    memory-injected hard constraints into a models.contract.Dispatch.
-    Falls back to a scripted contract when no OPENROUTER_API_KEY is set.
+    TODO(v2-M1):
+    - Merge intent (LLM) with constraints.hard copied VERBATIM from memory.
+    - constraints.soft from soft prefs; scope/context stay domain-flexible.
+    - autonomy = "tiered"; mint goal_id + correlation_id.
+    - Validate via Dispatch(**frame); stash the frame in state["contract"].
     """
-    try:
-        llm_fields = _call_llm_for_contract_fields(state)
-        dispatch = _build_dispatch(
-            llm_fields=llm_fields,
-            normalized_intent=state["normalized_intent"],
-            hard_constraints=state["hard_constraints"],
-            soft_preferences=state["soft_preferences"],
-        )
-        return {**state, "contract": dispatch, "fallback_used": False}
-    except Exception as exc:
-        dispatch = _scripted_dispatch(state, str(exc))
-        return {
-            **state,
-            "contract": dispatch,
-            "fallback_used": True,
-            "fallback_reason": str(exc),
-        }
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
 
 
-def relay_node(state: GraphState) -> GraphState:
-    """Validate the assembled contract and hand it to the WS hub.
+def dispatch_to_device(state: GraphState) -> GraphState:
+    """Hand the dispatch frame to the WS hub (the hub owns socket IO).
 
-    M2: validate against models.contract.Dispatch, then prepare the outbound
-    wire frame. The server owns actual WebSocket IO.
+    TODO(v2-M1): mark task_status="planning"; the hub sends the frame and
+    relays the device's agent_event stream while the graph waits.
     """
-    dispatch = Dispatch(**_dump_model(state["contract"]))
-    frame = _dump_model(dispatch)
-    frame["correlation_id"] = CORRELATION_ID
-    return {**state, "contract": dispatch, "dispatch_frame": frame}
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
 
 
-def build_graph() -> Any:
-    """Assemble and compile the LangGraph StateGraph.
+def collect_plan(state: GraphState) -> GraphState:
+    """Resume point: the hub feeds the device's plan_ready payload in.
 
-    M2: StateGraph(GraphState); edges ambiguity -> memory -> decompose -> relay.
+    TODO(v2-M1): record payload into state["plan"]; extract proposals with
+    requires_approval into state["pending_approvals"]; task_status="checking".
+    """
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
+
+
+def hitl_approval(state: GraphState) -> GraphState:
+    """Approval/Consent (HITL): pause on the tiered proposals via interrupt().
+
+    TODO(v2-M1):
+        decisions = interrupt({
+            "pending_approvals": state.get("pending_approvals", []),
+        })
+    The checkpointer persists the paused state; the hub resumes with the
+    user's approval decisions (Command(resume=...)). Nothing firm executes
+    until this returns. ``interrupt`` imported above is the real primitive.
+    """
+    _ = interrupt  # design anchor: this node is the interrupt() site
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
+
+
+def relay_decisions(state: GraphState) -> GraphState:
+    """Forward the approval decisions to the device via the hub.
+
+    TODO(v2-M1): build the Approval frame from state["decisions"];
+    task_status="executing" then "monitoring".
+    """
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
+
+
+def monitor(state: GraphState) -> GraphState:
+    """Monitor & Adapt: track device status/proposals for material changes.
+
+    TODO(v2-M1): fed by the hub on status/proposal frames; a MATERIAL change
+    (or an adaptation proposal) populates pending_approvals for the adapt
+    loop; task_status="monitoring"|"adapting"|"done".
+    """
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
+
+
+def explain_block(state: GraphState) -> GraphState:
+    """Trace/Explain: safety-blocked plan or LLM error -> user-facing why.
+
+    TODO(v2-M1): compose the explanation from safety.violations or
+    state["error"]; never silently retry or fake a plan.
+    """
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
+
+
+def finalize(state: GraphState) -> GraphState:
+    """Close out the goal; emit the final trace; task_status="done".
+
+    TODO(v2-M1): summarize event_log for the Trace/Explain surface.
+    """
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
+
+
+# ---------------------------------------------------------------------------
+# Conditional-edge routers
+# ---------------------------------------------------------------------------
+
+
+def route_after_interpret(state: GraphState) -> str:
+    """error -> explain_block (LLM-only, fail loudly); else -> load_memory."""
+    # TODO(v2-M1): return "explain_block" if state.get("error") else "load_memory"
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
+
+
+def route_on_safety(state: GraphState) -> str:
+    """After collect_plan: blocked -> explain_block; approvals pending ->
+    hitl_approval; auto-tier only -> relay_decisions."""
+    # TODO(v2-M1): inspect state["plan"]["safety"]["gate"] + pending_approvals.
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
+
+
+def route_on_monitor(state: GraphState) -> str:
+    """After monitor: material change -> hitl_approval (adapt loop);
+    done -> finalize; else keep monitoring."""
+    # TODO(v2-M1): inspect task_status / pending_approvals / material flag.
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
+
+
+# ---------------------------------------------------------------------------
+# Graph assembly
+# ---------------------------------------------------------------------------
+
+
+def build_graph(checkpointer: Any | None = None) -> Any:
+    """Assemble and compile the v2 StateGraph.
+
+    The checkpointer (default: in-process MemorySaver) makes the interrupt()
+    pause durable; every invoke/resume must pass
+    ``config={"configurable": {"thread_id": goal_id}}``.
     """
     graph = StateGraph(GraphState)
-    graph.add_node("ambiguity", ambiguity_node)
-    graph.add_node("memory", memory_node)
-    graph.add_node("decompose", decompose_node)
-    graph.add_node("relay", relay_node)
 
-    graph.set_entry_point("ambiguity")
-    graph.add_edge("ambiguity", "memory")
-    graph.add_edge("memory", "decompose")
-    graph.add_edge("decompose", "relay")
-    graph.add_edge("relay", END)
-    return graph.compile()
+    graph.add_node("interpret_goal", interpret_goal)
+    graph.add_node("load_memory", load_memory)
+    graph.add_node("build_contract", build_contract)
+    graph.add_node("dispatch_to_device", dispatch_to_device)
+    graph.add_node("collect_plan", collect_plan)
+    graph.add_node("hitl_approval", hitl_approval)
+    graph.add_node("relay_decisions", relay_decisions)
+    graph.add_node("monitor", monitor)
+    graph.add_node("explain_block", explain_block)
+    graph.add_node("finalize", finalize)
+
+    graph.set_entry_point("interpret_goal")
+    graph.add_conditional_edges(
+        "interpret_goal",
+        route_after_interpret,
+        {"load_memory": "load_memory", "explain_block": "explain_block"},
+    )
+    graph.add_edge("load_memory", "build_contract")
+    graph.add_edge("build_contract", "dispatch_to_device")
+    # Device plans here (SK function calling); the hub streams agent_events
+    # and resumes the graph at collect_plan when plan_ready arrives.
+    graph.add_edge("dispatch_to_device", "collect_plan")
+    graph.add_conditional_edges(
+        "collect_plan",
+        route_on_safety,
+        {
+            "hitl_approval": "hitl_approval",
+            "relay_decisions": "relay_decisions",
+            "explain_block": "explain_block",
+        },
+    )
+    graph.add_edge("hitl_approval", "relay_decisions")
+    graph.add_edge("relay_decisions", "monitor")
+    graph.add_conditional_edges(
+        "monitor",
+        route_on_monitor,
+        {
+            "hitl_approval": "hitl_approval",  # the adapt loop
+            "monitor": "monitor",
+            "finalize": "finalize",
+        },
+    )
+    graph.add_edge("explain_block", "finalize")
+    graph.add_edge("finalize", END)
+
+    return graph.compile(checkpointer=checkpointer or MemorySaver())
 
 
-def build_dispatch_frame(user_goal_text: str) -> dict[str, Any]:
-    """Run the graph and return the dispatch wire frame for the WS hub."""
-    graph = build_graph()
-    result = graph.invoke({"user_goal_text": user_goal_text})
-    return result["dispatch_frame"]
+# ---------------------------------------------------------------------------
+# Hub-facing entry points (called by server.py)
+# ---------------------------------------------------------------------------
+
+
+def start_goal(graph: Any, goal_text: str, goal_id: str) -> dict[str, Any]:
+    """Kick off a goal run; returns the dispatch frame for the hub to send.
+
+    TODO(v2-M1): graph.invoke({"goal_text": goal_text, "goal_id": goal_id},
+    config={"configurable": {"thread_id": goal_id}}) and pull
+    state["contract"] out (the run pauses at the device hand-off).
+    """
+    raise NotImplementedError("v2 design stub — implemented in the build pass")
+
+
+def resume_goal(graph: Any, goal_id: str, resume_value: Any) -> dict[str, Any]:
+    """Resume a paused run (plan_ready arrival, approval, adapt decision).
+
+    TODO(v2-M1): graph.invoke(Command(resume=resume_value),
+    config={"configurable": {"thread_id": goal_id}}).
+    """
+    raise NotImplementedError("v2 design stub — implemented in the build pass")

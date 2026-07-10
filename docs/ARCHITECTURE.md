@@ -1,104 +1,180 @@
-# Cloud Agent Architecture
+# Cloud Agent Architecture (v2)
 
 ## Role
 
-The cloud agent is one of three tiers in GoalFlow:
+GoalFlow v2 is a **general goal-based agent** (not a meal app). The cloud is one of
+three tiers:
 
-| Tier   | Owns                                   | Never does                          |
-|--------|----------------------------------------|-------------------------------------|
-| UI     | Conversation surface, approval clicks  | Talks to the device directly        |
-| Cloud  | **Talk + memory**, goal decomposition, routing | Touches actuators / local state |
-| Device | **Local truth**, actuators, safety gate | Talks to the UI directly           |
+| Tier   | Owns                                                    | Never does                    |
+|--------|---------------------------------------------------------|-------------------------------|
+| UI     | Conversation surface, approval clicks, the live stream  | Talks to the device directly  |
+| Cloud  | **Conversation + memory**, goal interpretation, the generic Task Contract, HITL, routing | Touches actuators / local state |
+| Device | **Local truth**, SK function-calling planner, capability modules, Safety filter, actuators | Talks to the UI directly |
 
 The cloud:
 
-1. Owns the **conversation** with the human and the **family memory**.
-2. Resolves ambiguity in the user's goal (M2).
-3. Decomposes the goal into a frozen-shape **Task Contract** (`dispatch`, see
-   [`../CONTRACT.md`](../CONTRACT.md)).
-4. **Relays**: routes device output (`plan_ready`, `proposal`, `status`) to the
-   UI and user decisions (`approval`) back to the device.
+1. Owns the **conversation** with the human and the **family memory** (hard/soft split).
+2. **Interprets** the fuzzy goal into a generic **Task Contract** (`dispatch`,
+   see [`../CONTRACT.md`](../CONTRACT.md)) — LLM structured output, any domain.
+3. **Dispatches** to the device, which does the actual SK function-calling planning
+   over its advertised capability modules.
+4. **Relays** the streamed `agent_event`s, the plan, `proposal`/`status` to the UI,
+   and `approval`/`control` back to the device.
+5. Holds the **HITL approval pause** as a durable LangGraph `interrupt()`.
 
-Two gates, deliberately distinct:
+Two gates, deliberately distinct — **"LLM plans, code checks"**:
 
-- **Safety gate** — deterministic **code on the device**; reads only
+- **Safety gate** — deterministic **code on the device**; enforces only
   `constraints.hard`; *blocks*.
-- **Approval gate** — the **user via the cloud**; *waits*.
+- **Approval gate** — the **user via the cloud** (LangGraph `interrupt()`); *waits*.
 
-Slogan: **"LLM plans, code checks."**
+**LLM-only**: goal interpretation is a real LLM call (OpenRouter, OpenAI-compatible
+API). There are **no scripted/rule fallbacks** — if the LLM is unavailable the goal
+fails loudly with a structured error, it is never faked.
 
-## WebSocket hub (M1)
+## The LangGraph StateGraph
 
-`src/goalflow_cloud/server.py` — FastAPI app exposing a single WS endpoint
-(`/ws`).
+`src/goalflow_cloud/graph/nodes.py`. Advanced LangGraph: `StateGraph` +
+conditional edges + `interrupt()` HITL + a checkpointer for durable state across
+the approval pause. One graph run per goal; `thread_id = goal_id` so the
+checkpointer can resume the exact paused state when the approval (or an adaptation
+decision) arrives, even across process restarts (swap `MemorySaver` for a
+persistent checkpointer without touching the graph).
 
-- **Connection registry keyed by role.** On connect, a client's first frame
-  must be `hello` with `role: "ui" | "device"`. The hub replies `hello_ack`
-  with a `session_id` and stores the socket in `registry[role]` (one active
-  connection per role for the POC; a reconnect replaces the entry).
-- **Routing rules** (on `type` + sender role):
+### State schema
 
-  | Incoming `type` | From   | Cloud action                                             |
-  |-----------------|--------|----------------------------------------------------------|
-  | `user_goal`     | ui     | M1: build **hardcoded** `dispatch`, send to device. M2: run LangGraph pipeline first. |
-  | `plan_ready`    | device | Re-wrap as `present_plan`, send to UI (may add display hints). |
-  | `proposal`      | device | Relay to UI for a user decision.                         |
-  | `status`        | device | Relay to UI.                                             |
-  | `approval`      | ui     | Relay to device (correlated by `correlation_id`).        |
-
-- **Reliability:** clients reconnect on drop; the hub dedupes device messages
-  on `correlation_id` (a seen-set per `goal_id` is enough for the POC).
-- The UI and device **never** talk directly; the hub is the only path.
-
-## LangGraph pipeline (M2 — signatures only today)
-
-`src/goalflow_cloud/graph/nodes.py` defines the node chain that turns a raw
-`user_goal` into a `dispatch`:
-
+```python
+class GraphState(TypedDict, total=False):
+    goal_text: str                     # raw user_goal text
+    intent: dict                       # normalized intent (LLM structured output):
+                                       #   domain, objective, success_criteria,
+                                       #   scope, time_window (relative to today)
+    memory: dict                       # loaded profile: hard block + soft prefs + context
+    contract: dict                     # the assembled generic Dispatch frame
+    plan: dict                         # plan_ready payload from the device
+    pending_approvals: list[dict]      # proposals awaiting user decisions
+    decisions: list[dict]              # approval decisions returned by interrupt()
+    task_status: str                   # CONTRACT v2 lifecycle value
+    event_log: list[dict]              # append-only agent_event/trace log (Annotated add)
+    goal_id: str
+    correlation_id: str
+    error: str                         # structured failure (LLM-only: no fallback path)
 ```
-user_goal → [ambiguity] → [memory] → [decompose] → [relay] → dispatch
+
+### Nodes
+
+| Node               | Harness module          | Does |
+|--------------------|-------------------------|------|
+| `interpret_goal`   | Goal Interpreter        | LLM **structured output**: fuzzy text → `{domain, objective, success_criteria, scope, time_window}`. Time window derived **relative to real today**. |
+| `load_memory`      | Memory & Constraints    | Load the generic profile; split channels: `hard` → verbatim into `constraints.hard`; `soft` + context → planning bias only. |
+| `build_contract`   | Goal Interpreter + Memory | Assemble + validate the generic `Dispatch`; hard block copied as **data, never LLM output**. |
+| `dispatch_to_device` | (hub hand-off)        | Hand the frame to the WS hub; device now grounds/plans (SK function calling) while the cloud relays its `agent_event` stream. |
+| `collect_plan`     | (hub hand-off)          | Resume point: the hub feeds the device's `plan_ready` payload into the paused graph. |
+| `hitl_approval`    | Approval / Consent (HITL) | **`interrupt()`** with the tiered proposals; graph state checkpointed; resumes with the user's decisions. |
+| `relay_decisions`  | Actuator hand-off       | Forward the `approval` to the device; move to executing/monitoring. |
+| `monitor`          | Monitor & Adapt         | Track `status`/`proposal`; a **material** change routes back into the approval loop (adapt). |
+| `explain_block`    | Trace / Explain         | Safety filter blocked the plan → produce the user-facing explanation instead of a plan. |
+| `finalize`         | Trace / Explain         | Close out the goal; emit the final trace. |
+
+### Conditional edges
+
+- after `interpret_goal`: `error` set → `explain_block` (LLM-only, fail loudly);
+  else → `load_memory`.
+- after `collect_plan` (`route_on_safety`): `safety.gate == "blocked"` →
+  `explain_block`; any proposal with `requires_approval` → `hitl_approval`;
+  auto-tier only → `relay_decisions`.
+- after `monitor` (`route_on_monitor`): material change / adaptation `proposal` →
+  `hitl_approval` (the **adapt loop**); `task_status == "done"` → `finalize`;
+  else keep monitoring.
+
+### Diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> interpret_goal
+    interpret_goal --> load_memory : intent ok
+    interpret_goal --> explain_block : LLM error (no fallback)
+    load_memory --> build_contract
+    build_contract --> dispatch_to_device
+    dispatch_to_device --> collect_plan : device plans (SK), agent_events streamed
+    collect_plan --> hitl_approval : approval needed
+    collect_plan --> explain_block : safety blocked
+    collect_plan --> relay_decisions : auto-tier only
+    hitl_approval --> relay_decisions : interrupt() resumed with decisions
+    relay_decisions --> monitor
+    monitor --> hitl_approval : material change (adapt loop)
+    monitor --> finalize : done
+    explain_block --> finalize
+    finalize --> [*]
 ```
 
-- **ambiguity** — decide whether the goal is actionable; if not, formulate a
-  clarifying question back to the UI instead of proceeding.
-- **memory** — load the family profile and split it:
-  - **hard constraints** (allergens, dietary, medical) are **injected verbatim**
-    into `constraints.hard` of the contract — *never* left to LLM semantics,
-    because the device safety gate reads exactly this block;
-  - **soft preferences** (dislikes, prefer, notes) go into `constraints.soft` /
-    `context_hints` and only **bias** planning.
-- **decompose** — LLM call (OpenRouter) that fills the rest of the Task
-  Contract: objective, scope, time_window, optimization, autonomy.
-- **relay** — validate against the Pydantic contract models and hand off to the
-  hub for dispatch to the device.
+### Checkpointer
 
-### LLM access
+`compile(checkpointer=MemorySaver())` (from `langgraph-checkpoint`). Every
+`invoke`/`resume` uses `config={"configurable": {"thread_id": goal_id}}`. The
+`interrupt()` in `hitl_approval` persists the paused state, so the approval can
+arrive minutes later (or after a reconnect) and resume exactly where it stopped.
+The same mechanism carries the adapt loop: an adaptation `proposal` re-enters
+`hitl_approval` on the same thread.
 
-Via **OpenRouter** (OpenAI-compatible; `base_url` from `OPENROUTER_BASE_URL`,
-default `https://openrouter.ai/api/v1`) using `langchain-openai`. Default model
-`anthropic/claude-sonnet-5` — configurable via `OPENROUTER_MODEL`. A
-**scripted/mock fallback** implements the same interface so the pipeline runs
-without a key or network.
+## agent_event stream relay
 
-## Memory (M2 — loader signature only today)
+`agent_event` frames are a **device → cloud → ui passthrough**: the hub validates
+the envelope, tags the log with the `correlation_id`, appends to the graph's
+`event_log`, and forwards the frame unchanged. The graph never blocks the stream —
+streaming happens at the hub layer while the graph waits at its hand-off points.
+`seq` gives the UI ordering + dedupe.
 
-`src/goalflow_cloud/memory/store.py` reads
-`data/memory/family_profile.json` (mocked for the POC — "fake the world").
+## Memory: the hard-vs-soft split
 
-The split is the important design decision:
+`src/goalflow_cloud/memory/store.py` + `data/memory/family_profile.json` (generic,
+not meal-only):
 
-- `hard` → copied field-for-field into `dispatch.constraints.hard`. This is a
-  **data path**, not a prompt path.
-- `soft` + members + context → prompt context for the decompose node only.
+- **hard** — the safety policy: `allergens`, `medical`, `dietary`, `budget_cap`,
+  `quiet_hours`. Injected **VERBATIM** into `dispatch.constraints.hard` — a pure
+  data path the LLM never generates, edits, or paraphrases. The device Safety
+  filter enforces exactly this block and nothing else.
+- **soft** — free-form preferences (likes/dislikes/habits per domain). Fed to the
+  LLM as planning **bias** only; never safety-enforced.
+- **family context** — members, routines, notes; grounds the `context` object.
 
-## Module map
+## WebSocket hub
 
-```
-src/goalflow_cloud/
-  config.py            # Settings from env (.env.example documents them)
-  server.py            # FastAPI + WS hub, connection registry, router   [M1]
-  models/contract.py   # Pydantic mirror of Contract v0 (canonical: CONTRACT.md)
-  graph/nodes.py       # ambiguity / memory / decompose / relay nodes    [M2]
-  memory/store.py      # family_profile.json loader                      [M2]
-data/memory/family_profile.json
-```
+`src/goalflow_cloud/server.py` — FastAPI, single `/ws` endpoint.
+
+- **Registration:** first frame must be `hello` (`role: ui|device`); hub replies
+  `hello_ack` with a `session_id`. One active socket per role; reconnect replaces.
+- **Routing (type + sender role):**
+
+  | Incoming `type` | From   | Cloud action |
+  |-----------------|--------|--------------|
+  | `capabilities`  | device | Cache the module registry; relay to UI. |
+  | `user_goal`     | ui     | Run the graph → `dispatch` to device. |
+  | `agent_event`   | device | **Passthrough relay** to UI; append to event log. |
+  | `plan_ready`    | device | Resume graph; re-wrap as `present_plan` (+`payload.knew`) → UI. |
+  | `proposal`      | device | Relay to UI; enters the adapt loop. |
+  | `status`        | device | Relay to UI; feeds `monitor`. |
+  | `approval`      | ui     | Resume the `interrupt()`; forward to device. |
+  | `control`       | ui     | Forward to device (generic clock: `advance_day`/`reset`/`set_date`). |
+
+- UI and device **never** talk directly; dedupe on `correlation_id`.
+
+## Structured logging (first-class requirement)
+
+Both agents log **leveled, structured, correlation-id-tagged** lines. On the cloud:
+
+- `LOG_LEVEL` from config; one formatter emitting structured key=value/JSON records.
+- Every log record carries `correlation_id` (and `goal_id` when known) via a
+  `contextvars`-backed logging filter, so one goal's trail is grep-able across
+  hub, graph, and LLM calls.
+- Every inbound/outbound frame is logged at INFO with `direction`, `role`, `type`,
+  `goal_id`, `correlation_id`; payload bodies at DEBUG.
+- Node enter/exit and `interrupt()`/resume are logged — this is the Trace/Explain
+  harness surface and the debugging story.
+
+## LLM access
+
+LLM-only via **OpenRouter** (OpenAI-compatible): `OPENROUTER_BASE_URL`
+(`https://openrouter.ai/api/v1`), `OPENROUTER_MODEL` (default
+`openai/gpt-oss-120b`), through `langchain-openai`'s `ChatOpenAI` with structured
+output. No mock, no scripted fallback.

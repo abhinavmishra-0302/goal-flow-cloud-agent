@@ -1,7 +1,7 @@
 [project]
 name = "goalflow-cloud-agent"
-version = "0.1.0"
-description = "GoalFlow POC cloud agent: conversation, memory, goal decomposition, and WebSocket hub between UI and on-device agent."
+version = "2.0.0"
+description = "GoalFlow v2 cloud agent: conversation + memory, generic Task Contract interpretation (LangGraph), HITL interrupt, and WebSocket hub between UI and on-device agent."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
@@ -10,6 +10,7 @@ dependencies = [
     "uvicorn[standard]",
     "websockets",
     "langgraph",
+    "langgraph-checkpoint",
     "langchain-openai",
     "python-dotenv",
     "pydantic",
