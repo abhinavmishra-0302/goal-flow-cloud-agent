@@ -100,6 +100,24 @@ def _event(state: GraphState, event: str, payload: dict[str, Any] | None = None)
     }
 
 
+def _canonical_domain(raw_domain: str, goal_text: str, objective: str) -> str:
+    haystack = " ".join([raw_domain, goal_text, objective]).lower()
+    guest_keywords = (
+        "guest",
+        "host",
+        "hosting",
+        "dinner party",
+        "dinner for",
+        "entertain",
+        "visitors",
+        "company over",
+        "have people over",
+    )
+    if any(keyword in haystack for keyword in guest_keywords):
+        return "guest_dinner"
+    return "meal_plan"
+
+
 # ---------------------------------------------------------------------------
 # Nodes (harness modules) — signatures + TODO stubs
 # ---------------------------------------------------------------------------
@@ -225,7 +243,7 @@ def build_contract(state: GraphState) -> GraphState:
         "type": "dispatch",
         "goal_id": goal_id,
         "correlation_id": correlation_id,
-        "domain": intent["domain"],
+        "domain": _canonical_domain(intent["domain"], state.get("goal_text", ""), intent["objective"]),
         "objective": intent["objective"],
         "success_criteria": intent.get("success_criteria", []),
         "constraints": {
