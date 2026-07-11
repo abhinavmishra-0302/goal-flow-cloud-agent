@@ -377,6 +377,8 @@ class Status(_ContractModel):
 class ControlPayload(_ContractModel):
     #: ISO date for command == "set_date".
     date: str | None = None
+    #: Daily demo event id for command == "trigger_event".
+    event_id: str | None = None
 
 
 class Control(_ContractModel):
@@ -387,7 +389,7 @@ class Control(_ContractModel):
 
     type: Literal["control"] = "control"
     goal_id: str
-    command: Literal["advance_day", "reset", "set_date"]
+    command: Literal["advance_day", "reset", "set_date", "trigger_event"]
     payload: ControlPayload = Field(default_factory=ControlPayload)
 
 
