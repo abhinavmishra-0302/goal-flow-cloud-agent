@@ -109,25 +109,38 @@ def log_frame(direction: str, role: str, frame: dict[str, Any]) -> None:
 
 
 class ConnectionRegistry:
-    """Active WebSocket connections, keyed by role ("ui" | "device").
+    """Active WebSocket connections.
 
-    One active socket per role; a reconnect replaces the previous socket.
+    "device" is single-slot: commands must target exactly one device, so a
+    device reconnect replaces (1012-closes) the previous device socket.
+
+    "ui" is MULTI-slot: any number of dashboards may watch concurrently and
+    ui-bound frames are broadcast to all of them. UI sockets are NEVER
+    evicted — the old one-socket-per-role eviction meant any two ui clients
+    (a second tab, a stale pre-reload tab, a WSL-side test browser next to
+    the user's Windows Chrome, a probe script...) closed each other with 1012
+    and, since each reconnected after ~1.5s, produced an endless mutual
+    eviction storm while the real tab sat on a red "closed" header.
     """
 
     def __init__(self) -> None:
-        self._connections: dict[Role, WebSocket] = {}
+        self._device: WebSocket | None = None
+        self._ui: list[WebSocket] = []
 
     async def register(self, role: Role, websocket: WebSocket) -> str:
         """Store the socket under ``role``; reply hello_ack; return session_id.
 
         """
-        old = self._connections.get(role)
-        if old is not None and old is not websocket:
-            try:
-                await old.close(code=1012, reason="replaced by a new connection")
-            except RuntimeError:
-                pass
-        self._connections[role] = websocket
+        if role == "device":
+            old = self._device
+            if old is not None and old is not websocket:
+                try:
+                    await old.close(code=1012, reason="replaced by a new connection")
+                except Exception:
+                    logger.debug("old_device_close_failed", exc_info=True)
+            self._device = websocket
+        elif websocket not in self._ui:
+            self._ui.append(websocket)
         session_id = str(uuid4())
         ack = HelloAck(role=role, session_id=session_id).model_dump(mode="json")
         log_frame("out", role, ack)
@@ -135,20 +148,39 @@ class ConnectionRegistry:
         return session_id
 
     async def unregister(self, role: Role, websocket: WebSocket | None = None) -> None:
-        """Drop the socket for ``role`` if it is still the active one."""
-        if websocket is None or self._connections.get(role) is websocket:
-            self._connections.pop(role, None)
+        """Drop ``websocket`` for ``role`` (or every socket of ``role`` if None)."""
+        if role == "device":
+            if websocket is None or self._device is websocket:
+                self._device = None
+        elif websocket is None:
+            self._ui.clear()
+        elif websocket in self._ui:
+            self._ui.remove(websocket)
 
     async def send_to(self, role: Role, frame: dict[str, Any]) -> None:
-        """Send ``frame`` as JSON to the registered role; structured-log it.
+        """Send ``frame`` as JSON to the role (broadcast for ui); log it.
 
+        A socket that dies mid-send (disconnect race) is dropped from the
+        registry instead of letting the exception kill the sender's own
+        connection handler.
         """
-        websocket = self._connections.get(role)
         log_frame("out", role, frame)
-        if websocket is None:
+        targets = [self._device] if role == "device" else list(self._ui)
+        live_targets = [ws for ws in targets if ws is not None]
+        if not live_targets:
             logger.warning("send_drop role=%s reason=not_connected type=%s", role, frame.get("type"))
             return
-        await websocket.send_json(frame)
+        for websocket in live_targets:
+            try:
+                await websocket.send_json(frame)
+            except Exception:
+                logger.warning(
+                    "send_failed role=%s type=%s — dropping dead socket",
+                    role,
+                    frame.get("type"),
+                    exc_info=True,
+                )
+                await self.unregister(role, websocket)
 
 
 registry = ConnectionRegistry()
@@ -182,7 +214,11 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         role = hello.role
         await registry.register(role, websocket)
         if role == "ui" and device_capabilities is not None:
-            await registry.send_to("ui", device_capabilities.model_dump(mode="json"))
+            # Only the NEWLY-joined ui socket needs the cached registry;
+            # broadcasting would re-send it to every already-connected tab.
+            caps = device_capabilities.model_dump(mode="json")
+            log_frame("out", role, caps)
+            await websocket.send_json(caps)
 
         while True:
             frame = await websocket.receive_json()
@@ -199,7 +235,11 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     except ValidationError:
         # Only the initial hello handshake reaches here now.
         logger.exception("websocket_protocol_error role=%s", role or "unknown")
-        await websocket.close(code=1003, reason="invalid contract frame")
+        try:
+            await websocket.close(code=1003, reason="invalid contract frame")
+        except RuntimeError:
+            # Client already disconnected — closing again raises in Starlette.
+            pass
     except WebSocketDisconnect:
         logger.info("websocket_disconnect role=%s", role or "unknown")
     finally:
