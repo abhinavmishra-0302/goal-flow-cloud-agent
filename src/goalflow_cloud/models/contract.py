@@ -294,6 +294,44 @@ class PresentPlan(_ContractModel):
 
 
 # ---------------------------------------------------------------------------
+# understanding (cloud -> ui) / understanding_response (ui -> cloud)
+# ---------------------------------------------------------------------------
+
+
+class UnderstandingPayload(_ContractModel):
+    """Pre-planning confirmation payload shown before device dispatch."""
+
+    objective: str
+    domain: str = ""
+    #: Display-ready hard-constraint chips, same shape as PlanPayload.knew.
+    knew: dict[str, Any] = Field(default_factory=dict)
+    thought: str = ""
+    time_window: dict[str, str] | None = None
+
+
+class Understanding(_ContractModel):
+    """Cloud -> ui: interpreted objective + hard constraints, awaiting confirm."""
+
+    type: Literal["understanding"] = "understanding"
+    goal_id: str
+    correlation_id: str | None = None
+    task_status: TaskStatus = "grounding"
+    payload: UnderstandingPayload
+
+
+class UnderstandingResponsePayload(_ContractModel):
+    confirmed: bool
+
+
+class UnderstandingResponse(_ContractModel):
+    """UI -> cloud: confirm or decline the pre-planning understanding gate."""
+
+    type: Literal["understanding_response"] = "understanding_response"
+    goal_id: str
+    payload: UnderstandingResponsePayload
+
+
+# ---------------------------------------------------------------------------
 # approval (ui -> cloud -> device)
 # ---------------------------------------------------------------------------
 
@@ -407,6 +445,8 @@ ContractMessage = Annotated[
         AgentEvent,
         PlanReady,
         PresentPlan,
+        Understanding,
+        UnderstandingResponse,
         Approval,
         Proposal,
         Status,

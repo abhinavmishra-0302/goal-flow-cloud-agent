@@ -6,7 +6,8 @@ frames/reconnects. One graph run per goal; ``thread_id = goal_id``.
 
 Pipeline (see docs/ARCHITECTURE.md for the full design + Mermaid diagram):
 
-    interpret_goal -> load_memory -> build_contract -> dispatch_to_device
+    interpret_goal -> load_memory -> present_understanding [interrupt()]
+        -> build_contract -> dispatch_to_device
         -> [device plans; agent_events stream through the hub]
         -> collect_plan -> (safety route) -> hitl_approval [interrupt()]
         -> relay_decisions -> monitor -> (adapt loop | finalize)
@@ -58,6 +59,10 @@ class GraphState(TypedDict, total=False):
     intent: dict[str, Any]
     #: Loaded memory profile: hard safety block + soft prefs + family context.
     memory: dict[str, Any]
+    #: Pre-planning understanding shown to the user before dispatch.
+    understanding: dict[str, Any]
+    #: User response to the understanding gate.
+    understanding_confirmed: bool
     #: The assembled generic Dispatch frame (models.contract.Dispatch shape).
     contract: dict[str, Any]
     #: plan_ready payload from the device (plan + tiered proposals + safety).
@@ -116,6 +121,99 @@ def _canonical_domain(raw_domain: str, goal_text: str, objective: str) -> str:
     if any(keyword in haystack for keyword in guest_keywords):
         return "guest_dinner"
     return "meal_plan"
+
+
+def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
+    """Display-ready hard-constraint chips shared by the gate and plan card."""
+    hard = hard or {}
+    knew: dict[str, Any] = {}
+
+    def add(label: str, value: Any) -> None:
+        # Only surface flat, display-ready values (str / list[str]); never raw
+        # nested objects except quiet_hours, which is intentionally stringified.
+        if isinstance(value, list):
+            items = [str(v) for v in value if str(v).strip()]
+            if items:
+                knew[label] = items
+        elif isinstance(value, str) and value.strip():
+            knew[label] = value
+        elif isinstance(value, (int, float)) and value:
+            knew[label] = str(value)
+
+    add("allergens", hard.get("allergens"))
+    add("dietary", hard.get("dietary"))
+    add("medical", hard.get("medical"))
+    if hard.get("budget_cap"):
+        knew["budget"] = f"${hard.get('budget_cap')}"
+    if hard.get("quiet_hours"):
+        knew["quiet hours"] = str(hard.get("quiet_hours"))
+    return knew
+
+
+def _understanding_thought_fallback(intent: dict[str, Any], hard: dict[str, Any], domain: str) -> str:
+    tw = intent.get("time_window") or {}
+    constraint_count = (
+        len(hard.get("allergens") or [])
+        + len(hard.get("medical") or [])
+        + len(hard.get("dietary") or [])
+        + (1 if hard.get("budget_cap") else 0)
+        + (1 if hard.get("quiet_hours") else 0)
+    )
+    label = domain.replace("_", " ")
+    start = tw.get("start", "")
+    end = tw.get("end", "")
+    window = f"{start} to {end}" if start and end else start or end
+    window_part = f" for {window}" if window else ""
+    guard = ""
+    if constraint_count:
+        guard = f" while honoring {constraint_count} household constraint"
+        if constraint_count != 1:
+            guard += "s"
+    return f"I'll shape a {label}{window_part}{guard}, then have your Family Hub build the plan."
+
+
+def _understanding_thought(intent: dict[str, Any], hard: dict[str, Any], domain: str) -> str:
+    """Tiny LLM one-liner for the understanding gate, with a deterministic fallback."""
+    fallback = _understanding_thought_fallback(intent, hard, domain)
+    settings = get_settings()
+    max_tokens = settings.openrouter_max_tokens
+    thought_tokens = min(max_tokens, 60) if isinstance(max_tokens, int) and max_tokens > 0 else 60
+    try:
+        llm = ChatOpenAI(
+            model=settings.openrouter_model,
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+            temperature=0.2,
+            max_tokens=thought_tokens,
+            timeout=15,
+            max_retries=0,
+        )
+        response = llm.invoke(
+            [
+                (
+                    "system",
+                    "Write one short sentence describing how GoalFlow will approach the user's goal. "
+                    "Keep it under 22 words. Do not mention internal systems or uncertainty.",
+                ),
+                (
+                    "human",
+                    "Objective: {objective}\nDomain: {domain}\nTime window: {time_window}\n"
+                    "Hard constraints: {hard}".format(
+                        objective=intent.get("objective", ""),
+                        domain=domain,
+                        time_window=intent.get("time_window") or {},
+                        hard=hard,
+                    ),
+                ),
+            ]
+        )
+        thought = " ".join(str(getattr(response, "content", "") or "").split())
+        if len(thought) > 180:
+            thought = thought[:177].rstrip() + "..."
+        return thought if thought else fallback
+    except Exception:
+        logger.exception("understanding_thought_llm_failed")
+        return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +315,46 @@ def load_memory(state: GraphState) -> GraphState:
         "memory": memory,
         "task_status": "grounding",
         "event_log": [_event(state, "memory_loaded", {"family_id": memory.get("family_id")})],
+    }
+
+
+def present_understanding(state: GraphState) -> GraphState:
+    """Confirm-understanding gate: pause before contract build and dispatch."""
+    logger.info("graph_node_enter node=present_understanding")
+    intent = state["intent"]
+    memory = state["memory"]
+    hard = memory.get("hard") or {}
+    domain = _canonical_domain(intent["domain"], state.get("goal_text", ""), intent["objective"])
+    understanding = {
+        "objective": intent["objective"],
+        "domain": domain,
+        "time_window": intent.get("time_window") or {},
+        "hard": hard,
+        "knew": _hard_knew(hard),
+        "thought": _understanding_thought(intent, hard, domain),
+    }
+    incoming = interrupt(
+        {
+            "kind": "understanding_confirmation",
+            "goal_id": state.get("goal_id"),
+            "understanding": understanding,
+        }
+    )
+    if isinstance(incoming, dict) and "payload" in incoming:
+        incoming = incoming["payload"]
+    confirmed = bool(isinstance(incoming, dict) and incoming.get("confirmed"))
+    logger.info("graph_node_exit node=present_understanding confirmed=%s", confirmed)
+    return {
+        "understanding": understanding,
+        "understanding_confirmed": confirmed,
+        "task_status": "grounding",
+        "event_log": [
+            _event(
+                state,
+                "understanding_confirmed" if confirmed else "understanding_declined",
+                {},
+            )
+        ],
     }
 
 
@@ -377,6 +515,16 @@ def relay_decisions(state: GraphState) -> GraphState:
     }
 
 
+def goal_declined(state: GraphState) -> GraphState:
+    """User declined the understanding before planning; end without dispatch."""
+    logger.info("graph_node_enter node=goal_declined")
+    return {
+        "task_status": "done",
+        "explanation": {"type": "declined", "message": "Goal cancelled before planning."},
+        "event_log": [_event(state, "goal_declined", {})],
+    }
+
+
 def monitor(state: GraphState) -> GraphState:
     """Monitor & Adapt: track device status/proposals for material changes.
 
@@ -458,6 +606,11 @@ def route_after_interpret(state: GraphState) -> str:
     return "explain_block" if state.get("error") else "load_memory"
 
 
+def route_after_understanding(state: GraphState) -> str:
+    """confirmed -> build_contract; declined -> graceful terminal node."""
+    return "build_contract" if state.get("understanding_confirmed") else "goal_declined"
+
+
 def route_on_safety(state: GraphState) -> str:
     """After collect_plan: blocked -> explain_block; approvals pending ->
     hitl_approval; auto-tier only -> relay_decisions."""
@@ -494,11 +647,13 @@ def build_graph(checkpointer: Any | None = None) -> Any:
 
     graph.add_node("interpret_goal", interpret_goal)
     graph.add_node("load_memory", load_memory)
+    graph.add_node("present_understanding", present_understanding)
     graph.add_node("build_contract", build_contract)
     graph.add_node("dispatch_to_device", dispatch_to_device)
     graph.add_node("collect_plan", collect_plan)
     graph.add_node("hitl_approval", hitl_approval)
     graph.add_node("relay_decisions", relay_decisions)
+    graph.add_node("goal_declined", goal_declined)
     graph.add_node("monitor", monitor)
     graph.add_node("explain_block", explain_block)
     graph.add_node("finalize", finalize)
@@ -509,7 +664,12 @@ def build_graph(checkpointer: Any | None = None) -> Any:
         route_after_interpret,
         {"load_memory": "load_memory", "explain_block": "explain_block"},
     )
-    graph.add_edge("load_memory", "build_contract")
+    graph.add_edge("load_memory", "present_understanding")
+    graph.add_conditional_edges(
+        "present_understanding",
+        route_after_understanding,
+        {"build_contract": "build_contract", "goal_declined": "goal_declined"},
+    )
     graph.add_edge("build_contract", "dispatch_to_device")
     # Device plans here (SK function calling); the hub streams agent_events
     # and resumes the graph at collect_plan when plan_ready arrives.
@@ -535,6 +695,7 @@ def build_graph(checkpointer: Any | None = None) -> Any:
         },
     )
     graph.add_edge("explain_block", "finalize")
+    graph.add_edge("goal_declined", END)
     graph.add_edge("finalize", END)
 
     return graph.compile(checkpointer=checkpointer or MemorySaver())
@@ -545,24 +706,36 @@ def build_graph(checkpointer: Any | None = None) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def start_goal(graph: Any, goal_text: str, goal_id: str) -> dict[str, Any]:
-    """Kick off a goal run; returns the dispatch frame for the hub to send.
+def _interrupt_value(interrupt_obj: Any) -> Any:
+    if hasattr(interrupt_obj, "value"):
+        return interrupt_obj.value
+    if isinstance(interrupt_obj, dict):
+        return interrupt_obj.get("value", interrupt_obj)
+    return interrupt_obj
 
-    graph.invoke({"goal_text": goal_text, "goal_id": goal_id},
-    config={"configurable": {"thread_id": goal_id}}) and pull state["contract"]
-    out after the run pauses at the device hand-off.
-    """
+
+def _with_interrupt(result: Any, state_snapshot: Any) -> dict[str, Any]:
+    """Return checkpointed state plus the pending interrupt payload, if any."""
+    state = dict(getattr(state_snapshot, "values", state_snapshot) or {})
+    interrupts = []
+    if isinstance(result, dict):
+        interrupts = list(result.get("__interrupt__") or [])
+    if not interrupts:
+        for task in getattr(state_snapshot, "tasks", ()) or ():
+            task_interrupts = getattr(task, "interrupts", None) or ()
+            interrupts.extend(task_interrupts)
+    state["_interrupt"] = _interrupt_value(interrupts[0]) if interrupts else None
+    return state
+
+
+def start_goal(graph: Any, goal_text: str, goal_id: str) -> dict[str, Any]:
+    """Kick off a goal run and return checkpointed state plus any interrupt."""
     config = {"configurable": {"thread_id": goal_id}}
-    graph.invoke(
+    result = graph.invoke(
         {"goal_text": goal_text, "goal_id": goal_id, "task_status": "created", "event_log": []},
         config=config,
     )
-    state = graph.get_state(config).values
-    if state.get("error"):
-        return dict(state)
-    if not state.get("contract"):
-        raise RuntimeError("graph did not produce a dispatch contract")
-    return dict(state)
+    return _with_interrupt(result, graph.get_state(config))
 
 
 def resume_goal(graph: Any, goal_id: str, resume_value: Any) -> dict[str, Any]:
@@ -571,5 +744,5 @@ def resume_goal(graph: Any, goal_id: str, resume_value: Any) -> dict[str, Any]:
     Resume with Command(resume=resume_value), preserving the thread_id.
     """
     config = {"configurable": {"thread_id": goal_id}}
-    graph.invoke(Command(resume=resume_value), config=config)
-    return dict(graph.get_state(config).values)
+    result = graph.invoke(Command(resume=resume_value), config=config)
+    return _with_interrupt(result, graph.get_state(config))

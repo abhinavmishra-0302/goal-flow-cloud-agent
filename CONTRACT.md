@@ -64,6 +64,32 @@ The raw natural-language goal.
 { "type": "user_goal", "text": "..." }
 ```
 
+### `understanding` (cloud → ui)
+
+Emitted after the cloud interprets the goal and loads memory, before any device
+dispatch. The graph is paused until the UI answers with `understanding_response`.
+
+```json
+{ "type": "understanding", "goal_id": "...", "task_status": "grounding",
+  "payload": {
+    "objective": "...",
+    "domain": "meal_plan",
+    "knew": { "allergens": ["peanuts"], "budget": "$120" },
+    "thought": "I'll shape a meal plan around your constraints before planning.",
+    "time_window": { "start": "<ISO>", "end": "<ISO>" }
+  } }
+```
+
+### `understanding_response` (ui → cloud)
+
+```json
+{ "type": "understanding_response", "goal_id": "...",
+  "payload": { "confirmed": true } }
+```
+
+If `confirmed` is `true`, the graph resumes to `dispatch`; if `false`, it ends
+gracefully with no device dispatch.
+
 ### `dispatch` (cloud → device) — the GENERIC Task Contract
 
 ```json

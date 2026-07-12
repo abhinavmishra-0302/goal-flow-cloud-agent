@@ -3,8 +3,9 @@
 The cloud is the only path between UI and device (they NEVER talk directly).
 Routing (CONTRACT v2, see /CONTRACT.md):
 
-    ui -> cloud:      user_goal (run graph -> dispatch), approval (resume
-                      interrupt + forward), control (forward)
+    ui -> cloud:      user_goal (run graph -> understanding interrupt),
+                      understanding_response (resume -> dispatch or cancel),
+                      approval (resume interrupt + forward), control (forward)
     device -> cloud:  capabilities (cache + relay to ui),
                       agent_event (PASSTHROUGH relay to ui),
                       plan_ready (resume graph; re-wrap as present_plan +knew),
@@ -38,6 +39,9 @@ from goalflow_cloud.models.contract import (
     Proposal,
     Role,
     Status,
+    Understanding,
+    UnderstandingPayload,
+    UnderstandingResponse,
     UserGoal,
 )
 
@@ -194,6 +198,9 @@ dispatched_contracts: dict[str, dict[str, Any]] = {}
 #: Seen device correlation_ids per goal (dedupe on reconnect/replay).
 seen_correlation_ids: dict[str, set[str]] = {}
 
+#: Goals whose understanding gate has already been resumed (multi-tab dedupe).
+resolved_understandings: set[str] = set()
+
 
 # ---------------------------------------------------------------------------
 # WS endpoint + routing
@@ -271,6 +278,8 @@ async def route_message(sender_role: Role, frame: dict[str, Any]) -> None:
 
     if sender_role == "ui" and frame_type == "user_goal":
         await handle_user_goal(UserGoal(**frame))
+    elif sender_role == "ui" and frame_type == "understanding_response":
+        await handle_understanding_response(UnderstandingResponse(**frame))
     elif sender_role == "ui" and frame_type == "approval":
         await handle_approval(Approval(**frame))
     elif sender_role == "ui" and frame_type == "control":
@@ -297,12 +306,13 @@ async def route_message(sender_role: Role, frame: dict[str, Any]) -> None:
 
 
 async def handle_user_goal(user_goal: UserGoal) -> None:
-    """Run the LangGraph pipeline and dispatch the generic Task Contract.
+    """Run the graph to the understanding gate and send it to the UI.
 
     """
     import asyncio
 
     goal_id = str(uuid4())
+    resolved_understandings.discard(goal_id)
     goal_id_var.set(goal_id)
     logger.info("task_status status=created")
     state = await asyncio.to_thread(graph_nodes.start_goal, graph, user_goal.text, goal_id)
@@ -318,8 +328,109 @@ async def handle_user_goal(user_goal: UserGoal) -> None:
             },
         )
         return
-    frame = state["contract"]
-    dispatched_contracts[goal_id] = frame
+
+    interrupt_payload = state.get("_interrupt")
+    if isinstance(interrupt_payload, dict) and interrupt_payload.get("kind") == "understanding_confirmation":
+        understanding = interrupt_payload.get("understanding") or {}
+        hard = understanding.get("hard") or {}
+        frame = Understanding(
+            goal_id=goal_id,
+            payload=UnderstandingPayload(
+                objective=understanding.get("objective", ""),
+                domain=understanding.get("domain", ""),
+                knew=understanding.get("knew") or graph_nodes._hard_knew(hard),
+                thought=understanding.get("thought", ""),
+                time_window=understanding.get("time_window") or None,
+            ),
+        )
+        logger.info("task_status status=grounding gate=understanding")
+        await registry.send_to("ui", frame.model_dump(mode="json", exclude_none=True))
+        return
+
+    frame = state.get("contract")
+    if frame:
+        dispatched_contracts[goal_id] = frame
+        logger.info("task_status status=planning")
+        await registry.send_to("device", frame)
+        return
+
+    await registry.send_to(
+        "ui",
+        {
+            "type": "status",
+            "goal_id": goal_id,
+            "correlation_id": state.get("correlation_id") or "-",
+            "task_status": "done",
+            "payload": {"material": False, "executed": [], "note": "Goal paused without an understanding payload."},
+        },
+    )
+
+
+async def handle_understanding_response(response: UnderstandingResponse) -> None:
+    """Resume the pre-planning gate; dispatch only after confirmed."""
+    import asyncio
+
+    if response.goal_id in resolved_understandings:
+        logger.info("understanding_response_dedupe_drop goal_id=%s", response.goal_id)
+        return
+    resolved_understandings.add(response.goal_id)
+
+    confirmed = response.payload.confirmed
+    state = await asyncio.to_thread(
+        graph_nodes.resume_goal,
+        graph,
+        response.goal_id,
+        {"confirmed": confirmed},
+    )
+    if not confirmed:
+        await registry.send_to(
+            "ui",
+            {
+                "type": "status",
+                "goal_id": response.goal_id,
+                "correlation_id": state.get("correlation_id") or "-",
+                "task_status": "done",
+                "payload": {
+                    "material": False,
+                    "executed": [],
+                    "note": "Goal cancelled before planning.",
+                },
+            },
+        )
+        return
+
+    if state.get("error"):
+        await registry.send_to(
+            "ui",
+            {
+                "type": "status",
+                "goal_id": response.goal_id,
+                "correlation_id": state.get("correlation_id") or "-",
+                "task_status": "done",
+                "payload": {"material": False, "executed": [], "note": state["error"]},
+            },
+        )
+        return
+
+    frame = state.get("contract")
+    if not frame:
+        await registry.send_to(
+            "ui",
+            {
+                "type": "status",
+                "goal_id": response.goal_id,
+                "correlation_id": state.get("correlation_id") or "-",
+                "task_status": "done",
+                "payload": {
+                    "material": False,
+                    "executed": [],
+                    "note": "Dispatch contract was not built after understanding confirmation.",
+                },
+            },
+        )
+        return
+
+    dispatched_contracts[response.goal_id] = frame
     logger.info("task_status status=planning")
     await registry.send_to("device", frame)
 
@@ -410,7 +521,7 @@ def build_knew(contract: dict[str, Any] | None) -> dict[str, Any]:
     soft = (contract.get("constraints") or {}).get("soft") or {}
     context = contract.get("context") or {}
 
-    knew: dict[str, Any] = {}
+    knew: dict[str, Any] = graph_nodes._hard_knew(hard)
 
     def add(label: str, value: Any) -> None:
         # Only surface flat, display-ready values (str / list[str]); never raw
@@ -424,13 +535,6 @@ def build_knew(contract: dict[str, Any] | None) -> dict[str, Any]:
         elif isinstance(value, (int, float)) and value:
             knew[label] = str(value)
 
-    add("allergens", hard.get("allergens"))
-    add("dietary", hard.get("dietary"))
-    add("medical", hard.get("medical"))
-    if hard.get("budget_cap"):
-        knew["budget"] = f"${hard.get('budget_cap')}"
-    if hard.get("quiet_hours"):
-        knew["quiet hours"] = str(hard.get("quiet_hours"))
     add("dislikes", soft.get("dislikes"))
     add("prefer", soft.get("prefer"))
     add("notes", context.get("notes"))
