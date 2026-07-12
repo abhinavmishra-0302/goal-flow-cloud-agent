@@ -1,0 +1,85 @@
+# AGENTS.md — goal-flow-cloud-agent (coding-session guide)
+
+Context for an AI/coding session working in this repo. Read this first; it is the
+fast path to being productive without re-deriving the architecture.
+
+## What this repo is
+
+The **cloud agent** of GoalFlow — a two-tier, goal-based agent POC for the Samsung
+Tizen Family Hub. This tier owns **conversation, memory, and human-in-the-loop
+orchestration**. It is a FastAPI WebSocket **hub**: the UI and the device each open
+one outbound WS to it; the UI and device NEVER talk directly. Driving use case:
+*"help my family eat healthier this week and reduce food waste"* → an adaptive,
+approval-gated weekly dinner plan (also a `guest_dinner` domain).
+
+Sibling repos (all under `~/ashu/git/`): `goal-flow-agent-chat-ui` (React UI),
+`goal-flow-device-agent-ubuntu` (.NET/SK device brain), `goal-flow-device-agent-tizen`
+(frozen port), `goal-flow-agents` (cross-cutting docs). The **canonical wire
+contract lives HERE**: `CONTRACT.md` (mirrored as `types/contract.ts` in the UI and
+`Contracts/*.cs` in the device). Change `CONTRACT.md` first when the protocol moves.
+
+## Stack & run
+
+- Python 3.11+, FastAPI + `uvicorn`, **LangGraph** (StateGraph + `interrupt()` HITL +
+  `MemorySaver` checkpointer, `thread_id = goal_id`). **LLM-only** via OpenRouter —
+  no scripted/rules fallback; it fails loudly.
+- Run the hub: `./run.sh` (sources `.env`, runs `uvicorn goalflow_cloud.server:app`
+  on `WS_HOST:WS_PORT`, default `0.0.0.0:8000`, WS endpoint `/ws`).
+- Headless graph sanity check (no hub/sockets): `python scripts/run_graph_demo.py "<goal>"`.
+- Env (`.env`, see `.env.example`): `OPENROUTER_API_KEY` (required),
+  `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL` (default `openai/gpt-oss-120b` — the
+  `:free` variants are 429-throttled/unusable), `OPENROUTER_MAX_TOKENS`,
+  `WS_HOST`/`WS_PORT`, `LOG_LEVEL`.
+
+## Architecture / key files
+
+- `src/goalflow_cloud/server.py` — the `/ws` hub. `ConnectionRegistry` routes by role.
+  **The `ui` role is MULTI-slot (broadcast, never evict); `device` is single-slot.**
+  (This matters: a single-slot `ui` caused a reconnect/eviction storm — see gotchas.)
+  Dispatch table routes inbound frames by `type`; every frame is logged with a
+  correlation id (this log is the presenter "Show agent flow" feed).
+- `src/goalflow_cloud/graph/nodes.py` — the LangGraph StateGraph. Node flow:
+  `interpret_goal → load_memory → present_understanding [interrupt] → build_contract
+  → dispatch_to_device → collect_plan [interrupt] → hitl_approval [interrupt] →
+  relay_decisions → monitor → finalize`, with branches `goal_declined` (user declined
+  the understanding) and `explain_block`. Router: `route_after_understanding`.
+  `_canonical_domain()` normalizes the LLM's free-text domain to `meal_plan` /
+  `guest_dinner` (the device routes on the EXACT string — don't let "nutrition" leak
+  through). The meal-plan `time_window` is pinned today..today+6.
+- `src/goalflow_cloud/models/contract.py` — Pydantic mirror of every wire message.
+  `_ContractModel` uses `extra="allow"` so new nested device fields (e.g.
+  `demo_events`, `updated_plan`) pass through without cloud changes.
+  `Control.command` Literal includes `"trigger_event"`.
+- `src/goalflow_cloud/memory/store.py` + `data/memory/family_profile.json` — memory.
+  **Hard constraints** (allergies, medical) are injected deterministically into the
+  contract's `constraints.hard`; **soft prefs** only bias. The safety gate on the
+  device reads `constraints.hard` and nothing else.
+
+## Contract touchpoints (what the cloud sends/receives)
+
+Receives from UI: `user_goal`, `understanding_response`, `approval`, `control`.
+Receives from device: `capabilities`, `agent_event` (stream), `plan_ready`,
+`proposal`, `status`. Sends to UI: `understanding`, `present_plan` (adds `knew`,
+relays `demo_events`), `agent_event`, `proposal`, `status`. Sends to device:
+`dispatch` (the generic Task Contract), `approval`, `control`. See `CONTRACT.md` for
+exact shapes — it is authoritative and current (includes `understanding`,
+`trigger_event`, `demo_events`, `event_id`, `updated_plan`/`changed_ids`).
+
+## Current state
+
+Fully built and verified end-to-end (headless + live browser): interpret → memory →
+**confirm-understanding gate** → contract → device plan (streamed) → present → tiered
+HITL approval → monitor. Both `meal_plan` and `guest_dinner` domains. The cloud made
+NO logic change for the event-driven meal demo — `trigger_event` control + device
+`demo_events`/`updated_plan` flow through by pass-through.
+
+## Conventions & gotchas
+
+- **Commit identity:** author as `ashuksingh11`
+  (`31301999+ashuksingh11@users.noreply.github.com`). **Push only when explicitly asked.**
+- **Workflow (per the human):** plan=Opus · design/architecture=Fable · coding=Codex CLI
+  · browsing=Sonnet. Confirm before moving between phases.
+- LLM-only by design — do NOT add scripted/rules fallbacks.
+- There is a known benign log-noise TODO: `receive_json` on an already-closed socket
+  can raise; it's caught/logged, not fatal.
+- The device streams ~950 thinking frames per run; the UI coalesces them.

@@ -42,16 +42,22 @@ specifics live in the device's capability modules plus the free-form
    injected **verbatim** into `constraints.hard` as pure data — the LLM never
    generates, edits, or paraphrases the safety policy; **soft** preferences and
    family context only bias planning.
-3. **Builds + validates** the generic `dispatch` Task Contract and sends it to the
+3. **Presents its understanding and waits**: the confirm-understanding gate. The
+   graph parks at a durable `interrupt()` (`present_understanding`) and sends the
+   UI an `understanding` frame — a short LLM-authored summary plus the `knew`
+   hard-constraint chips. Nothing is dispatched to the device until the user's
+   `understanding_response` resumes it; a decline ends the goal (`goal_declined`)
+   before any planning happens.
+4. **Builds + validates** the generic `dispatch` Task Contract and sends it to the
    device, which does the actual planning (SK auto function calling).
-4. **Relays the live stream**: the device's `agent_event` frames (thinking,
+5. **Relays the live stream**: the device's `agent_event` frames (thinking,
    tool calls, plan progress) pass through to the UI untouched.
-5. **Presents the plan**: on `plan_ready`, resumes the graph, adds the
+6. **Presents the plan**: on `plan_ready`, resumes the graph, adds the
    personalization `knew` block ("what it knew"), and sends `present_plan` to the UI.
-6. **Holds the HITL pause**: the graph parks at `interrupt()` with the tiered
+7. **Holds the HITL pause**: the graph parks at `interrupt()` with the tiered
    proposals; the user's `approval` resumes it and is forwarded to the device.
    Nothing firm executes until approval.
-7. **Monitors + adapts**: `status` / `proposal` frames relay to the UI and feed the
+8. **Monitors + adapts**: `status` / `proposal` frames relay to the UI and feed the
    graph's monitor node; a material change re-enters the approval loop.
 
 **LLM-only, no fallbacks.** There is no scripted/mock planner behind the LLM call.

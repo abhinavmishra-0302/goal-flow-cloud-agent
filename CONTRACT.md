@@ -143,7 +143,7 @@ Payload shapes by `event`:
   "task_status": "awaiting_approval",
   "payload": {
     "plan": [
-      { "id": "s1", "title": "...", "detail": "...", "when": "<ISO?>",
+      { "id": "s1", "day": 1, "title": "...", "detail": "...", "when": "<ISO?>",
         "why": ["..."], "tags": ["..."] }
     ],
     "proposals": [
@@ -153,14 +153,25 @@ Payload shapes by `event`:
     ],
     "safety": { "gate": "passed" | "blocked", "violations": [] },
     "impact": [ { "label": "...", "value": "..." } ],
+    "demo_events": [
+      { "id": "day3-football", "day": 3, "label": "Thu",
+        "title": "Football practice", "kind": "calendar.event_overlap", "order": 3 }
+    ],
     "explanation": "..."
   } }
 ```
 
+- `plan[].day` is the **1-based plan-day index** — the source of truth for
+  meal-week ordering (the UI renders "Day N"; events target a plan item by `day`).
+- `demo_events` (optional) is a display catalog of **presenter-fired** demo events.
+  The UI renders one chip per entry; firing a chip sends `control trigger_event`
+  (below). Present only for demos that expose the event strip (e.g. the meal week).
+
 ### `present_plan` (cloud → ui)
 
 `plan_ready` relayed, **plus** `payload.knew` — the personalization "what it knew"
-(what memory/constraints the cloud injected).
+(what memory/constraints the cloud injected). `payload.demo_events` is relayed
+through unchanged when present.
 
 ### `approval` (ui → cloud → device)
 
@@ -175,8 +186,18 @@ Payload shapes by `event`:
 { "type": "proposal", "goal_id": "...", "correlation_id": "...",
   "task_status": "adapting",
   "payload": { "proposal_id": "a1", "action": "...", "detail": "...",
-               "trigger": "...", "tier": "...", "requires_approval": true } }
+               "trigger": "...", "tier": "..." | "adapt", "requires_approval": true,
+               "event_id": "day3-football",
+               "patch": { "upsert": [ { "id": "s3", "day": 3, "title": "...", "detail": "..." } ],
+                          "remove": [], "impact_delta": [], "rationale": "..." } } }
 ```
+
+- `event_id` echoes the presenter-fired event that triggered this adaptation
+  (present only for `trigger_event`-driven proposals).
+- `patch` (optional) is the scoped plan diff a daily/event adaptation applies:
+  `upsert` (rows to add/replace, each with its `day`), `remove` (ids), plus
+  `impact_delta` and a short `rationale`. The `adapt` tier marks these proactive
+  adaptations.
 
 ### `status` (device → cloud → ui)
 
@@ -184,16 +205,30 @@ Payload shapes by `event`:
 { "type": "status", "goal_id": "...", "correlation_id": "...",
   "task_status": "...",
   "payload": { "day": "?", "sim_date": "?", "material": false,
-               "executed": [], "note": "..." } }
+               "executed": [], "note": "...",
+               "event_id": "day3-football",
+               "updated_plan": [ { "id": "s3", "day": 3, "title": "...", "...": "..." } ],
+               "changed_ids": ["s3"],
+               "impact_delta": [ { "label": "...", "value": "..." } ] } }
 ```
+
+- On an applied adaptation the status carries the **new full plan** in
+  `updated_plan` (the UI replaces the plan card in place), `changed_ids` (rows to
+  highlight/morph), `impact_delta` (badges to merge), and the `event_id` that
+  drove it. Quiet ticks omit these (just `material: false` + a "on track" note).
 
 ### `control` (ui → cloud → device)
 
 ```json
 { "type": "control", "goal_id": "...",
-  "command": "advance_day" | "reset" | "set_date",
-  "payload": { "date": "<ISO?>" } }
+  "command": "advance_day" | "reset" | "set_date" | "trigger_event",
+  "payload": { "date": "<ISO?>", "event_id": "day3-football" } }
 ```
+
+- `trigger_event` fires one presenter demo event by `event_id` (from
+  `plan_ready.demo_events`): the device runs ONE scoped-LLM adaptation for that
+  event's context, **clock frozen**, deduped once per event id. This is the
+  event-driven meal-week demo path — it replaces `advance_day` for that demo.
 
 ## Task-status lifecycle
 

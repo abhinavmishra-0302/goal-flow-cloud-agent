@@ -4,11 +4,14 @@
 
 ## 1. Full flow (sequence)
 
-Happy path plus a later adaptation. Note the two gates: the **safety filter**
-runs as deterministic code on the device before anything is surfaced; the
-**approval gate** is the user, reached via the cloud's LangGraph `interrupt()`.
-New in v2: the device advertises `capabilities`, and `agent_event`s stream live
-(device → cloud → UI passthrough) while the device plans.
+Happy path plus a later adaptation. Note the gates: a **confirm-understanding
+gate** pauses on `present_understanding` before anything is dispatched; the
+**safety filter** runs as deterministic code on the device before anything is
+surfaced; the **approval gate** is the user, reached via the cloud's LangGraph
+`interrupt()`. New in v2: the device advertises `capabilities`, `agent_event`s
+stream live (device → cloud → UI passthrough) while the device plans, and the
+UI can fire a `control { command: "trigger_event" }` at any time for the
+event-driven demo (pure passthrough to the device — no cloud logic change).
 
 ```mermaid
 sequenceDiagram
@@ -27,7 +30,12 @@ sequenceDiagram
 
     Note over UI,Cloud: Goal intake (ANY domain — meal_plan, guest_dinner, …)
     UI->>Cloud: user_goal { "we've got 6 people over Saturday — sort it" }
-    Note over Cloud: interpret_goal (LLM structured output)<br/>→ load_memory (hard verbatim / soft bias)<br/>→ build_contract → dispatch
+    Note over Cloud: interpret_goal (LLM structured output)<br/>→ load_memory (hard verbatim / soft bias)<br/>→ present_understanding = interrupt()
+    Cloud->>UI: understanding { objective, domain, knew ("what it knew"), thought }
+
+    Note over UI: CONFIRM-UNDERSTANDING GATE (user) — waits before any dispatch.
+    UI->>Cloud: understanding_response { confirmed: true }
+    Note over Cloud: interrupt() resumed (route_after_understanding)<br/>confirmed → build_contract → dispatch<br/>declined → goal_declined, status{task_status:"done"} to UI, run ends
     Cloud->>Device: dispatch { goal_id, domain, objective, success_criteria,<br/>constraints{hard,soft}, scope, time_window, autonomy:"tiered", context }
 
     Note over Device: SK function-calling planner works;<br/>SAFETY FILTER (code) enforces constraints.hard only.
@@ -56,6 +64,10 @@ sequenceDiagram
     Cloud->>Device: approval
     Device->>Cloud: status { task_status: done }
     Cloud->>UI: status (relayed)
+
+    Note over UI,Device: Event-driven demo (any time): the device ships a demo_events<br/>catalog on plan_ready; the UI can fire one on demand.
+    UI->>Cloud: control { command: "trigger_event", goal_id, payload: { event_id } }
+    Cloud->>Device: control (forwarded — no cloud logic change, pure passthrough)
 ```
 
 ## 2. Three tiers + WS hub (components)
@@ -73,7 +85,7 @@ flowchart LR
     subgraph CLOUD["Cloud tier — goal-flow-cloud-agent (WS HUB)"]
         Hub[FastAPI /ws hub<br/>registry by role · correlation-id logs]
         Router[Router: type + role<br/>agent_event = passthrough]
-        Graph["LangGraph StateGraph<br/>interpret_goal → load_memory → build_contract<br/>→ dispatch → collect_plan → hitl_approval (interrupt)<br/>→ relay_decisions → monitor (adapt loop)"]
+        Graph["LangGraph StateGraph<br/>interpret_goal → load_memory<br/>→ present_understanding (interrupt) → build_contract<br/>→ dispatch → collect_plan → hitl_approval (interrupt)<br/>→ relay_decisions → monitor (adapt loop)"]
         CP[(Checkpointer<br/>thread_id = goal_id)]
         Mem[(family_profile.json<br/>hard safety block vs soft prefs)]
         LLM[OpenRouter LLM<br/>openai/gpt-oss-120b<br/>LLM-only, no fallback]

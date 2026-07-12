@@ -50,6 +50,8 @@ class GraphState(TypedDict, total=False):
                                        #   domain, objective, success_criteria,
                                        #   scope, time_window (relative to today)
     memory: dict                       # loaded profile: hard block + soft prefs + context
+    understanding: dict                # pre-planning understanding shown to the user
+    understanding_confirmed: bool      # user's response to the understanding gate
     contract: dict                     # the assembled generic Dispatch frame
     plan: dict                         # plan_ready payload from the device
     pending_approvals: list[dict]      # proposals awaiting user decisions
@@ -67,6 +69,8 @@ class GraphState(TypedDict, total=False):
 |--------------------|-------------------------|------|
 | `interpret_goal`   | Goal Interpreter        | LLM **structured output**: fuzzy text → `{domain, objective, success_criteria, scope, time_window}`. Time window derived **relative to real today**. |
 | `load_memory`      | Memory & Constraints    | Load the generic profile; split channels: `hard` → verbatim into `constraints.hard`; `soft` + context → planning bias only. |
+| `present_understanding` | Understanding Gate (HITL) | **`interrupt()`** with a short LLM-authored `thought` one-liner plus the `knew` hard-constraint chips; pauses until the user confirms or declines via `understanding_response`. |
+| `goal_declined`    | (graceful terminal)     | User declined the understanding; ends the run (`task_status="done"`) without ever dispatching to the device. |
 | `build_contract`   | Goal Interpreter + Memory | Assemble + validate the generic `Dispatch`; hard block copied as **data, never LLM output**. |
 | `dispatch_to_device` | (hub hand-off)        | Hand the frame to the WS hub; device now grounds/plans (SK function calling) while the cloud relays its `agent_event` stream. |
 | `collect_plan`     | (hub hand-off)          | Resume point: the hub feeds the device's `plan_ready` payload into the paused graph. |
@@ -80,6 +84,8 @@ class GraphState(TypedDict, total=False):
 
 - after `interpret_goal`: `error` set → `explain_block` (LLM-only, fail loudly);
   else → `load_memory`.
+- after `present_understanding` (`route_after_understanding`): confirmed →
+  `build_contract`; declined → `goal_declined` (graceful terminal, no dispatch).
 - after `collect_plan` (`route_on_safety`): `safety.gate == "blocked"` →
   `explain_block`; any proposal with `requires_approval` → `hitl_approval`;
   auto-tier only → `relay_decisions`.
@@ -94,7 +100,9 @@ stateDiagram-v2
     [*] --> interpret_goal
     interpret_goal --> load_memory : intent ok
     interpret_goal --> explain_block : LLM error (no fallback)
-    load_memory --> build_contract
+    load_memory --> present_understanding
+    present_understanding --> build_contract : confirmed
+    present_understanding --> goal_declined : declined
     build_contract --> dispatch_to_device
     dispatch_to_device --> collect_plan : device plans (SK), agent_events streamed
     collect_plan --> hitl_approval : approval needed
@@ -105,14 +113,16 @@ stateDiagram-v2
     monitor --> hitl_approval : material change (adapt loop)
     monitor --> finalize : done
     explain_block --> finalize
+    goal_declined --> [*]
     finalize --> [*]
 ```
 
 ### Checkpointer
 
 `compile(checkpointer=MemorySaver())` (from `langgraph-checkpoint`). Every
-`invoke`/`resume` uses `config={"configurable": {"thread_id": goal_id}}`. The
-`interrupt()` in `hitl_approval` persists the paused state, so the approval can
+`invoke`/`resume` uses `config={"configurable": {"thread_id": goal_id}}`. Each
+`interrupt()` — `present_understanding`, `collect_plan`, `hitl_approval`, `monitor`
+— persists the paused state, so the approval can
 arrive minutes later (or after a reconnect) and resume exactly where it stopped.
 The same mechanism carries the adapt loop: an adaptation `proposal` re-enters
 `hitl_approval` on the same thread.
@@ -149,13 +159,14 @@ not meal-only):
   | Incoming `type` | From   | Cloud action |
   |-----------------|--------|--------------|
   | `capabilities`  | device | Cache the module registry; relay to UI. |
-  | `user_goal`     | ui     | Run the graph → `dispatch` to device. |
+  | `user_goal`     | ui     | Run the graph to the `present_understanding` gate → `understanding` to UI. |
+  | `understanding_response` | ui | Resume `present_understanding`; confirmed → `dispatch` to device, declined → `goal_declined`. |
   | `agent_event`   | device | **Passthrough relay** to UI; append to event log. |
   | `plan_ready`    | device | Resume graph; re-wrap as `present_plan` (+`payload.knew`) → UI. |
   | `proposal`      | device | Relay to UI; enters the adapt loop. |
   | `status`        | device | Relay to UI; feeds `monitor`. |
   | `approval`      | ui     | Resume the `interrupt()`; forward to device. |
-  | `control`       | ui     | Forward to device (generic clock: `advance_day`/`reset`/`set_date`). |
+  | `control`       | ui     | Forward to device (generic clock: `advance_day`/`reset`/`set_date`; plus `trigger_event` for the event-driven demo — pure passthrough). |
 
 - UI and device **never** talk directly; dedupe on `correlation_id`.
 
