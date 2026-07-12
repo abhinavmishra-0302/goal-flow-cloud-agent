@@ -26,7 +26,7 @@ Key invariants:
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from operator import add
 from typing import Annotated, Any, TypedDict
 from uuid import uuid4
@@ -372,6 +372,14 @@ def build_contract(state: GraphState) -> GraphState:
     memory = state["memory"]
     goal_id = state.get("goal_id") or str(uuid4())
     correlation_id = state.get("correlation_id") or str(uuid4())
+    domain = _canonical_domain(intent["domain"], state.get("goal_text", ""), intent["objective"])
+    today = date.today()
+    time_window = intent.get("time_window")
+    if domain == "meal_plan":
+        time_window = {
+            "start": today.isoformat(),
+            "end": (today + timedelta(days=6)).isoformat(),
+        }
 
     context = {
         "family_id": memory.get("family_id"),
@@ -381,7 +389,7 @@ def build_contract(state: GraphState) -> GraphState:
         "type": "dispatch",
         "goal_id": goal_id,
         "correlation_id": correlation_id,
-        "domain": _canonical_domain(intent["domain"], state.get("goal_text", ""), intent["objective"]),
+        "domain": domain,
         "objective": intent["objective"],
         "success_criteria": intent.get("success_criteria", []),
         "constraints": {
@@ -389,7 +397,7 @@ def build_contract(state: GraphState) -> GraphState:
             "soft": memory.get("bias", {}).get("soft", {}),
         },
         "scope": intent.get("scope", {}),
-        "time_window": intent.get("time_window"),
+        "time_window": time_window,
         "autonomy": "tiered",
         "context": context,
     }
