@@ -34,6 +34,7 @@ from goalflow_cloud.models.contract import (
     Control,
     Hello,
     HelloAck,
+    Notice,
     PlanReady,
     PresentPlan,
     Proposal,
@@ -327,6 +328,20 @@ async def handle_user_goal(user_goal: UserGoal) -> None:
                 "payload": {"material": False, "executed": [], "note": state["error"]},
             },
         )
+        return
+
+    # Out-of-scope: the interpreter judged the goal outside what GoalFlow acts on
+    # (only meal plans + guest dinners). The graph ended before any dispatch — send
+    # a terminal notice and stop; the device is never involved.
+    explanation = state.get("explanation")
+    if isinstance(explanation, dict) and explanation.get("type") == "out_of_scope":
+        notice = Notice(
+            goal_id=goal_id,
+            kind="out_of_scope",
+            message=explanation.get("message") or "That goal is outside what I can help with.",
+        )
+        logger.info("task_status status=done gate=out_of_scope")
+        await registry.send_to("ui", notice.model_dump(mode="json"))
         return
 
     interrupt_payload = state.get("_interrupt")

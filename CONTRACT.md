@@ -90,6 +90,28 @@ dispatch. The graph is paused until the UI answers with `understanding_response`
 If `confirmed` is `true`, the graph resumes to `dispatch`; if `false`, it ends
 gracefully with no device dispatch.
 
+### Actionability gate (interpret)
+
+When the cloud interprets `user_goal`, the LLM also returns an **actionability
+verdict**. GoalFlow only acts on two kinds of goals: **weekly meal/dinner planning**
+and **hosting a guest dinner**. Any other goal (trivia, general questions, unrelated
+tasks) is judged `actionable: false`; the graph then ends at `decline_out_of_scope`
+**before any device dispatch** and the UI receives a `notice` (below) instead of an
+`understanding`/`present_plan`. This is why an off-topic prompt no longer produces a
+meal plan.
+
+### `notice` (cloud → ui)
+
+A terminal, non-plan message. Emitted when the graph ends before any device
+dispatch — today, when the interpreter declines an out-of-scope goal.
+
+```json
+{ "type": "notice", "goal_id": "...", "kind": "out_of_scope",
+  "message": "That's outside what I do. I'm your Family Hub goal assistant — I can plan the week's meals or help you host a dinner." }
+```
+
+`kind` is `"out_of_scope"` (declined by the interpreter) or `"declined"` (reserved).
+
 ### `dispatch` (cloud → device) — the GENERIC Task Contract
 
 ```json

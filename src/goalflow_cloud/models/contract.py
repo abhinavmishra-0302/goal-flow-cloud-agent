@@ -408,6 +408,23 @@ class Status(_ContractModel):
 
 
 # ---------------------------------------------------------------------------
+# notice (cloud -> ui) — a terminal, non-plan message
+# ---------------------------------------------------------------------------
+
+
+class Notice(_ContractModel):
+    """cloud -> ui: a terminal, non-plan message (e.g. an out-of-scope decline).
+
+    Sent when the graph ends BEFORE any device dispatch — the goal was judged
+    outside what GoalFlow can act on (only meal planning + guest dinners are)."""
+
+    type: Literal["notice"] = "notice"
+    goal_id: str
+    kind: Literal["out_of_scope", "declined"] = "out_of_scope"
+    message: str
+
+
+# ---------------------------------------------------------------------------
 # control (ui -> cloud -> device)
 # ---------------------------------------------------------------------------
 
@@ -450,6 +467,7 @@ ContractMessage = Annotated[
         Approval,
         Proposal,
         Status,
+        Notice,
         Control,
     ],
     Field(discriminator="type"),

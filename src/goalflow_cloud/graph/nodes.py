@@ -92,7 +92,20 @@ class InterpretedIntent(BaseModel):
     success_criteria: list[str] = Field(default_factory=list)
     scope: dict[str, Any] = Field(default_factory=dict)
     time_window: dict[str, str] = Field(
-        description="ISO start/end dates or datetimes, relative to the supplied real today."
+        default_factory=dict,
+        description="ISO start/end dates or datetimes, relative to the supplied real today. "
+        "Leave empty when the goal is not actionable.",
+    )
+    actionable: bool = Field(
+        default=True,
+        description=(
+            "True ONLY if the goal is a weekly meal/dinner plan or hosting a guest dinner; "
+            "False for anything else (trivia, general questions, unrelated tasks)."
+        ),
+    )
+    decline_reason: str = Field(
+        default="",
+        description="If not actionable, one short plain-language reason why (used internally).",
     )
 
 
@@ -267,12 +280,49 @@ def interpret_goal(state: GraphState) -> GraphState:
                     "tomorrow, weekend, next week into time_window.start/end ISO dates relative to it. "
                     "For actionable goals, the start date must be real today or later; interpret "
                     "'this week' as the remaining week starting today. "
-                    "Keep scope flexible and generic for the device planner.",
+                    "Keep scope flexible and generic for the device planner. "
+                    "GoalFlow can only ACT on two kinds of goals: (1) planning the week's meals or "
+                    "dinners (healthy eating, reducing food waste), and (2) hosting a guest dinner. "
+                    "If the goal is one of those, set actionable=true and fill time_window. For ANYTHING "
+                    "ELSE — general questions, trivia, facts, chit-chat, or tasks unrelated to home meal "
+                    "planning — set actionable=false, put one short reason in decline_reason, and you may "
+                    "leave time_window empty. ALWAYS respond by calling the structured "
+                    "function — never answer the user's question directly in prose, even "
+                    "for out-of-scope goals (call it with actionable=false instead).",
                 ),
                 ("human", goal_text),
             ]
         )
+        if intent is None:
+            # The model replied in free text instead of returning structured intent —
+            # it treated the input as a question/chit-chat, not an actionable goal.
+            # Decline gracefully (redirect) rather than erroring.
+            logger.info("graph_node_exit node=interpret_goal actionable=false reason=no_structured_intent")
+            return {
+                "intent": {
+                    "actionable": False,
+                    "decline_reason": "not an actionable meal or guest-dinner goal",
+                    "domain": "",
+                    "objective": goal_text,
+                    "time_window": {},
+                },
+                "task_status": "interpreting",
+                "event_log": [_event(state, "intent_interpreted", {"actionable": False})],
+            }
         intent_dict = intent.model_dump(mode="json")
+        # Out-of-scope goals need no time window and never reach the device — the
+        # graph routes them to decline_out_of_scope. Only actionable goals must
+        # carry a resolved planning window.
+        if intent_dict.get("actionable") is False:
+            logger.info(
+                "graph_node_exit node=interpret_goal actionable=false reason=%s",
+                intent_dict.get("decline_reason"),
+            )
+            return {
+                "intent": intent_dict,
+                "task_status": "interpreting",
+                "event_log": [_event(state, "intent_interpreted", {"actionable": False})],
+            }
         if not intent_dict.get("time_window", {}).get("start") or not intent_dict.get("time_window", {}).get("end"):
             return {
                 "error": "LLM goal interpretation failed: missing time_window.start/end",
@@ -533,6 +583,27 @@ def goal_declined(state: GraphState) -> GraphState:
     }
 
 
+def decline_out_of_scope(state: GraphState) -> GraphState:
+    """Interpreter judged the goal out of scope; end without any device dispatch.
+
+    GoalFlow only acts on weekly meal plans and guest dinners. Anything else is
+    politely declined + redirected here — the device is never touched.
+    """
+    logger.info("graph_node_enter node=decline_out_of_scope")
+    intent = state.get("intent") or {}
+    reason = intent.get("decline_reason") or ""
+    message = (
+        "That's outside what I do. I'm your Family Hub goal assistant — I can plan the "
+        "week's meals or help you host a dinner. Try one of those and I'll get going."
+    )
+    explanation = {"type": "out_of_scope", "message": message, "reason": reason}
+    return {
+        "task_status": "done",
+        "explanation": explanation,
+        "event_log": [_event(state, "out_of_scope_declined", {"reason": reason})],
+    }
+
+
 def monitor(state: GraphState) -> GraphState:
     """Monitor & Adapt: track device status/proposals for material changes.
 
@@ -610,8 +681,13 @@ def finalize(state: GraphState) -> GraphState:
 
 
 def route_after_interpret(state: GraphState) -> str:
-    """error -> explain_block (LLM-only, fail loudly); else -> load_memory."""
-    return "explain_block" if state.get("error") else "load_memory"
+    """error -> explain_block (LLM-only, fail loudly); out-of-scope -> decline;
+    else -> load_memory."""
+    if state.get("error"):
+        return "explain_block"
+    if (state.get("intent") or {}).get("actionable") is False:
+        return "decline_out_of_scope"
+    return "load_memory"
 
 
 def route_after_understanding(state: GraphState) -> str:
@@ -662,6 +738,7 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     graph.add_node("hitl_approval", hitl_approval)
     graph.add_node("relay_decisions", relay_decisions)
     graph.add_node("goal_declined", goal_declined)
+    graph.add_node("decline_out_of_scope", decline_out_of_scope)
     graph.add_node("monitor", monitor)
     graph.add_node("explain_block", explain_block)
     graph.add_node("finalize", finalize)
@@ -670,7 +747,11 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     graph.add_conditional_edges(
         "interpret_goal",
         route_after_interpret,
-        {"load_memory": "load_memory", "explain_block": "explain_block"},
+        {
+            "load_memory": "load_memory",
+            "decline_out_of_scope": "decline_out_of_scope",
+            "explain_block": "explain_block",
+        },
     )
     graph.add_edge("load_memory", "present_understanding")
     graph.add_conditional_edges(
@@ -704,6 +785,7 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     )
     graph.add_edge("explain_block", "finalize")
     graph.add_edge("goal_declined", END)
+    graph.add_edge("decline_out_of_scope", END)
     graph.add_edge("finalize", END)
 
     return graph.compile(checkpointer=checkpointer or MemorySaver())
