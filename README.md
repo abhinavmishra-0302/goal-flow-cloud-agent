@@ -66,13 +66,15 @@ it is never faked.
 
 ## How to run
 
-Requires Python 3.11+.
+Requires Python 3.11+. For the **full three-service demo** (cloud + device + UI),
+follow `goal-flow-agents/docs/FINAL_DEMO.md` — the single source of truth for run
+commands. To run just the cloud hub:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 cp .env.example .env          # set OPENROUTER_API_KEY (required — LLM-only)
-./run.sh                      # uvicorn goalflow_cloud.server:app
+./run.sh                      # canonical launcher: uvicorn on 0.0.0.0:8000, loads .env
 ```
 
 Or directly:
