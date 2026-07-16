@@ -127,6 +127,15 @@ arrive minutes later (or after a reconnect) and resume exactly where it stopped.
 The same mechanism carries the adapt loop: an adaptation `proposal` re-enters
 `hitl_approval` on the same thread.
 
+`device_id` scopes message *delivery* (multi-session hub routing); `goal_id` scopes
+each *graph run* (`thread_id`) and is already isolated per goal, independent of the
+hub's session model.
+
+**Known risk:** `MemorySaver` plus the `asyncio.to_thread` fan-out in `server.py`
+isn't proven thread-safe under truly-parallel graph writes across concurrent
+sessions. If races surface, wrap the graph invoke/resume/`update_state` calls in one
+`asyncio.Lock` — cloud graph steps are fast; the LLM work happens on the device.
+
 ## agent_event stream relay
 
 `agent_event` frames are a **device → cloud → ui passthrough**: the hub validates
@@ -148,13 +157,27 @@ not meal-only):
   LLM as planning **bias** only; never safety-enforced.
 - **family context** — members, routines, notes; grounds the `context` object.
 
+**Known limitation:** unlike the hub's per-`device_id` session routing, memory is
+still GLOBAL — `memory/store.py` / `family_profile.json` is shared across every
+session, not scoped per home.
+
 ## WebSocket hub
 
 `src/goalflow_cloud/server.py` — FastAPI, single `/ws` endpoint.
 
 - **Registration:** first frame must be `hello` (`role: ui|device`); hub replies
-  `hello_ack` with a `session_id`. One active socket per role; reconnect replaces.
-- **Routing (type + sender role):**
+  `hello_ack` with a `session_id`. **Multi-session:** a `Session` (one device + N uis)
+  is keyed by `device_id`, so multiple homes are connected at once without cross-talk.
+  A device reconnect 1012-evicts only the PRIOR socket of the SAME `device_id` (other
+  sessions untouched); ui sockets are never evicted. A ui binds via `hello.device_id`,
+  auto-binds when exactly one device is online, or is held UNBOUND — it gets a
+  `devices` list and binds later via `select_device` (ACKed with `hello_ack.device_id`);
+  frames from an unbound ui are dropped. A device hello with no `device_id` defaults to
+  `"default"` (zero-config single-pair back-compat). `capabilities` are cached per
+  session and replayed to a ui when it binds.
+- **Routing (type + sender role, within the sender's session):** `route_message`
+  derives `device_id` from the sender socket's session; every relay stays inside that
+  session.
 
   | Incoming `type` | From   | Cloud action |
   |-----------------|--------|--------------|
@@ -169,6 +192,10 @@ not meal-only):
   | `control`       | ui     | Forward to device (generic clock: `advance_day`/`reset`/`set_date`; plus `trigger_event` for the event-driven demo — pure passthrough). |
 
 - UI and device **never** talk directly; dedupe on `correlation_id`.
+- `send_to_device` reports whether the frame was delivered; an undelivered dispatch
+  (no device connected for that session) surfaces to the uis as a terminal `status`
+  ("Device agent '<id>' isn't connected — start it and try again") instead of leaving
+  the UI hung on "planning".
 
 ## Structured logging (first-class requirement)
 

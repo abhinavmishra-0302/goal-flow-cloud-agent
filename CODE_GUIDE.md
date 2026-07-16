@@ -93,9 +93,16 @@ understanding gate (`{"confirmed": bool}`), later `hitl_approval` and `monitor`.
 ## The WebSocket hub (`server.py`)
 
 FastAPI, single `/ws` endpoint. First frame must be `hello` (`role: ui|device`); the
-`ConnectionRegistry` keeps one active socket per role (a reconnect replaces and closes
-the old one) and replies `hello_ack` with a `session_id`. Routing is on
-**`type` + sender role** (`route_message`):
+`ConnectionRegistry` is **multi-session**: a `Session` (one device + N uis) is keyed by
+`device_id`, so multiple homes run concurrently without cross-talk. A device reconnect
+1012-evicts only the PRIOR socket of the SAME `device_id` (other sessions untouched); ui
+sockets are never evicted. A ui binds via `hello.device_id`, auto-binds when exactly one
+device is online, or is held UNBOUND (sent a `devices` list, binds later via a
+`select_device` frame, ACKed with `hello_ack.device_id`) — frames from an unbound ui are
+dropped. A device hello with no `device_id` defaults to `"default"` (zero-config
+single-pair back-compat). Every send replies `hello_ack` with a `session_id`. Routing is
+on **`type` + sender role, within the sender's session** (`route_message` derives
+`device_id` from the sender socket's cached `(role, device_id)` meta):
 
 | Incoming `type` | From   | Cloud action |
 |-----------------|--------|--------------|
@@ -103,13 +110,19 @@ the old one) and replies `hello_ack` with a `session_id`. Routing is on
 | `understanding_response` | ui | `resume_goal` resumes `present_understanding` with `{"confirmed": bool}`; confirmed sends the `dispatch` contract to the device, declined ends the goal (`goal_declined`). |
 | `approval`      | ui     | `resume_goal` resumes the `hitl_approval` interrupt with the decisions; forward the frame to the device. |
 | `control`       | ui     | Forward to the device (generic clock: `advance_day` / `reset` / `set_date`; plus `trigger_event` for the event-driven demo — cloud makes no logic changes, pure passthrough). |
-| `capabilities`  | device | Cache the module registry; relay to the UI (also replayed to late-joining UIs on `hello`). |
+| `capabilities`  | device | Cache the module registry **per session**; relay to the UI (also replayed to a UI when it binds into the session). |
 | `agent_event`   | device | **Passthrough relay** to the UI; best-effort append into the graph's `event_log` via `graph.update_state`. The stream never blocks the graph — streaming lives at the hub layer while the graph waits at its interrupts. |
 | `plan_ready`    | device | `resume_goal` (resumes `collect_plan`); re-wrap as `present_plan` with `payload.knew` added; send to UI. If the run auto-advanced past approval (auto-tier only), forward the resulting `approval_frame` to the device. |
 | `proposal` / `status` | device | Relay to the UI, then feed the graph's `monitor` interrupt (best-effort). |
 
 Device frames are **deduped** per goal on `correlation_id` (plus `seq` for
 `agent_event`) so reconnect replays are dropped.
+
+`send_to_device` reports whether the frame was delivered; both dispatch sites
+(`handle_user_goal`, `handle_understanding_response`) surface an undelivered dispatch
+as a terminal `status` frame to that session's uis ("Device agent '<id>' isn't
+connected — start it and try again") via `send_device_offline`, instead of leaving the
+UI stuck on "planning".
 
 **`build_knew(contract)`** produces the UI's "what it knew" personalization from the
 dispatched contract — generically: it surfaces `constraints.hard` (allergens, dietary,

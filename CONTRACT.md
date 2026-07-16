@@ -10,7 +10,27 @@ mirror it as typed definitions. Any change here is a contract version bump.
   each open **ONE outbound WS** to the cloud and register via `hello`.
 - The field **`type`** discriminates every message.
 - Task messages carry **`goal_id`**; device↔cloud messages carry **`correlation_id`**.
-- Route on `type` + role; **dedupe on `correlation_id`**; on drop: **reconnect**.
+- Route on `type` + **session** (see below); **dedupe on `correlation_id`**; on drop: **reconnect**.
+
+## Sessions — `device_id` is the pairing key
+
+The hub is **multi-session**: many UIs and many device agents may be connected at once.
+A **session** is one **home**: exactly **one device agent + N UIs**, keyed by `device_id`.
+
+- **Every frame routes only within its session**, chosen from the SENDER socket's
+  `device_id` — never by role alone, never broadcast across sessions. A UI's `user_goal`
+  / `approval` / `control` go to *its* device; a device's `agent_event` / `plan_ready` /
+  `proposal` / `status` / `capabilities` go to *its* UIs.
+- **Device agents own their `device_id`** — a stable, self-generated persistent UUID
+  (overridable). A device reconnect replaces (1012-closes) only the previous socket of the
+  **same** `device_id`; other homes are untouched. **UI sockets are never evicted.**
+- **A UI must be BOUND before it can send.** It binds by (a) sending `device_id` in
+  `hello`, (b) the cloud auto-binding it when exactly **one** device is connected, or
+  (c) answering the `devices` list with `select_device`. Frames from an unbound UI are
+  dropped.
+- Absent `device_id` on a **device** `hello` ⇒ `"default"` (zero-config single-pair).
+- `goal_id` still scopes the graph run (one checkpointer thread per goal); `device_id`
+  scopes *delivery*. They are independent.
 
 ## Generic & domain-agnostic
 
@@ -25,17 +45,50 @@ plus the free-form `scope` / `context` objects. The same protocol must serve any
 `hello` (client → cloud):
 
 ```json
-{ "type": "hello", "role": "ui" }
+{ "type": "hello", "role": "ui", "device_id": "hub-a" }
 ```
 
 ```json
-{ "type": "hello", "role": "device" }
+{ "type": "hello", "role": "device", "device_id": "9f3c...", "device_name": "ashu@boxA" }
 ```
+
+- `device_id` (both roles, optional) — the pairing key. **device:** its own stable id;
+  empty ⇒ `"default"`. **ui:** the device it wants to watch (from `?device=<id>`); empty
+  ⇒ unbound, await auto-bind or `devices`/`select_device`.
+- `device_name` (device only, optional) — human label for the UI's picker; defaults to
+  `user@machine`.
 
 `hello_ack` (cloud → client):
 
 ```json
-{ "type": "hello_ack", "role": "ui|device", "session_id": "..." }
+{ "type": "hello_ack", "role": "ui|device", "session_id": "...", "device_id": "hub-a" }
+```
+
+- `device_id` — the session this socket is bound to; `""` for a still-unbound UI. Also
+  sent again in reply to a successful `select_device`.
+
+### `devices` (cloud → ui)
+
+Sent to an **unbound** UI (no `device_id` and the cloud could not auto-bind because there
+isn't exactly one device), and again whenever the connected set changes.
+
+```json
+{
+  "type": "devices",
+  "devices": [
+    { "device_id": "9f3c...", "device_name": "ashu@boxA", "online": true },
+    { "device_id": "1a7d...", "device_name": "bob@boxB",  "online": true }
+  ]
+}
+```
+
+### `select_device` (ui → cloud)
+
+Binds this UI socket to a device (the picker's answer). The cloud replies `hello_ack`
+with the bound `device_id`.
+
+```json
+{ "type": "select_device", "device_id": "9f3c..." }
 ```
 
 ### `capabilities` (device → cloud → ui)

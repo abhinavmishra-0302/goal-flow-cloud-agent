@@ -33,11 +33,15 @@ contract lives HERE**: `CONTRACT.md` (mirrored as `types/contract.ts` in the UI 
 
 ## Architecture / key files
 
-- `src/goalflow_cloud/server.py` — the `/ws` hub. `ConnectionRegistry` routes by role.
-  **The `ui` role is MULTI-slot (broadcast, never evict); `device` is single-slot.**
-  (This matters: a single-slot `ui` caused a reconnect/eviction storm — see gotchas.)
-  Dispatch table routes inbound frames by `type`; every frame is logged with a
-  correlation id (this log is the presenter "Show agent flow" feed).
+- `src/goalflow_cloud/server.py` — the `/ws` hub. `ConnectionRegistry` is **multi-session**:
+  a `Session` (one device agent + N UIs) is keyed by `device_id`, so multiple homes can be
+  connected at once. A device reconnect 1012-evicts only the prior socket of the SAME
+  `device_id`; other homes are untouched. UI sockets are never evicted. A UI binds via
+  `hello.device_id`, auto-binds when exactly one device is online, or is held UNBOUND
+  (gets a `devices` list, binds later via `select_device`) — frames from an unbound UI
+  are dropped. Dispatch table routes inbound frames by `type` within the sender's
+  session; every frame is logged with a correlation id (this log is the presenter
+  "Show agent flow" feed).
 - `src/goalflow_cloud/graph/nodes.py` — the LangGraph StateGraph. Node flow:
   `interpret_goal → load_memory → present_understanding [interrupt] → build_contract
   → dispatch_to_device → collect_plan [interrupt] → hitl_approval [interrupt] →
@@ -83,3 +87,10 @@ NO logic change for the event-driven meal demo — `trigger_event` control + dev
 - There is a known benign log-noise TODO: `receive_json` on an already-closed socket
   can raise; it's caught/logged, not fatal.
 - The device streams ~950 thinking frames per run; the UI coalesces them.
+- **Known limitation:** `device_id` scopes message *delivery* (multi-session) and
+  `goal_id` scopes each graph run (already isolated), but `memory/store.py` /
+  `family_profile.json` is still GLOBAL — shared across every session, not per-home.
+- **Known risk:** `MemorySaver` + the `asyncio.to_thread` fan-out in `server.py` isn't
+  proven thread-safe under truly-parallel graph writes (concurrent sessions hitting the
+  graph at once). If races surface, wrap the graph invoke/resume/`update_state` calls in
+  one `asyncio.Lock` — cloud graph steps are fast; the LLM work happens on the device.
