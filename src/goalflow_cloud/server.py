@@ -204,6 +204,11 @@ class ConnectionRegistry:
         await self._bind_ui(websocket, device_id, ack=True)
 
     async def _bind_ui(self, websocket: WebSocket, device_id: str, ack: bool) -> None:
+        # Re-binding must MOVE the socket, not add it to a second session: leaving it in
+        # the old session's ui list would deliver BOTH homes' frames to it — the exact
+        # cross-session leak this registry exists to prevent.
+        self._leave_session(websocket, keep=device_id)
+
         session = self._session(device_id)
         if websocket not in session.uis:
             session.uis.append(websocket)
@@ -217,6 +222,23 @@ class ConnectionRegistry:
                 await websocket.send_json(caps)
             except Exception:
                 logger.debug("caps_replay_failed", exc_info=True)
+
+    def _leave_session(self, websocket: WebSocket, keep: str = "") -> None:
+        """Remove a ui socket from the session it currently belongs to (if any other
+        than ``keep``), GC'ing the session if that empties it."""
+        previous = self._meta.get(websocket)
+        if previous is None:
+            return
+        _, previous_id = previous
+        if not previous_id or previous_id == keep:
+            return
+        session = self._sessions.get(previous_id)
+        if session is None:
+            return
+        if websocket in session.uis:
+            session.uis.remove(websocket)
+        if session.device is None and not session.uis:
+            self._sessions.pop(previous_id, None)
 
     async def _ack(self, websocket: WebSocket, role: Role, device_id: str) -> None:
         ack = HelloAck(role=role, session_id=str(uuid4()), device_id=device_id).model_dump(mode="json")
@@ -289,9 +311,23 @@ class ConnectionRegistry:
             logger.debug("send_devices_failed", exc_info=True)
 
     async def broadcast_devices(self) -> None:
-        """Refresh the device list on every UNBOUND ui (picker keeps current)."""
+        """Refresh the device list on EVERY ui.
+
+        Unbound uis need it to pick. BOUND uis need it too: a ui that was AUTO-bound
+        (it sent no device_id and there was exactly one device at the time) made a GUESS
+        — if a second device now appears, that guess is ambiguous and the ui must be able
+        to re-ask. Without this, whether you get a picker depended on whether your tab
+        happened to connect before or after the other agent started.
+        """
+        seen: set[WebSocket] = set()
         for websocket in list(self._unbound_uis):
             await self.send_devices(websocket)
+            seen.add(websocket)
+        for session in list(self._sessions.values()):
+            for websocket in list(session.uis):
+                if websocket not in seen:
+                    await self.send_devices(websocket)
+                    seen.add(websocket)
 
 
 registry = ConnectionRegistry()
