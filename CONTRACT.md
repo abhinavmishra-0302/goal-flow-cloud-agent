@@ -56,7 +56,8 @@ plus the free-form `scope` / `context` objects. The same protocol must serve any
   empty ⇒ `"default"`. **ui:** the device it wants to watch (from `?device=<id>`); empty
   ⇒ unbound, await auto-bind or `devices`/`select_device`.
 - `device_name` (device only, optional) — human label for the UI's picker; defaults to
-  `user@machine`.
+  a label that is UNIQUE per agent (it ends with a short slice of the device_id, so a
+  picker never shows two identical entries).
 
 `hello_ack` (cloud → client):
 
