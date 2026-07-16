@@ -197,10 +197,11 @@ class ConnectionRegistry:
         await self.send_devices(websocket)
 
     async def bind_ui(self, websocket: WebSocket, device_id: str) -> None:
-        """Move an unbound ui into a session (from a select_device frame)."""
+        """Move an unbound ui into a session (from a select_device frame). Acks so
+        the UI learns which device it landed on (hello_ack.device_id)."""
         if websocket in self._unbound_uis:
             self._unbound_uis.remove(websocket)
-        await self._bind_ui(websocket, device_id, ack=False)
+        await self._bind_ui(websocket, device_id, ack=True)
 
     async def _bind_ui(self, websocket: WebSocket, device_id: str, ack: bool) -> None:
         session = self._session(device_id)
