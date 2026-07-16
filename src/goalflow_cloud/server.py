@@ -243,18 +243,23 @@ class ConnectionRegistry:
             self._sessions.pop(device_id, None)
 
     # --- sending (per-session) ---
-    async def send_to_device(self, device_id: str, frame: dict[str, Any]) -> None:
+    async def send_to_device(self, device_id: str, frame: dict[str, Any]) -> bool:
+        """Send to this session's device. Returns False if it wasn't delivered
+        (no device connected / dead socket) so callers can tell the UI instead of
+        leaving it hanging."""
         log_frame("out", "device", frame)
         session = self._sessions.get(device_id)
         websocket = session.device if session else None
         if websocket is None:
             logger.warning("send_drop role=device device_id=%s reason=not_connected type=%s", device_id, frame.get("type"))
-            return
+            return False
         try:
             await websocket.send_json(frame)
+            return True
         except Exception:
             logger.warning("send_failed role=device device_id=%s type=%s", device_id, frame.get("type"), exc_info=True)
             await self.unregister(websocket)
+            return False
 
     async def send_to_uis(self, device_id: str, frame: dict[str, Any]) -> None:
         log_frame("out", "ui", frame)
@@ -414,6 +419,27 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
 # --- ui -> cloud -> device -------------------------------------------------
 
 
+async def send_device_offline(device_id: str, goal_id: str, correlation_id: str | None) -> None:
+    """The paired device agent isn't connected — tell the UI instead of leaving it
+    spinning on "planning" forever (the dispatch was dropped; nothing will answer).
+    """
+    logger.warning("dispatch_undelivered device_id=%s goal_id=%s reason=device_offline", device_id, goal_id)
+    await registry.send_to_uis(
+        device_id,
+        {
+            "type": "status",
+            "goal_id": goal_id,
+            "correlation_id": correlation_id or "-",
+            "task_status": "done",
+            "payload": {
+                "material": False,
+                "executed": [],
+                "note": f"Device agent '{device_id}' isn't connected — start it and try again.",
+            },
+        },
+    )
+
+
 async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
     """Run the graph to the understanding gate and send it to the UI.
 
@@ -473,7 +499,8 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
     if frame:
         dispatched_contracts[goal_id] = frame
         logger.info("task_status status=planning")
-        await registry.send_to_device(device_id, frame)
+        if not await registry.send_to_device(device_id, frame):
+            await send_device_offline(device_id, goal_id, state.get("correlation_id"))
         return
 
     await registry.send_to_uis(device_id,
@@ -550,7 +577,8 @@ async def handle_understanding_response(device_id: str, response: UnderstandingR
 
     dispatched_contracts[response.goal_id] = frame
     logger.info("task_status status=planning")
-    await registry.send_to_device(device_id, frame)
+    if not await registry.send_to_device(device_id, frame):
+        await send_device_offline(device_id, response.goal_id, state.get("correlation_id"))
 
 
 async def handle_approval(device_id: str, approval: Approval) -> None:
