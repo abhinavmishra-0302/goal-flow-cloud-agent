@@ -70,10 +70,20 @@ class _ContractModel(BaseModel):
 
 
 class Hello(_ContractModel):
-    """Client -> cloud, first frame on connect: registers the client's role."""
+    """Client -> cloud, first frame on connect: registers the client's role.
+
+    ``device_id`` is the PAIRING KEY (a "home" = one device agent + N UIs).
+    A device agent sends its own stable id (self-generated persistent UUID, or
+    an override); a UI sends the device_id it wants to watch. Absent/empty means
+    ``"default"`` (single-pair, zero-config back-compat) for a device, and
+    "unbound — await discovery" for a UI. ``device_name`` is a device-only
+    human label surfaced to UIs in the device picker.
+    """
 
     type: Literal["hello"] = "hello"
     role: Role
+    device_id: str = ""
+    device_name: str = ""
 
 
 class HelloAck(_ContractModel):
@@ -82,6 +92,33 @@ class HelloAck(_ContractModel):
     type: Literal["hello_ack"] = "hello_ack"
     role: Role
     session_id: str
+    device_id: str = ""
+
+
+class DeviceInfo(_ContractModel):
+    """One connected device, for the UI's device picker."""
+
+    device_id: str
+    device_name: str = ""
+    online: bool = True
+
+
+class Devices(_ContractModel):
+    """Cloud -> ui: the currently-connected device agents to pick from.
+
+    Sent to a UI that connected without a ``device_id`` (and whenever the set
+    changes) so it can auto-bind (exactly one) or show a picker.
+    """
+
+    type: Literal["devices"] = "devices"
+    devices: list[DeviceInfo] = Field(default_factory=list)
+
+
+class SelectDevice(_ContractModel):
+    """ui -> cloud: bind this UI socket to a device_id (from the picker)."""
+
+    type: Literal["select_device"] = "select_device"
+    device_id: str
 
 
 # ---------------------------------------------------------------------------
