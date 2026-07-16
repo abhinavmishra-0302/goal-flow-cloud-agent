@@ -215,6 +215,9 @@ class ConnectionRegistry:
         self._meta[websocket] = ("ui", device_id)
         if ack:
             await self._ack(websocket, "ui", device_id)
+        # Every ui gets the current list, bound or not: it needs the paired device's
+        # NAME to display, and the list to offer a "change device" affordance.
+        await self.send_devices(websocket)
         if session.capabilities is not None:
             caps = session.capabilities.model_dump(mode="json")
             log_frame("out", "ui", caps)
