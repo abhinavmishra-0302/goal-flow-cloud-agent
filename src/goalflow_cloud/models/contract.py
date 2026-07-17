@@ -473,7 +473,8 @@ class Notice(_ContractModel):
     """cloud -> ui: a terminal, non-plan message (e.g. an out-of-scope decline).
 
     Sent when the graph ends BEFORE any device dispatch — the goal was judged
-    outside what GoalFlow can act on (only meal planning + guest dinners are)."""
+    outside what the CONNECTED DEVICE advertises it can do (since v3-M4 the
+    actionable set is the device's capabilities, not a fixed topic list)."""
 
     type: Literal["notice"] = "notice"
     goal_id: str
