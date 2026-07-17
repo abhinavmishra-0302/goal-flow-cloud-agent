@@ -96,6 +96,14 @@ class InterpretedIntent(BaseModel):
 
     domain: str = Field(description="Short generic domain id, e.g. meal_plan, chores, errands.")
     objective: str = Field(description="A concise normalized objective.")
+    title: str = Field(
+        default="",
+        description=(
+            "A SHORT title-case noun phrase naming the goal, max 4 words — "
+            "'Birthday Party Preparation', 'Weekly Meal Plan', 'Vacation Prep'. "
+            "This is a card headline, not a sentence: no verbs, no dates, no detail."
+        ),
+    )
     success_criteria: list[str] = Field(default_factory=list)
     scope: dict[str, Any] = Field(default_factory=dict)
     time_window: dict[str, str] = Field(
@@ -458,6 +466,10 @@ def present_understanding(state: GraphState) -> GraphState:
     domain = intent["domain"]
     understanding = {
         "objective": intent["objective"],
+        # A short card headline for the board. Additive on the dispatch: the device
+        # ignores it, but the hub caches the contract and the board reads it from
+        # there, so it rides along rather than needing its own channel.
+        "title": intent.get("title") or "",
         "domain": domain,
         "time_window": intent.get("time_window") or {},
         "hard": hard,
@@ -522,6 +534,10 @@ def build_contract(state: GraphState) -> GraphState:
         "correlation_id": correlation_id,
         "domain": domain,
         "objective": intent["objective"],
+        # A short card headline for the board. Additive on the dispatch: the device
+        # ignores it, but the hub caches the contract and the board reads it from
+        # there, so it rides along rather than needing its own channel.
+        "title": intent.get("title") or "",
         "success_criteria": intent.get("success_criteria", []),
         "constraints": {
             "hard": memory.get("hard", {}),
