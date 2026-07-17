@@ -244,6 +244,20 @@ cloud learns what a goal is made of and how far along it is. `progress_pct`,
 `pending_tasks` and `next_step` are the goal-level rollup as of that transition; they are
 DERIVED from task state, never from the clock.
 
+`state` is one of — **snake_case, like every other enum on this wire**:
+
+```
+created | ready | planning | awaiting_approval | executing
+monitoring | adapting | paused | retrying | completed | failed
+```
+
+These were unlisted until v3-M6, and the drift that followed is the reason they are
+written down now: the device serialised its enum with `ToString().ToLowerInvariant()`
+and shipped `awaitingapproval` while `task_status` and `phase` carried
+`awaiting_approval` — the same idea spelled two ways. Every value except
+`awaiting_approval` is a single word, so it round-tripped by accident and no consumer
+noticed. An example alone (`"state": "monitoring"`) does not pin an enum; the list does.
+
 `phase: "queued"` (v3) means another goal holds the single planning slot; this one starts
 next. It exists so a waiting goal is visible rather than appearing stalled.
 

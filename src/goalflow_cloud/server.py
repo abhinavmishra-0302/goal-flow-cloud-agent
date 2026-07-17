@@ -529,11 +529,29 @@ async def send_board_snapshot(device_id: str) -> None:
 
 
 async def handle_goal_state_get(device_id: str, request: GoalStateGet) -> None:
-    """Drill-in after a reload: the cached plan, then the latest status.
+    """Drill-in: whatever this goal is currently sitting on.
 
     The agent_event stream is deliberately NOT replayed — a rejoined view shows the
     plan and its ticks, not a re-run of the thinking.
     """
+    # An unconfirmed understanding first: it is the whole reason to drill in from the
+    # board (the card says "Confirm what the agent understood" and links here), and a
+    # goal at this gate has neither a plan nor a status, so without this the tap
+    # would land on an empty stage.
+    understanding = board.cached_understanding(request.goal_id)
+    if understanding is not None:
+        await registry.send_to_uis(device_id, Understanding(
+            goal_id=request.goal_id,
+            payload=UnderstandingPayload(
+                objective=understanding.get("objective", ""),
+                domain=understanding.get("domain", ""),
+                knew=understanding.get("knew") or graph_nodes._hard_knew(understanding.get("hard") or {}),
+                thought=understanding.get("thought", ""),
+                time_window=understanding.get("time_window") or None,
+            ),
+        ).model_dump(mode="json", exclude_none=True))
+        return
+
     plan = board.cached_plan(request.goal_id)
     if plan is not None:
         await registry.send_to_uis(device_id, {
@@ -669,6 +687,11 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
         )
         logger.info("task_status status=grounding gate=understanding")
         await registry.send_to_uis(device_id, frame.model_dump(mode="json", exclude_none=True))
+        # The board gets a card NOW. This gate can hold a goal indefinitely — it is
+        # waiting on a person — so a board that only learns about goals at dispatch
+        # would show nothing at all for the whole time it matters most.
+        await push_board(device_id, board.on_understanding(
+            device_id, goal_id, understanding, user_goal.client_ref))
         return
 
     frame = state.get("contract")

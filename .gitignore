@@ -28,4 +28,9 @@ htmlcov/
 .vscode/
 .idea/
 .DS_Store
+# The LangGraph checkpointer (M5). The `-wal` and `-shm` siblings are SQLite's
+# runtime journal + shared memory: they are recreated on every open and churn on
+# every goal. A bare `data/goalflow.db` does NOT match them — that is how a 4MB WAL
+# got committed in v3-M6 — so the glob has to be explicit.
 data/goalflow.db
+data/goalflow.db-*

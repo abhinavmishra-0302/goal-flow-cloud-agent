@@ -58,15 +58,34 @@ def main() -> int:
     check(s.pending_tasks == 4, "pending count comes from the device")
 
     # 3. A plan needing approval -> Waiting (the board's third chip).
+    #
+    # The explanation here is a REAL one, verbatim in shape from a live run: the
+    # planner writes a rationale paragraph, not a caption. An earlier version of this
+    # gate used a tidy one-liner fixture and so passed while the rendered card read
+    # "The 7-day vegetarian dinner plan leverages existing inven…". A fixture prettier
+    # than production tests nothing — the field must be fed what it will really get.
     board.on_plan_ready(DEV, "g1", {
         "plan": [{"id": "s1"}], "safety": {"gate": "passed"},
         "proposals": [{"proposal_id": "p1", "requires_approval": True}],
-        "explanation": "Ordered the cake and blocked out Sunday afternoon.",
+        "explanation": (
+            "This plan orders the cake early to secure the Sunday slot, then blocks "
+            "the afternoon and confirms the guest count before decorations are bought, "
+            "so nothing is purchased against a number that may still change."
+        ),
     })
     s = board.snapshot(DEV)[1][0]
     check(s.state == "waiting", f"a plan awaiting approval is Waiting, got {s.state!r}")
     check(bool(board.cached_plan("g1")), "the plan is cached for drill-in after a reload")
-    check(s.activity and "cake" in s.activity[0], f"activity shows what happened, got {s.activity}")
+    check(s.activity == [], f"a plan's rationale is NOT activity — nothing has happened yet, got {s.activity}")
+
+    # 3b. A COMPLETED task is what activity means.
+    board.on_task_update(DEV, "g1", {
+        "task_id": "t1", "title": "Grocery delivery confirmed", "state": "completed",
+        "progress_pct": 43, "pending_tasks": 4, "next_step": "Buy party decorations",
+    })
+    s = board.snapshot(DEV)[1][0]
+    check(s.activity == ["Grocery delivery confirmed"], f"activity is what finished, got {s.activity}")
+    check(all(len(a) <= 60 for a in s.activity), "an activity line must fit the card")
 
     # 4. An adaptation -> an alert, and the board says what it wants.
     board.on_proposal(DEV, "g1", {"payload": {"action": "Swap the nut cake for a fruit platter"}})

@@ -53,6 +53,9 @@ class BoardService:
         self._plans: dict[str, dict[str, Any]] = {}
         #: goal_id -> the last status frame (for goal_state_get)
         self._statuses: dict[str, dict[str, Any]] = {}
+        #: goal_id -> the understanding awaiting a human (for goal_state_get drill-in).
+        #: Dropped once confirmed: a settled gate is not something to rejoin.
+        self._understandings: dict[str, dict[str, Any]] = {}
 
     # --- reads ---
 
@@ -71,20 +74,66 @@ class BoardService:
     def cached_status(self, goal_id: str) -> dict[str, Any] | None:
         return self._statuses.get(goal_id)
 
+    def cached_understanding(self, goal_id: str) -> dict[str, Any] | None:
+        return self._understandings.get(goal_id)
+
     def forget_goal(self, device_id: str, goal_id: str) -> None:
         self._goals.get(device_id, {}).pop(goal_id, None)
         self._plans.pop(goal_id, None)
         self._statuses.pop(goal_id, None)
+        self._understandings.pop(goal_id, None)
 
     # --- the fold ---
 
+    def on_understanding(self, device_id: str, goal_id: str, understanding: dict[str, Any],
+                         client_ref: str | None) -> GoalSummary:
+        """The cloud has read the goal back and wants a human to confirm it.
+
+        THE CARD IS BORN HERE, not at dispatch. A goal stuck behind a person is
+        precisely what a board exists to surface; creating the card only once the
+        contract dispatches means the single state where a human is the blocker is
+        the one state the board cannot show. Before this, a goal started from the
+        board sat on its optimistic placeholder forever, with nothing anywhere saying
+        it was waiting on you.
+
+        The understanding dict carries title/domain/time_window already — the same
+        keys `_subtitle` reads off a contract — so the card is complete from the
+        first frame rather than filling in later.
+        """
+        self._understandings[goal_id] = understanding
+        window = understanding.get("time_window") or {}
+        return self._put(device_id, GoalSummary(
+            goal_id=goal_id,
+            client_ref=client_ref,
+            title=_title(understanding.get("title") or understanding.get("objective") or "New goal"),
+            subtitle=_subtitle(understanding),
+            domain=understanding.get("domain") or "",
+            state="waiting",
+            task_status="interpreting",
+            eta=window.get("end") or None,
+            next_step="Confirm what the agent understood",
+            # An alert, because this one genuinely wants a person. The board is
+            # read-mostly by design, so the card's job is to say so and hand off to
+            # the chat UI — not to grow its own confirm button.
+            alerts=GoalAlerts(count=1, severity="warn"),
+            updated_at=_now(),
+        ))
+
     def on_goal_created(self, device_id: str, goal_id: str, contract: dict[str, Any],
                         client_ref: str | None) -> GoalSummary:
-        """A dispatch went out: the goal exists and is being planned."""
+        """A dispatch went out: the goal exists and is being planned.
+
+        Overwrites whatever the understanding gate put up, which is what clears that
+        gate's alert — confirming IS the resolution.
+        """
+        self._understandings.pop(goal_id, None)
+        existing = self._get(device_id, goal_id)
         window = contract.get("time_window") or {}
         summary = GoalSummary(
             goal_id=goal_id,
-            client_ref=client_ref,
+            # The post-confirmation dispatch path has no client_ref to hand us; keep
+            # the one the card was born with so a UI can still tie it to its submit.
+            client_ref=client_ref or (existing.client_ref if existing else None),
             title=_title(contract.get("title") or contract.get("objective") or "New goal"),
             subtitle=_subtitle(contract),
             domain=contract.get("domain") or "",
@@ -120,6 +169,12 @@ class BoardService:
         if payload.get("failure_reason"):
             updates["alerts"] = _bump(summary.alerts, "danger")
 
+        # A finished task IS the activity line — "Grocery delivery confirmed". Task
+        # titles are already written as short human phrases by the planner, which is
+        # why they read well here and the plan's explanation (a paragraph) does not.
+        if payload.get("state") == "completed" and payload.get("title"):
+            updates["activity"] = _push(summary.activity, payload["title"])
+
         return self._put(device_id, summary.model_copy(update=updates))
 
     def on_plan_ready(self, device_id: str, goal_id: str, payload: dict[str, Any]) -> GoalSummary | None:
@@ -147,7 +202,12 @@ class BoardService:
             "task_status": "awaiting_approval" if needs_approval else "monitoring",
             "state": state if state == "at_risk" else ("waiting" if needs_approval else "on_track"),
             "alerts": alerts,
-            "activity": _push(summary.activity, payload.get("explanation")),
+            # Deliberately NOT payload["explanation"]. That field is the planner's
+            # RATIONALE — a paragraph — and clipping it to fit a card yields "The
+            # 7-day vegetarian dinner plan leverages existing inven…", which is the
+            # exact failure `_title` exists to prevent. Activity is filled by
+            # completed tasks instead; until one lands, the card shows none, which is
+            # honest: nothing has happened yet.
             "updated_at": _now(),
         }))
 

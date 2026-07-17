@@ -32,12 +32,6 @@ SIBLINGS = ROOT.parent
 CONTRACT = ROOT / "CONTRACT.md"
 PY_MIRROR = ROOT / "src/goalflow_cloud/models/contract.py"
 CS_MIRRORS = sorted((SIBLINGS / "goal-flow-device-agent-ubuntu/src/GoalFlow.Device/Contracts").glob("*.cs"))
-TS_MIRRORS = [
-    SIBLINGS / "goal-flow-agent-chat-ui/src/types/contract.ts",
-    SIBLINGS / "goal-flow-agent-board-ui/src/types/contract.ts",
-]
-WS_ALLOWLIST = SIBLINGS / "goal-flow-agent-chat-ui/src/lib/ws.ts"
-
 #: Frames the DEVICE neither sends nor receives — it has no reason to know them.
 #: The board is a cloud↔ui concern; the device is upstream of it and never sees one.
 DEVICE_EXEMPT = {
@@ -46,11 +40,45 @@ DEVICE_EXEMPT = {
     "present_plan", "notice",
 }
 
-#: Frames a UI never handles inbound (ui→cloud only, or device↔cloud only).
+#: Frames NO ui ever handles inbound (ui→cloud only, or device↔cloud only).
 UI_INBOUND_EXEMPT = {
     "hello", "user_goal", "understanding_response", "approval", "control",
     "select_device", "board_get", "goal_state_get", "dispatch", "plan_ready",
 }
+
+#: The two UIs are NOT the same shape, and the gate must not pretend they are.
+#:
+#: The chat UI is the full protocol surface. The board is a deliberate SLICE: a
+#: read-mostly projection that renders the cloud's derived summaries. `types_exempt`
+#: for the board is therefore the "board is read-mostly" decision written down as a
+#: check — if someone adds `approval` to the board's mirror, this gate fails and asks
+#: them to change the decision on purpose rather than by drift.
+#:
+#: Both allowlists are checked. The board's ws.ts drops unlisted frames exactly like
+#: the chat UI's does, and it is the newer file — leaving it unchecked would reopen
+#: the very hole this gate was written for.
+UIS = [
+    {
+        "name": "chat-ui",
+        "contract": SIBLINGS / "goal-flow-agent-chat-ui/src/types/contract.ts",
+        "ws": SIBLINGS / "goal-flow-agent-chat-ui/src/lib/ws.ts",
+        "types_exempt": set(),
+        "inbound_exempt": UI_INBOUND_EXEMPT,
+    },
+    {
+        "name": "board-ui",
+        "contract": SIBLINGS / "goal-flow-agent-board-ui/src/types/contract.ts",
+        "ws": SIBLINGS / "goal-flow-agent-board-ui/src/lib/ws.ts",
+        # device↔cloud frames, plus the two WRITES the board must never send.
+        "types_exempt": {"dispatch", "plan_ready", "control", "approval", "understanding_response"},
+        # The board renders derived summaries, not raw per-goal frames. It receives
+        # these (the cloud broadcasts to every ui) and deliberately ignores them.
+        "inbound_exempt": UI_INBOUND_EXEMPT | {
+            "capabilities", "agent_event", "understanding", "present_plan",
+            "proposal", "status",
+        },
+    },
+]
 
 
 def contract_types() -> set[str]:
@@ -63,6 +91,53 @@ def contract_event_kinds() -> set[str]:
     text = CONTRACT.read_text()
     m = re.search(r'"event"\s*:\s*((?:"[a-z_]+"\s*\|?\s*)+)', text)
     return set(re.findall(r'"([a-z_]+)"', m.group(1))) if m else set()
+
+
+def contract_task_states() -> set[str]:
+    """The documented `task_update.state` enumeration."""
+    text = CONTRACT.read_text()
+    m = re.search(r"`state` is one of.*?```\n(.*?)```", text, re.S)
+    return set(re.findall(r"[a-z_]+", m.group(1))) if m else set()
+
+
+def check_task_states(failures: list[str]) -> None:
+    """The device's TaskState enum must serialise to the documented wire values.
+
+    Compares the C# enum MEMBERS against the contract's list, converting the way
+    Trace.ToWire does. This is the check that was missing when the device shipped
+    `awaitingapproval` against a contract that (silently) meant `awaiting_approval`:
+    gate 14 only ever compared frame `type` values and agent_event kinds, so a
+    field's own enumeration could drift freely.
+    """
+    documented = contract_task_states()
+    if not documented:
+        failures.append("CONTRACT.md no longer documents the task_update.state enum — it is unpinned")
+        return
+
+    record = SIBLINGS / "goal-flow-device-agent-ubuntu/src/GoalFlow.Device/Harness/TaskManager/TaskRecord.cs"
+    if not record.exists():
+        failures.append("could not find TaskRecord.cs — task_update.state is unchecked")
+        return
+    m = re.search(r"enum TaskState\s*\{(.*?)\n\}", record.read_text(), re.S)
+    if not m:
+        failures.append("could not read the TaskState enum — task_update.state is unchecked")
+        return
+
+    body = re.sub(r"///.*", "", m.group(1))
+    members = re.findall(r"^\s*([A-Z][A-Za-z]*)\s*,", body, re.M)
+    on_wire = {re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower() for name in members}
+
+    for missing in sorted(on_wire - documented):
+        failures.append(f"device emits task state {missing!r}, which CONTRACT.md does not list")
+    for extra in sorted(documented - on_wire):
+        failures.append(f"CONTRACT.md lists task state {extra!r}, which the device cannot emit")
+
+    trace = SIBLINGS / "goal-flow-device-agent-ubuntu/src/GoalFlow.Device/Harness/Trace/Trace.cs"
+    if trace.exists() and 'task.State.ToString().ToLowerInvariant()' in trace.read_text():
+        failures.append(
+            "Trace emits task.State via ToString().ToLowerInvariant() — that ships "
+            "'awaitingapproval', not 'awaiting_approval'. Use ToWire()."
+        )
 
 
 def main() -> int:
@@ -89,26 +164,40 @@ def main() -> int:
         if f'"{k}"' not in cs:
             failures.append(f"C# is missing agent_event kind {k!r}")
 
-    # --- TypeScript ---
-    for ts in TS_MIRRORS:
+    # --- TypeScript + each UI's silent dropper ---
+    for ui in UIS:
+        name, ts, ws = ui["name"], ui["contract"], ui["ws"]
         if not ts.exists():
-            print(f"  (skipped {ts.parent.parent.parent.name} — not created yet)")
+            print(f"  (skipped {name} — not created yet)")
             continue
-        text = ts.read_text()
-        for t in sorted(types):
-            if f'"{t}"' not in text:
-                failures.append(f"{ts.parent.parent.parent.name} contract.ts is missing {t!r}")
 
-    # --- the silent dropper ---
-    if WS_ALLOWLIST.exists():
-        allow = WS_ALLOWLIST.read_text()
-        m = re.search(r"INBOUND_TYPES[^=]*=\s*(?:new Set\()?\[([^\]]+)\]", allow)
-        if m:
-            listed = set(re.findall(r'"([a-z_]+)"', m.group(1)))
-            for t in sorted(types - UI_INBOUND_EXEMPT - listed):
-                failures.append(f"chat-ui ws.ts INBOUND_TYPES is missing {t!r} — it will be SILENTLY DROPPED")
-        else:
-            failures.append("could not read INBOUND_TYPES out of ws.ts — the allowlist is unchecked")
+        text = ts.read_text()
+        for t in sorted(types - ui["types_exempt"]):
+            if f'"{t}"' not in text:
+                failures.append(f"{name} contract.ts is missing {t!r}")
+        # An exemption must stay a DECISION, not a stale list: a frame declared here
+        # that the mirror also carries means the two disagree about what this surface
+        # is for.
+        for t in sorted(ui["types_exempt"]):
+            if f'"{t}"' in text:
+                failures.append(
+                    f"{name} contract.ts declares {t!r}, which it is exempt from — "
+                    f"either it is no longer read-mostly, or the mirror over-reaches"
+                )
+
+        if not ws.exists():
+            failures.append(f"{name} has a contract mirror but no ws.ts — the allowlist is unchecked")
+            continue
+        m = re.search(r"INBOUND_TYPES[^=]*=\s*(?:new Set\()?\[([^\]]+)\]", ws.read_text())
+        if not m:
+            failures.append(f"could not read INBOUND_TYPES out of {name} ws.ts — the allowlist is unchecked")
+            continue
+        listed = set(re.findall(r'"([a-z_]+)"', m.group(1)))
+        for t in sorted(types - ui["inbound_exempt"] - listed):
+            failures.append(f"{name} ws.ts INBOUND_TYPES is missing {t!r} — it will be SILENTLY DROPPED")
+
+    # --- field-level enums (not just frame types) ---
+    check_task_states(failures)
 
     for f in failures:
         print(f"  FAIL {f}")
