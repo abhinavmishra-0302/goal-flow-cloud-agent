@@ -17,6 +17,7 @@ tagged (contextvars-backed filter), one line per inbound/outbound frame.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -490,6 +491,35 @@ async def send_device_offline(device_id: str, goal_id: str, correlation_id: str 
     )
 
 
+#: One lock per goal. Every graph invoke/resume must hold its goal's lock.
+#:
+#: LangGraph is synchronous, so each call hops to a worker thread via
+#: ``asyncio.to_thread`` — and a goal has several things that can resume it at
+#: once: a ``status`` tick and an ``approval`` for the SAME goal arrive
+#: independently and both resume the same checkpoint from two OS threads. That is
+#: a read-modify-write race on the checkpointer with no lock anywhere; v2's own
+#: ARCHITECTURE.md flagged it as an open risk and it was survivable only because
+#: one goal at a time meant the overlap was rare. Agent Board makes it routine.
+#:
+#: Keyed by goal, NOT global: goals must still run in parallel (goal B's
+#: interpretation should not wait on goal A's approval). Per-goal serialised,
+#: cross-goal concurrent.
+#:
+#: Unbounded by construction (one entry per goal_id ever seen) — acceptable for a
+#: POC, and the entry is a bare asyncio.Lock. Real cleanup belongs with the goal
+#: store in M6.
+_goal_locks: dict[str, asyncio.Lock] = {}
+
+
+def goal_lock(goal_id: str) -> asyncio.Lock:
+    """The lock for one goal, created on first use.
+
+    Safe without a lock of its own: this only ever runs on the event loop, and
+    ``dict.setdefault`` is atomic with respect to it.
+    """
+    return _goal_locks.setdefault(goal_id, asyncio.Lock())
+
+
 async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
     """Run the graph to the understanding gate and send it to the UI.
 
@@ -505,9 +535,10 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
     # decides what we can act on was a hardcoded list of two domains instead
     # (v3-M4). Now the answer follows the hardware that is plugged in.
     capabilities = registry.capabilities_of(device_id)
-    state = await asyncio.to_thread(
-        graph_nodes.start_goal, graph, user_goal.text, goal_id, capabilities
-    )
+    async with goal_lock(goal_id):
+        state = await asyncio.to_thread(
+            graph_nodes.start_goal, graph, user_goal.text, goal_id, capabilities
+        )
     if state.get("error"):
         await registry.send_to_uis(device_id,
             {
@@ -581,12 +612,13 @@ async def handle_understanding_response(device_id: str, response: UnderstandingR
     resolved_understandings.add(response.goal_id)
 
     confirmed = response.payload.confirmed
-    state = await asyncio.to_thread(
-        graph_nodes.resume_goal,
-        graph,
-        response.goal_id,
-        {"confirmed": confirmed},
-    )
+    async with goal_lock(response.goal_id):
+        state = await asyncio.to_thread(
+            graph_nodes.resume_goal,
+            graph,
+            response.goal_id,
+            {"confirmed": confirmed},
+        )
     if not confirmed:
         await registry.send_to_uis(device_id,
             {
@@ -645,7 +677,8 @@ async def handle_approval(device_id: str, approval: Approval) -> None:
     import asyncio
 
     decisions = [decision.model_dump(mode="json") for decision in approval.payload.decisions]
-    await asyncio.to_thread(graph_nodes.resume_goal, graph, approval.goal_id, decisions)
+    async with goal_lock(approval.goal_id):
+        await asyncio.to_thread(graph_nodes.resume_goal, graph, approval.goal_id, decisions)
     await registry.send_to_device(device_id, approval.model_dump(mode="json"))
 
 
@@ -689,12 +722,13 @@ async def handle_plan_ready(device_id: str, plan_ready: PlanReady) -> None:
     """
     import asyncio
 
-    state = await asyncio.to_thread(
-        graph_nodes.resume_goal,
-        graph,
-        plan_ready.goal_id,
-        plan_ready.model_dump(mode="json"),
-    )
+    async with goal_lock(plan_ready.goal_id):
+        state = await asyncio.to_thread(
+            graph_nodes.resume_goal,
+            graph,
+            plan_ready.goal_id,
+            plan_ready.model_dump(mode="json"),
+        )
     payload = plan_ready.payload.model_dump(mode="json")
     payload["knew"] = build_knew(dispatched_contracts.get(plan_ready.goal_id))
     present = PresentPlan(
@@ -748,7 +782,8 @@ async def graph_resume_monitor(goal_id: str, frame: dict[str, Any]) -> None:
     import asyncio
 
     try:
-        state = await asyncio.to_thread(graph_nodes.resume_goal, graph, goal_id, frame)
+        async with goal_lock(goal_id):
+            state = await asyncio.to_thread(graph_nodes.resume_goal, graph, goal_id, frame)
     except Exception:
         logger.exception("graph_monitor_resume_failed")
         return
