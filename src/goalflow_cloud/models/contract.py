@@ -49,12 +49,20 @@ TaskStatus = Literal[
 ]
 
 #: agent_event stream event kinds.
+#:
+#: A Literal here is a HARD GATE, not documentation: an unlisted value fails
+#: validation and the frame is DROPPED — silently, with the board simply sitting at
+#: 0% and no error anywhere. That is exactly what happened when ``task_update`` was
+#: added to CONTRACT.md and the C# mirror but not here, and it is why every mirror
+#: must move in one pass.
 AgentEventKind = Literal[
     "phase",
     "thinking",
     "tool_call",
     "tool_result",
     "plan_progress",
+    #: v3: the device's task ledger moved — the board's progress/next-step/pending.
+    "task_update",
 ]
 
 

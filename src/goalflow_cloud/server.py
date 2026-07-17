@@ -27,11 +27,17 @@ from uuid import uuid4
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
+from goalflow_cloud.board import BoardService
 from goalflow_cloud.config import get_settings
 from goalflow_cloud.graph import nodes as graph_nodes
 from goalflow_cloud.models.contract import (
     AgentEvent,
     Approval,
+    BoardGet,
+    BoardSnapshot,
+    BoardUpdate,
+    GoalAccepted,
+    GoalStateGet,
     Capabilities,
     Control,
     Devices,
@@ -52,8 +58,13 @@ from goalflow_cloud.models.contract import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="goalflow-cloud-agent", version="2.0.0-design")
+app = FastAPI(title="goalflow-cloud-agent", version="3.0.0")
 graph = graph_nodes.build_graph()
+
+#: Agent Board's derived state (v3-M6). The hub already routes every frame a goal
+#: produces and is the only place that sees ALL of a session's goals, so it folds
+#: them here rather than asking the device for a view it would have to invent.
+board = BoardService()
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +237,9 @@ class ConnectionRegistry:
                 await websocket.send_json(caps)
             except Exception:
                 logger.debug("caps_replay_failed", exc_info=True)
+        # First paint for a board: the session's goals, unprompted. A board that had
+        # to ASK would render empty for a beat on every reload.
+        await self._replay_board(websocket, device_id)
 
     def _leave_session(self, websocket: WebSocket, keep: str = "") -> None:
         """Remove a ui socket from the session it currently belongs to (if any other
@@ -264,6 +278,10 @@ class ConnectionRegistry:
             session.device = None
             session.capabilities = None
             await self.broadcast_devices()
+            # Nothing will answer for this session's unfinished goals now, so say so
+            # rather than leaving cards that look alive.
+            for summary in board.on_device_offline(device_id):
+                await push_board(device_id, summary)
         elif role == "ui" and websocket in session.uis:
             session.uis.remove(websocket)
         if session.device is None and not session.uis:
@@ -301,6 +319,18 @@ class ConnectionRegistry:
             except Exception:
                 logger.warning("send_failed role=ui device_id=%s type=%s", device_id, frame.get("type"), exc_info=True)
                 await self.unregister(websocket)
+
+    async def _replay_board(self, websocket: WebSocket, device_id: str) -> None:
+        """Send this session's board snapshot to one freshly-bound socket."""
+        seq, goals = board.snapshot(device_id)
+        if not goals:
+            return
+        frame = BoardSnapshot(board_seq=seq, goals=goals).model_dump(mode="json")
+        log_frame("out", "ui", frame)
+        try:
+            await websocket.send_json(frame)
+        except Exception:
+            logger.debug("board_replay_failed", exc_info=True)
 
     def set_capabilities(self, device_id: str, capabilities: Capabilities) -> None:
         self._session(device_id).capabilities = capabilities
@@ -443,6 +473,10 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
 
     if sender_role == "ui" and frame_type == "user_goal":
         await handle_user_goal(device_id, UserGoal(**frame))
+    elif sender_role == "ui" and frame_type == "board_get":
+        await send_board_snapshot(device_id)
+    elif sender_role == "ui" and frame_type == "goal_state_get":
+        await handle_goal_state_get(device_id, GoalStateGet(**frame))
     elif sender_role == "ui" and frame_type == "understanding_response":
         await handle_understanding_response(device_id, UnderstandingResponse(**frame))
     elif sender_role == "ui" and frame_type == "approval":
@@ -458,16 +492,62 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
     elif sender_role == "device" and frame_type == "proposal":
         proposal = Proposal(**frame)
         await registry.send_to_uis(device_id, proposal.model_dump(mode="json"))
+        await push_board(device_id, board.on_proposal(device_id, proposal.goal_id, proposal.model_dump(mode="json")))
         await graph_resume_monitor(proposal.goal_id, proposal.model_dump(mode="json"))
     elif sender_role == "device" and frame_type == "status":
         status = Status(**frame)
         await registry.send_to_uis(device_id, status.model_dump(mode="json"))
+        await push_board(device_id, board.on_status(device_id, status.goal_id, status.model_dump(mode="json")))
         await graph_resume_monitor(status.goal_id, status.model_dump(mode="json"))
     else:
         logger.warning("unknown_route role=%s type=%s", sender_role, frame_type)
 
 
 # --- ui -> cloud -> device -------------------------------------------------
+
+
+async def push_board(device_id: str, summary: Any | None) -> None:
+    """One goal changed — tell the boards watching this session.
+
+    A whole GoalSummary, replace-by-goal_id: idempotent, so a duplicate or
+    out-of-order update cannot corrupt a card. No-ops when the fold ignored the
+    frame (e.g. a goal the board never saw start).
+    """
+    if summary is None:
+        return
+    frame = BoardUpdate(board_seq=board.seq(device_id), goal=summary).model_dump(mode="json")
+    log_frame("out", "ui", frame)
+    await registry.send_to_uis(device_id, frame)
+
+
+async def send_board_snapshot(device_id: str) -> None:
+    """Every goal in this session — on bind, and to heal a board_seq gap."""
+    seq, goals = board.snapshot(device_id)
+    frame = BoardSnapshot(board_seq=seq, goals=goals).model_dump(mode="json")
+    log_frame("out", "ui", frame)
+    await registry.send_to_uis(device_id, frame)
+
+
+async def handle_goal_state_get(device_id: str, request: GoalStateGet) -> None:
+    """Drill-in after a reload: the cached plan, then the latest status.
+
+    The agent_event stream is deliberately NOT replayed — a rejoined view shows the
+    plan and its ticks, not a re-run of the thinking.
+    """
+    plan = board.cached_plan(request.goal_id)
+    if plan is not None:
+        await registry.send_to_uis(device_id, {
+            "type": "present_plan",
+            "goal_id": request.goal_id,
+            "correlation_id": "-",
+            "task_status": "monitoring",
+            "payload": plan,
+        })
+    status = board.cached_status(request.goal_id)
+    if status is not None:
+        await registry.send_to_uis(device_id, status)
+    if plan is None and status is None:
+        logger.info("goal_state_get_miss goal_id=%s", request.goal_id)
 
 
 async def send_device_offline(device_id: str, goal_id: str, correlation_id: str | None) -> None:
@@ -530,6 +610,14 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
     resolved_understandings.discard(goal_id)
     goal_id_var.set(goal_id)
     logger.info("task_status status=created")
+    # Tie the submission to its goal_id straight away. With two goals in flight the
+    # UI cannot otherwise tell which inbound goal_id is which — it would adopt
+    # whichever arrives first and mis-key the card.
+    if user_goal.client_ref:
+        await registry.send_to_uis(
+            device_id,
+            GoalAccepted(goal_id=goal_id, client_ref=user_goal.client_ref).model_dump(mode="json"),
+        )
     # Hand the interpreter what THIS session's device says it can do. The hub has
     # cached this since v2 and only ever relayed it to the UI; the gate that
     # decides what we can act on was a hardcoded list of two domains instead
@@ -586,6 +674,7 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
     frame = state.get("contract")
     if frame:
         dispatched_contracts[goal_id] = frame
+        await push_board(device_id, board.on_goal_created(device_id, goal_id, frame, user_goal.client_ref))
         logger.info("task_status status=planning")
         if not await registry.send_to_device(device_id, frame):
             await send_device_offline(device_id, goal_id, state.get("correlation_id"))
@@ -665,6 +754,7 @@ async def handle_understanding_response(device_id: str, response: UnderstandingR
         return
 
     dispatched_contracts[response.goal_id] = frame
+    await push_board(device_id, board.on_goal_created(device_id, response.goal_id, frame, None))
     logger.info("task_status status=planning")
     if not await registry.send_to_device(device_id, frame):
         await send_device_offline(device_id, response.goal_id, state.get("correlation_id"))
@@ -696,7 +786,13 @@ async def handle_capabilities(device_id: str, capabilities: Capabilities) -> Non
 async def relay_agent_event(device_id: str, event: AgentEvent) -> None:
     """PASSTHROUGH relay of the device's live stream to the UI.
 
+    Also the board's data path: `task_update` carries the goal's progress, next step
+    and pending count, derived by the DEVICE from its task DAG. The cloud cannot
+    compute those — only the device can ground a decomposition — so this is the one
+    place the board's numbers can come from.
     """
+    if event.event == "task_update":
+        await push_board(device_id, board.on_task_update(device_id, event.goal_id, event.payload or {}))
     try:
         graph.update_state(
             {"configurable": {"thread_id": event.goal_id}},
@@ -731,6 +827,7 @@ async def handle_plan_ready(device_id: str, plan_ready: PlanReady) -> None:
         )
     payload = plan_ready.payload.model_dump(mode="json")
     payload["knew"] = build_knew(dispatched_contracts.get(plan_ready.goal_id))
+    await push_board(device_id, board.on_plan_ready(device_id, plan_ready.goal_id, payload))
     present = PresentPlan(
         goal_id=plan_ready.goal_id,
         correlation_id=plan_ready.correlation_id,
