@@ -28,3 +28,4 @@ htmlcov/
 .vscode/
 .idea/
 .DS_Store
+data/goalflow.db

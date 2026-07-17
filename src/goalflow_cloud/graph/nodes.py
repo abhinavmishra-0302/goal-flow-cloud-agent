@@ -26,13 +26,16 @@ Key invariants:
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import date, timedelta
+from pathlib import Path
 from operator import add
 from typing import Annotated, Any, TypedDict
 from uuid import uuid4
 
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field, ValidationError
@@ -806,6 +809,31 @@ def route_on_monitor(state: GraphState) -> str:
 # ---------------------------------------------------------------------------
 
 
+def default_checkpointer(db_path: str | None = None) -> Any:
+    """A SQLite-backed checkpointer at ``data/goalflow.db`` (v3-M5).
+
+    WHY NOT MemorySaver: the interrupts ARE the product. A goal sits at its
+    approval gate waiting for a person, and people take hours — a board goal spans
+    days. MemorySaver spans one process, so every restart silently dropped every
+    paused goal: the card stays on the board and nothing can ever resume it, which
+    is worse than losing it visibly.
+
+    ``check_same_thread=False`` because LangGraph is synchronous and every call
+    hops to a worker thread via ``asyncio.to_thread`` — so the connection is used
+    from several threads. That is safe HERE because the hub holds a per-goal lock
+    around every invoke (server.goal_lock), and a thread_id is a goal_id: two
+    threads never touch the same checkpoint at once.
+
+    One file, stdlib sqlite3 under the hood. No Redis, no Postgres, no ORM.
+    """
+    settings = get_settings()
+    path = db_path or getattr(settings, "checkpoint_db", None) or "data/goalflow.db"
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, check_same_thread=False)
+    logger.info("checkpointer=sqlite path=%s", path)
+    return SqliteSaver(connection)
+
+
 def build_graph(checkpointer: Any | None = None) -> Any:
     """Assemble and compile the v2 StateGraph.
 
@@ -874,7 +902,7 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     graph.add_edge("decline_out_of_scope", END)
     graph.add_edge("finalize", END)
 
-    return graph.compile(checkpointer=checkpointer or MemorySaver())
+    return graph.compile(checkpointer=checkpointer or default_checkpointer())
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,10 @@ dependencies = [
     "websockets",
     "langgraph",
     "langgraph-checkpoint",
+    # v3-M5: the checkpointer is SQLite-backed, so a goal paused at its approval
+    # gate survives a cloud restart. Board goals span days; MemorySaver spans one
+    # process.
+    "langgraph-checkpoint-sqlite",
     "langchain-openai",
     "python-dotenv",
     "pydantic",
