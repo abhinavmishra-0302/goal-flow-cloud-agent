@@ -82,6 +82,10 @@ class GraphState(TypedDict, total=False):
     approval_frame: dict[str, Any]
     monitor_frame: dict[str, Any]
     explanation: dict[str, Any]
+    # What the connected device says it can do (its `capabilities` frame, cached
+    # per session by the hub). The interpreter judges actionability against THIS
+    # rather than a hardcoded topic list — see capability_digest.
+    device_capabilities: dict[str, Any]
 
 
 class InterpretedIntent(BaseModel):
@@ -99,8 +103,9 @@ class InterpretedIntent(BaseModel):
     actionable: bool = Field(
         default=True,
         description=(
-            "True ONLY if the goal is a weekly meal/dinner plan or hosting a guest dinner; "
-            "False for anything else (trivia, general questions, unrelated tasks)."
+            "True if the goal can plausibly be advanced using the capabilities the "
+            "connected device advertises; False when nothing it can do relates to the "
+            "goal (trivia, general questions, unrelated tasks)."
         ),
     )
     decline_reason: str = Field(
@@ -118,22 +123,66 @@ def _event(state: GraphState, event: str, payload: dict[str, Any] | None = None)
     }
 
 
-def _canonical_domain(raw_domain: str, goal_text: str, objective: str) -> str:
-    haystack = " ".join([raw_domain, goal_text, objective]).lower()
-    guest_keywords = (
-        "guest",
-        "host",
-        "hosting",
-        "dinner party",
-        "dinner for",
-        "entertain",
-        "visitors",
-        "company over",
-        "have people over",
-    )
-    if any(keyword in haystack for keyword in guest_keywords):
-        return "guest_dinner"
-    return "meal_plan"
+def capability_digest(capabilities: dict[str, Any] | None) -> str:
+    """Render the device's advertised toolbox for the interpreter's prompt.
+
+    THE POINT OF v3-M4: what this assistant can do is a fact about the DEVICE that
+    is plugged in, not a fact about the cloud. The device already tells us — the
+    ``capabilities`` frame lands right after ``hello_ack`` and the hub has been
+    caching it since v2 and never showing it to anyone who could act on it. So the
+    gate stops being a hardcoded list of two domains and starts being a reading of
+    what is actually there.
+
+    Only capability modules, and only their descriptions: the steering modules are
+    the harness's own plumbing (Safety, Trace, …) and say nothing about what a
+    family can ask for.
+    """
+    domains = (capabilities or {}).get("domains") or []
+    modules = [
+        m for m in ((capabilities or {}).get("modules") or [])
+        if m.get("kind") == "capability"
+    ]
+    if not modules and not domains:
+        # Empty means "we don't know", and the caller must NOT proceed on a guess —
+        # returning a bare header here would read as a device that advertises
+        # nothing, which is a different (and wrong) claim.
+        return ""
+
+    lines: list[str] = []
+    if domains:
+        lines.append("Goal shapes this device understands and can sustain:")
+        lines.extend(f"- {d.get('id')}: {d.get('hint')}" for d in domains)
+        lines.append("")
+    lines.append("Capability modules:")
+    for module in modules:
+        name = module.get("name", "")
+        description = module.get("description") or ""
+        functions = ", ".join(
+            fn.get("name", "") for fn in (module.get("functions") or [])
+        )
+        lines.append(f"- {name}: {description} (functions: {functions})")
+    return "\n".join(lines)
+
+
+def _capability_summary(capabilities: dict[str, Any] | None) -> str:
+    """A human phrase for what this device offers — for the redirect message.
+
+    Uses each capability module's own description, which the device already writes
+    for humans ("The shared family calendar — who is busy when"), so a new plugin
+    describes itself in the refusal without anyone editing this file.
+    """
+    modules = (capabilities or {}).get("modules") or []
+    topics = [
+        (m.get("description") or m.get("name", "")).split("—")[0].strip().rstrip(".").lower()
+        for m in modules
+        if m.get("kind") == "capability"
+    ]
+    topics = [t for t in topics if t][:4]
+    if not topics:
+        return ""
+    if len(topics) == 1:
+        return topics[0]
+    return ", ".join(topics[:-1]) + f" and {topics[-1]}"
 
 
 def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
@@ -253,6 +302,24 @@ def interpret_goal(state: GraphState) -> GraphState:
             "event_log": [_event(state, "interpret_error", {"error": "empty_goal"})],
         }
 
+    digest = capability_digest(state.get("device_capabilities"))
+    if not digest:
+        # No device, or one that advertised nothing. We have no basis for judging
+        # what is actionable, so we do NOT guess: guessing here is how the gate got
+        # hardcoded to two domains in the first place. Decline honestly instead.
+        logger.info("graph_node_exit node=interpret_goal actionable=false reason=no_capabilities")
+        return {
+            "intent": {
+                "actionable": False,
+                "decline_reason": "no device is connected, so I don't know what I can do yet",
+                "domain": "",
+                "objective": goal_text,
+                "time_window": {},
+            },
+            "task_status": "interpreting",
+            "event_log": [_event(state, "intent_interpreted", {"actionable": False, "reason": "no_capabilities"})],
+        }
+
     settings = get_settings()
     today = date.today()
     try:
@@ -280,15 +347,26 @@ def interpret_goal(state: GraphState) -> GraphState:
                     "tomorrow, weekend, next week into time_window.start/end ISO dates relative to it. "
                     "For actionable goals, the start date must be real today or later; interpret "
                     "'this week' as the remaining week starting today. "
-                    "Keep scope flexible and generic for the device planner. "
-                    "GoalFlow can only ACT on two kinds of goals: (1) planning the week's meals or "
-                    "dinners (healthy eating, reducing food waste), and (2) hosting a guest dinner. "
-                    "If the goal is one of those, set actionable=true and fill time_window. For ANYTHING "
-                    "ELSE — general questions, trivia, facts, chit-chat, or tasks unrelated to home meal "
-                    "planning — set actionable=false, put one short reason in decline_reason, and you may "
-                    "leave time_window empty. ALWAYS respond by calling the structured "
-                    "function — never answer the user's question directly in prose, even "
-                    "for out-of-scope goals (call it with actionable=false instead).",
+                    "Keep scope flexible and generic for the device planner.\n\n"
+                    "The connected device advertises exactly these capabilities:\n"
+                    f"{digest}\n\n"
+                    "Set actionable=true if the goal can plausibly be ADVANCED using them, "
+                    "and fill time_window. Judge the goal against the capability list, not "
+                    "against any fixed list of topics. Whether an action is PERMITTED is not "
+                    "your call — the device decides that and gives a better answer than you "
+                    "could; your question is only whether this is the kind of thing this "
+                    "product is for. If nothing it can do relates to the goal — general "
+                    "questions, trivia, facts, chit-chat, unrelated tasks — set "
+                    "actionable=false, put one short reason in decline_reason, and you may "
+                    "leave time_window empty. Choose `domain` as a short slug fitting the "
+                    "goal (e.g. meal_plan, guest_dinner, vacation_prep). ALWAYS respond by "
+                    "calling the structured function — never answer the user's question "
+                    "directly in prose, even for out-of-scope goals (call it with "
+                    "actionable=false instead).\n\n"
+                    "DOMAIN: prefer one of the advertised goal-shape ids above when the "
+                    "goal fits it — the device ROUTES on that value, so a guest dinner "
+                    "labelled meal_plan quietly loses its guest handling. Coin a new short "
+                    "slug only when none of them fits.",
                 ),
                 ("human", goal_text),
             ]
@@ -374,7 +452,7 @@ def present_understanding(state: GraphState) -> GraphState:
     intent = state["intent"]
     memory = state["memory"]
     hard = memory.get("hard") or {}
-    domain = _canonical_domain(intent["domain"], state.get("goal_text", ""), intent["objective"])
+    domain = intent["domain"]
     understanding = {
         "objective": intent["objective"],
         "domain": domain,
@@ -422,7 +500,7 @@ def build_contract(state: GraphState) -> GraphState:
     memory = state["memory"]
     goal_id = state.get("goal_id") or str(uuid4())
     correlation_id = state.get("correlation_id") or str(uuid4())
-    domain = _canonical_domain(intent["domain"], state.get("goal_text", ""), intent["objective"])
+    domain = intent["domain"]
     today = date.today()
     time_window = intent.get("time_window")
     if domain == "meal_plan":
@@ -586,15 +664,23 @@ def goal_declined(state: GraphState) -> GraphState:
 def decline_out_of_scope(state: GraphState) -> GraphState:
     """Interpreter judged the goal out of scope; end without any device dispatch.
 
-    GoalFlow only acts on weekly meal plans and guest dinners. Anything else is
-    politely declined + redirected here — the device is never touched.
+    Nothing the connected device can do relates to the goal, so it is politely
+    declined and redirected — the device is never touched.
+
+    The redirect names what this device ACTUALLY offers (v3-M4). It used to promise
+    "the week's meals or help you host a dinner" from a string literal here, which
+    would have become a lie the moment the device grew a capability — the assistant
+    telling the user it can't do something it just learned to do.
     """
     logger.info("graph_node_enter node=decline_out_of_scope")
     intent = state.get("intent") or {}
     reason = intent.get("decline_reason") or ""
+    can_do = _capability_summary(state.get("device_capabilities"))
     message = (
-        "That's outside what I do. I'm your Family Hub goal assistant — I can plan the "
-        "week's meals or help you host a dinner. Try one of those and I'll get going."
+        f"That's outside what I do. I'm your home goal assistant — I can help with {can_do}. "
+        "Try one of those and I'll get going."
+        if can_do
+        else "That's outside what I do, and right now I can't see a device to check what I can help with."
     )
     explanation = {"type": "out_of_scope", "message": message, "reason": reason}
     return {
@@ -818,11 +904,27 @@ def _with_interrupt(result: Any, state_snapshot: Any) -> dict[str, Any]:
     return state
 
 
-def start_goal(graph: Any, goal_text: str, goal_id: str) -> dict[str, Any]:
-    """Kick off a goal run and return checkpointed state plus any interrupt."""
+def start_goal(
+    graph: Any,
+    goal_text: str,
+    goal_id: str,
+    device_capabilities: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Kick off a goal run and return checkpointed state plus any interrupt.
+
+    ``device_capabilities`` is the connected device's ``capabilities`` frame. The
+    interpreter judges actionability against it, so what the assistant can do
+    follows the hardware that is plugged in rather than a list in this file.
+    """
     config = {"configurable": {"thread_id": goal_id}}
     result = graph.invoke(
-        {"goal_text": goal_text, "goal_id": goal_id, "task_status": "created", "event_log": []},
+        {
+            "goal_text": goal_text,
+            "goal_id": goal_id,
+            "task_status": "created",
+            "event_log": [],
+            "device_capabilities": device_capabilities or {},
+        },
         config=config,
     )
     return _with_interrupt(result, graph.get_state(config))

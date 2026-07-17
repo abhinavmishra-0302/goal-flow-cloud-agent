@@ -304,6 +304,16 @@ class ConnectionRegistry:
     def set_capabilities(self, device_id: str, capabilities: Capabilities) -> None:
         self._session(device_id).capabilities = capabilities
 
+    def capabilities_of(self, device_id: str) -> dict[str, Any] | None:
+        """What this session's device says it can do, as plain JSON.
+
+        Feeds the interpreter's actionability gate (v3-M4). Returns None when no
+        device has advertised yet — the gate then declines honestly rather than
+        guessing, which is how it ended up hardcoded to two domains before.
+        """
+        capabilities = self._session(device_id).capabilities
+        return capabilities.model_dump(mode="json") if capabilities else None
+
     # --- discovery ---
     async def send_devices(self, websocket: WebSocket) -> None:
         frame = Devices(devices=self.device_list()).model_dump(mode="json")
@@ -490,7 +500,14 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
     resolved_understandings.discard(goal_id)
     goal_id_var.set(goal_id)
     logger.info("task_status status=created")
-    state = await asyncio.to_thread(graph_nodes.start_goal, graph, user_goal.text, goal_id)
+    # Hand the interpreter what THIS session's device says it can do. The hub has
+    # cached this since v2 and only ever relayed it to the UI; the gate that
+    # decides what we can act on was a hardcoded list of two domains instead
+    # (v3-M4). Now the answer follows the hardware that is plugged in.
+    capabilities = registry.capabilities_of(device_id)
+    state = await asyncio.to_thread(
+        graph_nodes.start_goal, graph, user_goal.text, goal_id, capabilities
+    )
     if state.get("error"):
         await registry.send_to_uis(device_id,
             {
