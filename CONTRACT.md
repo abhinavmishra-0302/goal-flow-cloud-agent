@@ -167,12 +167,16 @@ gracefully with no device dispatch.
 ### Actionability gate (interpret)
 
 When the cloud interprets `user_goal`, the LLM also returns an **actionability
-verdict**. GoalFlow only acts on two kinds of goals: **weekly meal/dinner planning**
-and **hosting a guest dinner**. Any other goal (trivia, general questions, unrelated
-tasks) is judged `actionable: false`; the graph then ends at `decline_out_of_scope`
-**before any device dispatch** and the UI receives a `notice` (below) instead of an
-`understanding`/`present_plan`. This is why an off-topic prompt no longer produces a
-meal plan.
+verdict**. As of v3-M4 this is judged against **whatever the connected device
+advertises** (`capabilities.domains` + capability modules), NOT a fixed list of
+topics — "what this assistant can do is a fact about the device that is plugged in,
+not a fact about the cloud." So the actionable set grows with the device: M7's device
+advertises `meal_plan`, `guest_dinner`, `vacation_prep`, and `birthday_party`, and
+"get the house ready, we're away next week" — which v2 declined — is now actionable.
+A goal nothing advertised relates to (trivia, general questions, unrelated tasks) is
+judged `actionable: false`; the graph then ends at `decline_out_of_scope` **before any
+device dispatch** and the UI receives a `notice` (below) instead of an
+`understanding`/`present_plan`.
 
 ### `notice` (cloud → ui)
 
@@ -181,7 +185,7 @@ dispatch — today, when the interpreter declines an out-of-scope goal.
 
 ```json
 { "type": "notice", "goal_id": "...", "kind": "out_of_scope",
-  "message": "That's outside what I do. I'm your Family Hub goal assistant — I can plan the week's meals or help you host a dinner." }
+  "message": "That's outside what I do. I'm your home goal assistant — I can help with <the device's advertised capabilities>. Try one of those and I'll get going." }
 ```
 
 `kind` is `"out_of_scope"` (declined by the interpreter) or `"declined"` (reserved).

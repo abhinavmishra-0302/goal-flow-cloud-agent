@@ -47,9 +47,12 @@ contract lives HERE**: `CONTRACT.md` (mirrored as `types/contract.ts` in the UI 
   → dispatch_to_device → collect_plan [interrupt] → hitl_approval [interrupt] →
   relay_decisions → monitor → finalize`, with branches `goal_declined` (user declined
   the understanding) and `explain_block`. Router: `route_after_understanding`.
-  `_canonical_domain()` normalizes the LLM's free-text domain to `meal_plan` /
-  `guest_dinner` (the device routes on the EXACT string — don't let "nutrition" leak
-  through). The meal-plan `time_window` is pinned today..today+6.
+  The interpreter picks `domain` by preferring one of the device's advertised
+  `capabilities.domains[].id` values (the device routes on the EXACT string), coining
+  a new slug only when none fit — there is NO `_canonical_domain()` normalizer (that
+  was the pre-M4 keyword hack; removed). M7's device advertises `meal_plan`,
+  `guest_dinner`, `vacation_prep`, `birthday_party`. The meal-plan `time_window` is
+  pinned today..today+6 (the one remaining domain-specific carve-out in cloud code).
 - `src/goalflow_cloud/models/contract.py` — Pydantic mirror of every wire message.
   `_ContractModel` uses `extra="allow"` so new nested device fields (e.g.
   `demo_events`, `updated_plan`) pass through without cloud changes.
