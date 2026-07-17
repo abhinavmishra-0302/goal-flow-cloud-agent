@@ -49,12 +49,20 @@ TaskStatus = Literal[
 ]
 
 #: agent_event stream event kinds.
+#:
+#: A Literal here is a HARD GATE, not documentation: an unlisted value fails
+#: validation and the frame is DROPPED — silently, with the board simply sitting at
+#: 0% and no error anywhere. That is exactly what happened when ``task_update`` was
+#: added to CONTRACT.md and the C# mirror but not here, and it is why every mirror
+#: must move in one pass.
 AgentEventKind = Literal[
     "phase",
     "thinking",
     "tool_call",
     "tool_result",
     "plan_progress",
+    #: v3: the device's task ledger moved — the board's progress/next-step/pending.
+    "task_update",
 ]
 
 
@@ -165,6 +173,12 @@ class UserGoal(_ContractModel):
 
     type: Literal["user_goal"] = "user_goal"
     text: str
+    #: UI-minted id, echoed back in ``goal_accepted`` (v3).
+    #:
+    #: With two goals in flight the UI CANNOT tell which inbound goal_id belongs to
+    #: which submission — it would have to adopt whichever arrives first and mis-key
+    #: the card. Optional: a v2 client that omits it still works.
+    client_ref: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +252,12 @@ class AgentEvent(_ContractModel):
       tool_call:     {"module": "...", "function": "...", "args": {...}}
       tool_result:   {"module": "...", "function": "...", "summary": "..."}
       plan_progress: {"item": {...}}
+      task_update:   {"task_id", "title", "state", "depends_on", "progress_pct",
+                      "pending_tasks", "next_step", "retry_count", "failure_reason"}
+
+    ``task_update`` (v3) is how the cloud learns a goal's shape and progress: the task
+    DAG lives on the DEVICE (only it can ground a decomposition), so Agent Board's
+    numbers are folded from these rather than guessed from the clock.
     """
 
     type: Literal["agent_event"] = "agent_event"
@@ -489,6 +509,93 @@ class Control(_ContractModel):
 # Discriminated union of every CONTRACT v2 message
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Agent Board (v3) — the board watches EVERY goal; every other frame is about one
+# ---------------------------------------------------------------------------
+
+
+class GoalAlerts(_ContractModel):
+    """Things wanting attention on a goal."""
+
+    count: int = 0
+    #: "danger" | "warn" | None — None when count is 0.
+    severity: str | None = None
+
+
+class GoalSummary(_ContractModel):
+    """One goal, as Agent Board renders it.
+
+    DERIVED BY THE CLOUD from frames it already routes (dispatch, plan_ready,
+    task_update, status, proposal, approval). The device is not involved and never
+    sends one of these.
+    """
+
+    goal_id: str
+    client_ref: str | None = None
+    title: str
+    subtitle: str = ""
+    domain: str = ""
+    #: "on_track" | "at_risk" | "waiting" | "completed" — the board's four chips.
+    state: str = "on_track"
+    task_status: str = "created"
+    progress_pct: int = 0
+    next_step: str | None = None
+    #: ISO date the goal is aiming at; the UI renders "2 days" by diffing.
+    eta: str | None = None
+    pending_tasks: int = 0
+    alerts: GoalAlerts = Field(default_factory=GoalAlerts)
+    #: The last couple of human-readable things that happened.
+    activity: list[str] = Field(default_factory=list)
+    updated_at: str = ""
+
+
+class BoardSnapshot(_ContractModel):
+    """Every goal in this session. Sent on UI bind and in reply to ``board_get``."""
+
+    type: Literal["board_snapshot"] = "board_snapshot"
+    #: Monotonic per session; a UI that sees a gap sends board_get and heals.
+    board_seq: int = 0
+    goals: list[GoalSummary] = Field(default_factory=list)
+
+
+class BoardUpdate(_ContractModel):
+    """One goal changed.
+
+    Carries a WHOLE GoalSummary, replace-by-goal_id: deltas exist to avoid re-sending
+    N goals, not to save bytes within one. Whole-object replacement is idempotent, so
+    a duplicate or out-of-order update cannot corrupt a card.
+    """
+
+    type: Literal["board_update"] = "board_update"
+    board_seq: int = 0
+    goal: GoalSummary
+
+
+class BoardGet(_ContractModel):
+    """UI asks for a fresh snapshot (first paint, or healing a board_seq gap)."""
+
+    type: Literal["board_get"] = "board_get"
+
+
+class GoalStateGet(_ContractModel):
+    """UI asks for one goal's cached plan + latest status (drill-in after a reload).
+
+    The agent_event stream is deliberately NOT replayed: a rejoined view shows the
+    plan and its ticks, not a re-run of the thinking.
+    """
+
+    type: Literal["goal_state_get"] = "goal_state_get"
+    goal_id: str
+
+
+class GoalAccepted(_ContractModel):
+    """Ties a submission to its goal_id, so an optimistic card can re-key."""
+
+    type: Literal["goal_accepted"] = "goal_accepted"
+    goal_id: str
+    client_ref: str | None = None
+
+
 ContractMessage = Annotated[
     Union[
         Hello,
@@ -506,6 +613,11 @@ ContractMessage = Annotated[
         Status,
         Notice,
         Control,
+        BoardSnapshot,
+        BoardUpdate,
+        BoardGet,
+        GoalStateGet,
+        GoalAccepted,
     ],
     Field(discriminator="type"),
 ]

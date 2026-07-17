@@ -1,8 +1,28 @@
-# GoalFlow CONTRACT v2 — generic goal-agent WebSocket protocol
+# GoalFlow CONTRACT v3 — generic goal-agent WebSocket protocol
 
 **This file is the CANONICAL copy of the shared protocol (the anchor — obey exactly).**
-The Python mirror is `src/goalflow_cloud/models/contract.py`; the UI and device repos
-mirror it as typed definitions. Any change here is a contract version bump.
+The mirrors are `src/goalflow_cloud/models/contract.py` (Python),
+`goal-flow-agent-chat-ui/src/types/contract.ts` and
+`goal-flow-agent-board-ui/src/types/contract.ts` (TS), and
+`goal-flow-device-agent-ubuntu/src/GoalFlow.Device/Contracts/*.cs` (C#).
+**All of them move in ONE pass** — there is no cross-repo atomic commit, so a
+half-mirrored change breaks at runtime rather than at build time. The chat UI's
+`ws.ts` has an `INBOUND_TYPES` allowlist too: a frame type missing from it is
+**silently dropped**, which is the worst possible failure mode. Any change here is a
+contract version bump.
+
+## v3 additions (all additive; v2 clients keep working)
+
+| addition | why |
+|---|---|
+| `capabilities.domains[]` | the device ROUTES on `dispatch.domain`, so the interpreter must use a domain it answers to (M4) |
+| `agent_event: task_update` | the goal's task DAG lives on the device; the board's progress is derived from these (M6) |
+| `agent_event phase: "queued"` | a goal waiting for the planning slot is visible rather than stalled (M5) |
+| `plan_ready.payload.precheck` | *"not yet"* — distinct from safety's *"never"* (M3) |
+| `status.executed[].result: "deferred_precheck"` | the approval stands; the effect runs when the world recovers (M3) |
+| `board_snapshot` / `board_update` / `board_get` | Agent Board watches every goal at once (M6) |
+| `goal_state_get` | drilling into a goal after a reload (M6) |
+| `goal_accepted` + `user_goal.client_ref` | with 2 goals in flight, the UI can't otherwise tell which `goal_id` is which (M6) |
 
 ## Transport
 
@@ -198,19 +218,48 @@ dispatch — today, when the interpreter declines an out-of-scope goal.
 
 ```json
 { "type": "agent_event", "goal_id": "...", "correlation_id": "...", "seq": 1,
-  "event": "phase" | "thinking" | "tool_call" | "tool_result" | "plan_progress",
+  "event": "phase" | "thinking" | "tool_call" | "tool_result" | "plan_progress" | "task_update",
   "payload": { } }
 ```
+
+`seq` is **monotonic per goal**, and a consumer MUST drop any frame whose `seq` is not
+greater than the last it saw for that `goal_id`. (Which is why the device's trace scope
+is per-goal: a shared counter sent one goal's frames out under another's id with a seq
+that had gone backwards, and they were silently discarded.)
 
 Payload shapes by `event`:
 
 | `event`         | `payload`                                                 |
 |-----------------|-----------------------------------------------------------|
-| `phase`         | `{ "phase": "grounding" \| "planning" \| "checking" \| "awaiting_approval" }` |
+| `phase`         | `{ "phase": "queued" \| "grounding" \| "planning" \| "checking" \| "awaiting_approval" \| "executing" \| "monitoring" \| "adapting" }` |
 | `thinking`      | `{ "text": "..." }`                                       |
 | `tool_call`     | `{ "module": "...", "function": "...", "args": { } }`     |
 | `tool_result`   | `{ "module": "...", "function": "...", "summary": "..." }`|
 | `plan_progress` | `{ "item": { } }`                                         |
+| `task_update`   | `{ "task_id": "t2", "title": "find recipes", "state": "monitoring", "depends_on": ["t1"], "progress_pct": 43, "pending_tasks": 4, "next_step": "build the shopping list", "retry_count": 0, "failure_reason": null }` |
+
+**`task_update` (v3)** — the device emits one every time a task changes state. The goal's
+task DAG lives on the DEVICE (only it can ground a decomposition), so this is how the
+cloud learns what a goal is made of and how far along it is. `progress_pct`,
+`pending_tasks` and `next_step` are the goal-level rollup as of that transition; they are
+DERIVED from task state, never from the clock.
+
+`state` is one of — **snake_case, like every other enum on this wire**:
+
+```
+created | ready | planning | awaiting_approval | executing
+monitoring | adapting | paused | retrying | completed | failed
+```
+
+These were unlisted until v3-M6, and the drift that followed is the reason they are
+written down now: the device serialised its enum with `ToString().ToLowerInvariant()`
+and shipped `awaitingapproval` while `task_status` and `phase` carried
+`awaiting_approval` — the same idea spelled two ways. Every value except
+`awaiting_approval` is a single word, so it round-tripped by accident and no consumer
+noticed. An example alone (`"state": "monitoring"`) does not pin an enum; the list does.
+
+`phase: "queued"` (v3) means another goal holds the single planning slot; this one starts
+next. It exists so a waiting goal is visible rather than appearing stalled.
 
 ### `plan_ready` (device → cloud) — generic plan + TIERED proposals
 
@@ -305,6 +354,76 @@ through unchanged when present.
   `plan_ready.demo_events`): the device runs ONE scoped-LLM adaptation for that
   event's context, **clock frozen**, deduped once per event id. This is the
   event-driven meal-week demo path — it replaces `advance_day` for that demo.
+
+### Agent Board (v3) — `board_snapshot` / `board_update` (cloud → ui), `board_get` (ui → cloud)
+
+The board watches EVERY goal at once, where every other frame is about one goal. The
+cloud DERIVES these — it already routes every frame a goal produces (`dispatch`,
+`plan_ready`, `task_update`, `status`, `proposal`, `approval`), so it can fold them
+into a summary without asking anyone. The device is not involved.
+
+```json
+{ "type": "board_snapshot", "board_seq": 42,
+  "goals": [ GoalSummary, ... ] }
+
+{ "type": "board_update", "board_seq": 43, "goal": GoalSummary }
+
+{ "type": "board_get" }
+```
+
+`GoalSummary`:
+
+```json
+{ "goal_id": "uuid", "client_ref": "g-17",
+  "title": "Birthday Party Preparation",
+  "subtitle": "Sun, Jun 22 • 20 Guests",
+  "domain": "guest_dinner",
+  "state": "on_track" | "at_risk" | "waiting" | "completed",
+  "task_status": "monitoring",
+  "progress_pct": 68,
+  "next_step": "Buy party decorations",
+  "eta": "2026-06-22",
+  "pending_tasks": 3,
+  "alerts": { "count": 2, "severity": "danger" | "warn" | null },
+  "activity": ["Grocery delivery confirmed", "Decor ideas ready"],
+  "updated_at": "<ISO>" }
+```
+
+**Semantics:**
+
+- A **full `board_snapshot`** on UI bind and in reply to `board_get`. **`board_update`
+  carries a WHOLE `GoalSummary`**, replace-by-`goal_id` — deltas exist to avoid
+  re-sending N goals, not to save bytes within one. Whole-object replacement is
+  idempotent, so a duplicate or out-of-order update cannot corrupt a card.
+- **`board_seq` is monotonic per session.** A UI that sees a gap sends `board_get` and
+  heals. Without it a dropped `board_update` leaves a card permanently stale with no way
+  to notice.
+- `state` is the board's four chips. `waiting` covers *anything* waiting on a human or
+  on the world (an open gate, an approval, a queued plan, a failed precheck) —
+  deliberately: from the board, "someone needs to do something" is one idea.
+
+### `goal_state_get` (ui → cloud)
+
+```json
+{ "type": "goal_state_get", "goal_id": "..." }
+```
+
+Re-sends the cached `present_plan` for a goal, then its latest `status`. This is what
+makes drilling into a day-old goal show a plan instead of an empty stage after a reload.
+The `agent_event` stream is deliberately NOT replayed: a rejoined view shows the plan and
+its ticks, not a re-run of the thinking.
+
+### `goal_accepted` (cloud → ui) + `user_goal.client_ref`
+
+```json
+{ "type": "user_goal", "text": "...", "client_ref": "g-17" }
+{ "type": "goal_accepted", "goal_id": "uuid", "client_ref": "g-17" }
+```
+
+With two goals in flight the UI **cannot tell which inbound `goal_id` is which
+submission** — it would have to adopt whichever arrives first, and mis-key the card.
+`client_ref` is UI-minted and echoed straight back, so an optimistic card re-keys to the
+real `goal_id`. Optional: a v2 client that omits it still works.
 
 ## Task-status lifecycle
 

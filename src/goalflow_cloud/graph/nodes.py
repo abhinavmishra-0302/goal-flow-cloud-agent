@@ -96,6 +96,14 @@ class InterpretedIntent(BaseModel):
 
     domain: str = Field(description="Short generic domain id, e.g. meal_plan, chores, errands.")
     objective: str = Field(description="A concise normalized objective.")
+    title: str = Field(
+        default="",
+        description=(
+            "A SHORT title-case noun phrase naming the goal, max 4 words — "
+            "'Birthday Party Preparation', 'Weekly Meal Plan', 'Vacation Prep'. "
+            "This is a card headline, not a sentence: no verbs, no dates, no detail."
+        ),
+    )
     success_criteria: list[str] = Field(default_factory=list)
     scope: dict[str, Any] = Field(default_factory=dict)
     time_window: dict[str, str] = Field(
@@ -209,9 +217,24 @@ def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
     add("dietary", hard.get("dietary"))
     add("medical", hard.get("medical"))
     if hard.get("budget_cap"):
-        knew["budget"] = f"${hard.get('budget_cap')}"
-    if hard.get("quiet_hours"):
-        knew["quiet hours"] = str(hard.get("quiet_hours"))
+        # ":g" so a whole-number cap reads "$120", not "$120.0". Coerced through
+        # float() first and guarded: this value comes from an LLM, so "120" as a
+        # STRING is a real shape, and formatting a str with :g raises — which would
+        # kill the goal at the understanding gate to tidy a decimal point.
+        try:
+            knew["budget"] = f"${float(hard['budget_cap']):g}"
+        except (TypeError, ValueError):
+            knew["budget"] = f"${hard['budget_cap']}"
+    quiet = hard.get("quiet_hours")
+    if quiet:
+        # NOT str(dict) — that renders "{'start': '21:30', 'end': '07:00'}" into a
+        # user-facing chip: a Python literal, quotes and braces included, on a fridge
+        # door. These chips are the agent proving it listened, so they have to read
+        # like a person wrote them.
+        if isinstance(quiet, dict) and (quiet.get("start") or quiet.get("end")):
+            knew["quiet hours"] = f"{quiet.get('start', '?')}–{quiet.get('end', '?')}"
+        elif isinstance(quiet, str) and quiet.strip():
+            knew["quiet hours"] = quiet.strip()
     return knew
 
 
@@ -458,6 +481,10 @@ def present_understanding(state: GraphState) -> GraphState:
     domain = intent["domain"]
     understanding = {
         "objective": intent["objective"],
+        # A short card headline for the board. Additive on the dispatch: the device
+        # ignores it, but the hub caches the contract and the board reads it from
+        # there, so it rides along rather than needing its own channel.
+        "title": intent.get("title") or "",
         "domain": domain,
         "time_window": intent.get("time_window") or {},
         "hard": hard,
@@ -522,6 +549,10 @@ def build_contract(state: GraphState) -> GraphState:
         "correlation_id": correlation_id,
         "domain": domain,
         "objective": intent["objective"],
+        # A short card headline for the board. Additive on the dispatch: the device
+        # ignores it, but the hub caches the contract and the board reads it from
+        # there, so it rides along rather than needing its own channel.
+        "title": intent.get("title") or "",
         "success_criteria": intent.get("success_criteria", []),
         "constraints": {
             "hard": memory.get("hard", {}),
