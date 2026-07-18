@@ -40,6 +40,7 @@ from goalflow_cloud.models.contract import (
     GoalStateGet,
     Capabilities,
     Control,
+    DayAdvanced,
     Devices,
     Hello,
     HelloAck,
@@ -514,6 +515,11 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
         await registry.send_to_uis(device_id, status.model_dump(mode="json"))
         await push_board(device_id, board.on_status(device_id, status.goal_id, status.model_dump(mode="json")))
         await graph_resume_monitor(status.goal_id, status.model_dump(mode="json"))
+    elif sender_role == "device" and frame_type == "day_advanced":
+        # v3.2 world tick summary — a board surface. The per-goal status/proposal frames
+        # that ride alongside it already updated the cards; this is just the "what
+        # happened today" list, relayed straight through to the boards.
+        await registry.send_to_uis(device_id, DayAdvanced(**frame).model_dump(mode="json"))
     else:
         logger.warning("unknown_route role=%s type=%s", sender_role, frame_type)
 

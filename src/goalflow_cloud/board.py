@@ -24,7 +24,7 @@ and what keeps the board honest.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from goalflow_cloud.models.contract import GoalAlerts, GoalSummary
@@ -56,6 +56,9 @@ class BoardService:
         #: goal_id -> the understanding awaiting a human (for goal_state_get drill-in).
         #: Dropped once confirmed: a settled gate is not something to rejoin.
         self._understandings: dict[str, dict[str, Any]] = {}
+        #: goal_id -> the dispatched time_window {start, end} — for DAY-BASED progress
+        #: (v3.2): once running, progress is how far the sim date has moved through it.
+        self._windows: dict[str, dict[str, Any]] = {}
         #: device_id -> the device's current proactive suggestions (M8). NOT goals —
         #: a list of {id, kind, title, subtitle, detail, goal_text} the board renders
         #: as "Upcoming & Suggested", each acceptable into a real goal.
@@ -108,6 +111,7 @@ class BoardService:
         self._plans.pop(goal_id, None)
         self._statuses.pop(goal_id, None)
         self._understandings.pop(goal_id, None)
+        self._windows.pop(goal_id, None)
 
     # --- the fold ---
 
@@ -155,6 +159,7 @@ class BoardService:
         self._understandings.pop(goal_id, None)
         existing = self._get(device_id, goal_id)
         window = contract.get("time_window") or {}
+        self._windows[goal_id] = window
         summary = GoalSummary(
             goal_id=goal_id,
             # The post-confirmation dispatch path has no client_ref to hand us; keep
@@ -261,6 +266,25 @@ class BoardService:
             updates["next_step"] = block_reason
         return self._put(device_id, summary.model_copy(update=updates))
 
+    @staticmethod
+    def _day_progress(window: dict[str, Any], sim_date: str | None) -> int | None:
+        """DAY-BASED progress (v3.2): how far the sim date has moved through the goal's
+        time window, 0–100. Deliberately CLOCK-DERIVED — the v3 rule was 'progress only
+        from the task DAG'; a running goal's progress is now the calendar, so advancing a
+        day moves every card. Returns None when there's no usable window/date (planning
+        phase), leaving the task-DAG progress in place."""
+        start, end = window.get("start"), window.get("end")
+        if not (start and end and sim_date):
+            return None
+        try:
+            s, e, d = date.fromisoformat(start), date.fromisoformat(end), date.fromisoformat(sim_date)
+        except ValueError:
+            return None
+        span = (e - s).days
+        if span <= 0:
+            return None
+        return max(0, min(100, round((d - s).days / span * 100)))
+
     def on_status(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> GoalSummary | None:
         """A status tick: executions, monitoring notes, completion."""
         self._statuses[goal_id] = frame
@@ -293,10 +317,15 @@ class BoardService:
         else:
             state = _state_for(task_status, alerts)
         done = task_status == "done"
+        # DAY-BASED progress (v3.2): a running goal's progress is where the sim date sits
+        # in its window; a world tick that advances the day therefore moves the card. Falls
+        # back to the task-DAG progress when there's no usable window/sim_date.
+        day_prog = self._day_progress(self._windows.get(goal_id) or {}, payload.get("sim_date"))
+        progress = 100 if done else (day_prog if day_prog is not None else summary.progress_pct)
         return self._put(device_id, summary.model_copy(update={
             "task_status": task_status,
             "state": state,
-            "progress_pct": 100 if done else summary.progress_pct,
+            "progress_pct": progress,
             "pending_tasks": 0 if done else summary.pending_tasks,
             "next_step": None if done else summary.next_step,
             "alerts": alerts,

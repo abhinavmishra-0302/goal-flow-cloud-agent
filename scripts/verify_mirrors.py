@@ -74,8 +74,10 @@ UIS = [
         # Suggestions are a BOARD surface — the chat UI neither renders nor receives
         # them (the cloud sends `suggestions` only to boards). So the chat mirror is
         # exempt from both suggestion frames, and this exemption IS that decision.
-        "types_exempt": {"suggestions", "suggestion_action"},
-        "inbound_exempt": UI_INBOUND_EXEMPT | {"suggestions"},
+        # `day_advanced` (v3.2 world tick) is likewise a board-only surface — the chat
+        # never renders it, so the chat mirror is exempt from it too.
+        "types_exempt": {"suggestions", "suggestion_action", "day_advanced"},
+        "inbound_exempt": UI_INBOUND_EXEMPT | {"suggestions", "day_advanced"},
     },
     {
         "name": "board-ui",
