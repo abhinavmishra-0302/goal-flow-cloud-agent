@@ -351,15 +351,35 @@ through unchanged when present.
 ### `control` (ui → cloud → device)
 
 ```json
-{ "type": "control", "goal_id": "...",
+{ "type": "control", "goal_id": "...?",
   "command": "advance_day" | "reset" | "set_date" | "trigger_event",
   "payload": { "date": "<ISO?>", "event_id": "day3-football" } }
 ```
 
+- **`goal_id` is OPTIONAL (v3.2).** The sim clock is GLOBAL (one, device-wide), so a
+  clock command with **no `goal_id`** is a **WORLD-level tick**: the device advances the
+  clock ONCE and fans out to **every active goal** — emitting a `status` (+ a `proposal`
+  when a goal newly catches a material change) per goal, plus one `day_advanced` summary
+  (below). This is how the board's main-page **Advance day** works. A `goal_id` scopes the
+  older per-goal path.
 - `trigger_event` fires one presenter demo event by `event_id` (from
-  `plan_ready.demo_events`): the device runs ONE scoped-LLM adaptation for that
-  event's context, **clock frozen**, deduped once per event id. This is the
-  event-driven meal-week demo path — it replaces `advance_day` for that demo.
+  `plan_ready.demo_events`) for a specific goal — the per-goal path (retained, but the
+  board no longer sends it; the world tick supersedes it).
+
+### `day_advanced` (device → cloud → ui)
+
+```json
+{ "type": "day_advanced", "sim_date": "2026-07-16", "day": 3,
+  "events": [ { "id": "daily:ev-football", "title": "Day 3 - football practice added Wed",
+                "kind": "calendar.event_overlap", "summary": "...",
+                "goal_ids": ["<goal_id>"] } ] }
+```
+
+Emitted once per **world-level** control tick. It summarises the world events that
+happened on the new day and which goals each was material to — the board's "what happened
+today" card. Events with empty `goal_ids` happened but touched no active goal; a quiet day
+sends an empty `events` list. The per-goal `status`/`proposal` frames that ride alongside
+update each goal card. The **chat UI never renders it** (a board surface).
 
 ### Agent Board (v3) — `board_snapshot` / `board_update` (cloud → ui), `board_get` (ui → cloud)
 

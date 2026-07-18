@@ -498,12 +498,45 @@ class Control(_ContractModel):
     """UI/operator -> cloud -> device: deterministic clock/lifecycle command.
 
     The device clock is GENERIC: real today by default, or set via these
-    commands — never a hardcoded date."""
+    commands — never a hardcoded date.
+
+    v3.2: ``goal_id`` is OPTIONAL. The clock is GLOBAL, so a clock command with no
+    goal_id is a WORLD-level tick — the device advances it once and fans out to every
+    active goal, emitting one ``day_advanced`` summary. A goal_id scopes the older
+    per-goal path (a ``trigger_event``)."""
 
     type: Literal["control"] = "control"
-    goal_id: str
+    goal_id: str = ""
     command: Literal["advance_day", "reset", "set_date", "trigger_event"]
     payload: ControlPayload = Field(default_factory=ControlPayload)
+
+
+class DayEvent(_ContractModel):
+    """One world event that happened on an advanced day."""
+
+    id: str
+    #: Human-readable headline, e.g. "Day 3 - football practice added Wed".
+    title: str
+    #: The change kind, e.g. "calendar.event_overlap".
+    kind: str | None = None
+    summary: str | None = None
+    #: Goals this event was material to (empty = happened but touched no active goal).
+    goal_ids: list[str] = Field(default_factory=list)
+
+
+class DayAdvanced(_ContractModel):
+    """device -> cloud -> ui: a GLOBAL world tick summary (v3.2).
+
+    Emitted once per world-level ``control`` tick: the day's world events + which goals
+    each touched. The board renders it as the "what happened today" card; the per-goal
+    ``status``/``proposal`` frames alongside update each goal card. Chat never sees it."""
+
+    type: Literal["day_advanced"] = "day_advanced"
+    #: The new simulated date (ISO) after the tick.
+    sim_date: str
+    #: 1-based sim day from the earliest active goal's window start (0 if none).
+    day: int = 0
+    events: list[DayEvent] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +690,7 @@ ContractMessage = Annotated[
         Status,
         Notice,
         Control,
+        DayAdvanced,
         BoardSnapshot,
         BoardUpdate,
         BoardGet,
