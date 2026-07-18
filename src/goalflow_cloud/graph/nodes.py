@@ -815,11 +815,34 @@ def route_after_understanding(state: GraphState) -> str:
     return "build_contract" if state.get("understanding_confirmed") else "goal_declined"
 
 
+def precheck_wait(state: GraphState) -> GraphState:
+    """A precheck-blocked plan HOLDS; it does not complete.
+
+    A safety block is "never" (→ explain_block, done). A precheck block is "not yet" —
+    the world isn't ready (signed out, appliance offline), and the plan should run when
+    it recovers. The empty plan must therefore NOT flow to relay_decisions: that sends
+    an empty approval, the device answers status(done), and the goal falsely reads
+    Completed. Ending here instead leaves the board on the Waiting state on_plan_ready
+    set, with the precheck reason. (Auto-retry on recovery is future work; for now it
+    honestly waits rather than lying that it finished.)
+    """
+    logger.info("graph_node_enter node=precheck_wait")
+    precheck = state.get("plan", {}).get("precheck") or {}
+    return {
+        "task_status": "monitoring",
+        "event_log": [_event(state, "precheck_wait", {"reason": precheck.get("reason")})],
+    }
+
+
 def route_on_safety(state: GraphState) -> str:
-    """After collect_plan: blocked -> explain_block; approvals pending ->
-    hitl_approval; auto-tier only -> relay_decisions."""
-    if state.get("plan", {}).get("safety", {}).get("gate") == "blocked":
+    """After collect_plan: safety-blocked -> explain_block; precheck-blocked ->
+    precheck_wait (holds, doesn't complete); approvals pending -> hitl_approval;
+    auto-tier only -> relay_decisions."""
+    plan = state.get("plan", {})
+    if plan.get("safety", {}).get("gate") == "blocked":
         return "explain_block"
+    if (plan.get("precheck") or {}).get("ok") is False:
+        return "precheck_wait"
     if state.get("pending_approvals"):
         return "hitl_approval"
     return "relay_decisions"
@@ -886,6 +909,7 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     graph.add_node("decline_out_of_scope", decline_out_of_scope)
     graph.add_node("monitor", monitor)
     graph.add_node("explain_block", explain_block)
+    graph.add_node("precheck_wait", precheck_wait)
     graph.add_node("finalize", finalize)
 
     graph.set_entry_point("interpret_goal")
@@ -915,8 +939,10 @@ def build_graph(checkpointer: Any | None = None) -> Any:
             "hitl_approval": "hitl_approval",
             "relay_decisions": "relay_decisions",
             "explain_block": "explain_block",
+            "precheck_wait": "precheck_wait",
         },
     )
+    graph.add_edge("precheck_wait", END)
     graph.add_edge("hitl_approval", "relay_decisions")
     graph.add_edge("relay_decisions", "monitor")
     graph.add_conditional_edges(
