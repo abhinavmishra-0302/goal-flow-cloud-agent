@@ -453,8 +453,17 @@ A suggestion is **not a goal**. `suggestion_action{accept}` submits the suggesti
 `goal_accepted`, so the board can re-key exactly like a typed goal) — it then runs the
 normal understand → plan → approve flow. So a suggestion can never act on its own; a
 person accepting it is what turns "you could do this" into a goal. `action: "dismiss"`
-drops it from the list. The board sends `suggestion_action` but **never** `approval`
-or `control` — it stays read-mostly.
+drops it from the list.
+
+**v3.1 — the board is no longer read-mostly.** Once a goal's initial plan is approved
+on the chat UI, the board becomes the goal's primary surface: it renders the raw device
+stream on a per-goal detail page (`present_plan`, `agent_event`, `status`, `proposal`)
+and it SENDS `control` (world-event / demo-clock commands) and `approval` (world-event
+adaptation decisions). The chat UI keeps goal CREATION — the understanding gate and the
+initial tiered approval; the board keeps everything after. Both are still just `role:ui`
+sockets to the hub, distinguished only by which frames each renders — the cloud does not
+route by surface. `goal_state_get` (above) is what refills the board's detail page for a
+goal it never saw start.
 
 ## Task-status lifecycle
 

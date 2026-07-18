@@ -55,11 +55,13 @@ UI_INBOUND_EXEMPT = {
 
 #: The two UIs are NOT the same shape, and the gate must not pretend they are.
 #:
-#: The chat UI is the full protocol surface. The board is a deliberate SLICE: a
-#: read-mostly projection that renders the cloud's derived summaries. `types_exempt`
-#: for the board is therefore the "board is read-mostly" decision written down as a
-#: check — if someone adds `approval` to the board's mirror, this gate fails and asks
-#: them to change the decision on purpose rather than by drift.
+#: The chat UI is the goal-CREATION surface (entry, understanding gate, initial plan
+#: approval). The board (v3.1) is the goal-LIFE surface: once the initial plan is
+#: approved it renders the full plan, the live stream, monitoring, and world-event
+#: adaptations, and it SENDS control + approval. The two `*_exempt` sets are those two
+#: roles written down as a check — if the board stops carrying a frame its role now
+#: needs, or the chat mirror grows a board-only frame, this gate fails and asks for the
+#: decision to be changed on purpose rather than by drift.
 #:
 #: Both allowlists are checked. The board's ws.ts drops unlisted frames exactly like
 #: the chat UI's does, and it is the newer file — leaving it unchecked would reopen
@@ -79,14 +81,16 @@ UIS = [
         "name": "board-ui",
         "contract": SIBLINGS / "goal-flow-agent-board-ui/src/types/contract.ts",
         "ws": SIBLINGS / "goal-flow-agent-board-ui/src/lib/ws.ts",
-        # device↔cloud frames, plus the two WRITES the board must never send.
-        "types_exempt": {"dispatch", "plan_ready", "control", "approval", "understanding_response"},
-        # The board renders derived summaries, not raw per-goal frames. It receives
-        # these (the cloud broadcasts to every ui) and deliberately ignores them.
-        "inbound_exempt": UI_INBOUND_EXEMPT | {
-            "capabilities", "agent_event", "understanding", "present_plan",
-            "proposal", "status",
-        },
+        # v3.1: the board is the device's PRIMARY surface once a goal is running (no
+        # longer a read-mostly slice). It SENDS control + approval now — so those are no
+        # longer exempt and MUST appear in its mirror. It still never sends dispatch /
+        # plan_ready (device↔cloud frames) or understanding_response (the chat's gate).
+        "types_exempt": {"dispatch", "plan_ready", "understanding_response"},
+        # It now RENDERS the raw device stream on a goal's detail page, so agent_event /
+        # present_plan / proposal / status are handled, not ignored — and because it
+        # renders agent_event, the AgentEvent-kind check below now applies to it too.
+        # Still exempt: `capabilities` (no board surface), `understanding` (chat's gate).
+        "inbound_exempt": UI_INBOUND_EXEMPT | {"capabilities", "understanding"},
     },
 ]
 
