@@ -535,17 +535,15 @@ def build_contract(state: GraphState) -> GraphState:
     correlation_id = state.get("correlation_id") or str(uuid4())
     domain = intent["domain"]
     today = date.today()
-    # A FORWARD, multi-day window for ANY goal (no longer meal-plan-only): the board's
-    # day-by-day progress is anchored to the PLAN's own day span once it arrives
-    # (BoardService.on_plan_ready), so this window is the goal's aimed horizon (the card's
-    # ETA) and a completion fallback — it just must not be backward or same-day.
-    tw = intent.get("time_window") or {}
-    start = tw.get("start") or today.isoformat()
-    if start < today.isoformat():
-        start = today.isoformat()
-    end = tw.get("end")
+    # Monitoring/prep begins NOW, so the window START is real today for EVERY goal — NOT
+    # the LLM's start, which for an event goal ("next Sunday") is the EVENT date and would
+    # peg progress at 0% until then. The LLM's end is the goal's horizon (the card's ETA).
+    # The board's day-by-day progress is anchored to the PLAN's own day span from this
+    # start (BoardService.on_plan_ready).
+    start = today.isoformat()
+    end = (intent.get("time_window") or {}).get("end")
     if not end or end <= start:
-        end = (date.fromisoformat(start) + timedelta(days=6)).isoformat()
+        end = (today + timedelta(days=6)).isoformat()
     time_window = {"start": start, "end": end}
 
     context = {

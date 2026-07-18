@@ -216,7 +216,9 @@ class BoardService:
         # for ANY domain — instead of an LLM-chosen calendar window that could be short
         # or already past. start is the dispatch date; end = start + N (N = max plan day).
         plan_span = max((item.get("day") or 0) for item in (payload.get("plan") or [{}])) or 1
-        start = (self._windows.get(goal_id) or {}).get("start") or date.today().isoformat()
+        # Anchor to TODAY (monitoring begins now), not the dispatched window start — an
+        # event goal's start is the event date, which would keep progress at 0% until then.
+        start = date.today().isoformat()
         self._windows[goal_id] = {
             "start": start,
             "end": (date.fromisoformat(start) + timedelta(days=plan_span)).isoformat(),
