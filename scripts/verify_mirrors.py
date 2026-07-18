@@ -185,6 +185,21 @@ def main() -> int:
         for t in sorted(types - ui["types_exempt"]):
             if f'"{t}"' not in text:
                 failures.append(f"{name} contract.ts is missing {t!r}")
+
+        # agent_event KINDS, not just the frame type. A UI that renders agent_events
+        # switches on `event.event`; if its type union omits a kind the device sends,
+        # the switch looks exhaustive over the kinds it knows while the missing one
+        # arrives at runtime and falls through to `undefined` — which is exactly how
+        # the chat UI crashed on `task_update` (a real M9-testing bug). A UI that
+        # IGNORES agent_event (the board — `agent_event` is in its inbound_exempt) is
+        # exempt from this too.
+        if "agent_event" not in ui["inbound_exempt"]:
+            for k in sorted(kinds):
+                if f'"{k}"' not in text:
+                    failures.append(
+                        f"{name} contract.ts AgentEvent is missing kind {k!r} — its "
+                        f"event switch would fall through to undefined at runtime"
+                    )
         # An exemption must stay a DECISION, not a stale list: a frame declared here
         # that the mirror also carries means the two disagree about what this surface
         # is for.
