@@ -50,6 +50,8 @@ from goalflow_cloud.models.contract import (
     Role,
     SelectDevice,
     Status,
+    Suggestions,
+    SuggestionAction,
     Understanding,
     UnderstandingPayload,
     UnderstandingResponse,
@@ -321,14 +323,21 @@ class ConnectionRegistry:
                 await self.unregister(websocket)
 
     async def _replay_board(self, websocket: WebSocket, device_id: str) -> None:
-        """Send this session's board snapshot to one freshly-bound socket."""
+        """Send this session's board snapshot + suggestions to one freshly-bound socket."""
         seq, goals = board.snapshot(device_id)
-        if not goals:
-            return
-        frame = BoardSnapshot(board_seq=seq, goals=goals).model_dump(mode="json")
-        log_frame("out", "ui", frame)
         try:
-            await websocket.send_json(frame)
+            if goals:
+                frame = BoardSnapshot(board_seq=seq, goals=goals).model_dump(mode="json")
+                log_frame("out", "ui", frame)
+                await websocket.send_json(frame)
+            # Suggestions can exist with zero goals (a fresh session whose device has
+            # already scanned), so this is NOT gated on `goals` — a board that binds to
+            # an idle home should still see "Expiring Soon".
+            items = board.suggestions(device_id)
+            if items:
+                frame = Suggestions(items=items).model_dump(mode="json")
+                log_frame("out", "ui", frame)
+                await websocket.send_json(frame)
         except Exception:
             logger.debug("board_replay_failed", exc_info=True)
 
@@ -483,6 +492,12 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
         await handle_approval(device_id, Approval(**frame))
     elif sender_role == "ui" and frame_type == "control":
         await registry.send_to_device(device_id, Control(**frame).model_dump(mode="json"))
+    elif sender_role == "ui" and frame_type == "suggestion_action":
+        await handle_suggestion_action(device_id, SuggestionAction(**frame))
+    elif sender_role == "device" and frame_type == "suggestions":
+        suggestions = Suggestions(**frame)
+        board.on_suggestions(device_id, [s.model_dump(mode="json") for s in suggestions.items])
+        await send_suggestions(device_id)
     elif sender_role == "device" and frame_type == "capabilities":
         await handle_capabilities(device_id, Capabilities(**frame))
     elif sender_role == "device" and frame_type == "agent_event":
@@ -526,6 +541,35 @@ async def send_board_snapshot(device_id: str) -> None:
     frame = BoardSnapshot(board_seq=seq, goals=goals).model_dump(mode="json")
     log_frame("out", "ui", frame)
     await registry.send_to_uis(device_id, frame)
+
+
+async def send_suggestions(device_id: str) -> None:
+    """The session's current proactive suggestions — on change and on bind (M8).
+
+    Sent as a whole list every time, like a board_snapshot: idempotent, so a UI that
+    reconnects or misses one just re-renders the current set. Only boards act on it;
+    the chat UI ignores the frame.
+    """
+    frame = Suggestions(items=board.suggestions(device_id)).model_dump(mode="json")
+    log_frame("out", "ui", frame)
+    await registry.send_to_uis(device_id, frame)
+
+
+async def handle_suggestion_action(device_id: str, action: SuggestionAction) -> None:
+    """A board accepted or dismissed a suggestion.
+
+    Accept turns it into an ordinary goal — the suggestion's goal_text becomes a
+    user_goal, running the full understand → plan → approve flow, so a suggestion never
+    acts on its own. Either way the suggestion is consumed and the refreshed list is
+    pushed so the card disappears.
+    """
+    taken = board.take_suggestion(device_id, action.suggestion_id)
+    if taken is not None and action.action == "accept":
+        await handle_user_goal(
+            device_id,
+            UserGoal(text=taken["goal_text"], client_ref=action.client_ref),
+        )
+    await send_suggestions(device_id)
 
 
 async def handle_goal_state_get(device_id: str, request: GoalStateGet) -> None:
@@ -745,6 +789,14 @@ async def handle_understanding_response(device_id: str, response: UnderstandingR
                 },
             },
         )
+        # The board card was BORN at the understanding gate (M6). A decline means the
+        # goal never became real, so drop the card — otherwise it sticks on "Confirm
+        # what the agent understood" forever, since the raw status above bypasses the
+        # board fold (only device frames are folded). A fresh snapshot is how the
+        # board removes a card: board_update only upserts, but a snapshot is applied
+        # authoritatively and drops what it no longer lists.
+        board.forget_goal(device_id, response.goal_id)
+        await send_board_snapshot(device_id)
         return
 
     if state.get("error"):

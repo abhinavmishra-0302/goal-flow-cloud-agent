@@ -23,6 +23,8 @@ contract version bump.
 | `board_snapshot` / `board_update` / `board_get` | Agent Board watches every goal at once (M6) |
 | `goal_state_get` | drilling into a goal after a reload (M6) |
 | `goal_accepted` + `user_goal.client_ref` | with 2 goals in flight, the UI can't otherwise tell which `goal_id` is which (M6) |
+| `suggestions` (device → cloud → ui) | the device proposes goals unprompted from local state — the one goal-less frame it sends (M8) |
+| `suggestion_action` (ui → cloud) | accept a suggestion (→ a `user_goal`) or dismiss it (M8) |
 
 ## Transport
 
@@ -428,6 +430,31 @@ With two goals in flight the UI **cannot tell which inbound `goal_id` is which
 submission** — it would have to adopt whichever arrives first, and mis-key the card.
 `client_ref` is UI-minted and echoed straight back, so an optimistic card re-keys to the
 real `goal_id`. Optional: a v2 client that omits it still works.
+
+### Proactive suggestions (v3-M8) — `suggestions` (device → cloud → ui), `suggestion_action` (ui → cloud)
+
+```json
+{ "type": "suggestions", "items": [
+    { "id": "sug-expiring", "kind": "expiring", "title": "Expiring Soon",
+      "subtitle": "5 items in 3 days", "detail": "spinach, yogurt, milk, ...",
+      "goal_text": "Plan meals that use up the food expiring this week" } ] }
+
+{ "type": "suggestion_action", "suggestion_id": "sug-expiring", "action": "accept", "client_ref": "s-3" }
+```
+
+The **`suggestions` frame is the one thing the device sends that isn't about a goal
+already in flight** — a proactive scan of local state (expiring food, low stock), not a
+reaction to a dispatch. Only the device can see the fridge, so only the device can raise
+one. The cloud holds the current list and relays it to the boards on change and on bind;
+the **chat UI never sees it** (suggestions are a board surface).
+
+A suggestion is **not a goal**. `suggestion_action{accept}` submits the suggestion's
+`goal_text` as an ordinary `user_goal` (echoing `client_ref` in the resulting
+`goal_accepted`, so the board can re-key exactly like a typed goal) — it then runs the
+normal understand → plan → approve flow. So a suggestion can never act on its own; a
+person accepting it is what turns "you could do this" into a goal. `action: "dismiss"`
+drops it from the list. The board sends `suggestion_action` but **never** `approval`
+or `control` — it stays read-mostly.
 
 ## Task-status lifecycle
 

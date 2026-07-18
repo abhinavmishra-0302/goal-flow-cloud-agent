@@ -125,6 +125,30 @@ def main() -> int:
     check(board.on_task_update(DEV, "ghost", {"progress_pct": 50}) is None, "an unknown goal is ignored, not invented")
     check(len(board.snapshot(DEV)[1]) == 3, "the ghost created no card")
 
+    # 10. NEGATIVE-PATH HONESTY (M8). A goal the WORLD blocked must read Waiting, not
+    # On Track — the bug this closes rendered a precheck-blocked goal GREEN because a
+    # downstream ternary recomputed the state the precheck had set.
+    board.on_goal_created(DEV, "g4", CONTRACT, None)
+    board.on_plan_ready(DEV, "g4", {
+        "plan": [], "proposals": [],
+        "safety": {"gate": "passed"},
+        "precheck": {"ok": False, "results": [
+            {"id": "smartthings_connected", "status": "fail", "detail": "SmartThings is disconnected — reconnect and this will resume"},
+        ]},
+    })
+    s4 = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g4")
+    check(s4.state == "waiting", f"a precheck-blocked goal is Waiting, not On Track — got {s4.state!r}")
+    check(s4.alerts.severity == "warn", f"the block is a warn (world's fault, recoverable), got {s4.alerts.severity!r}")
+    check(s4.next_step is not None and "SmartThings" in s4.next_step,
+          f"the card shows the fix as its next step, got {s4.next_step!r}")
+
+    # A deferred effect during execution, with no prior danger, also holds the goal on
+    # the WORLD — Waiting, not the false green _state_for would have returned for a
+    # warn-only alert.
+    board.on_status(DEV, "g4", {"task_status": "monitoring", "payload": {"executed": [{"result": "deferred_precheck"}]}})
+    s4 = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g4")
+    check(s4.state == "waiting", f"a deferred effect keeps the goal Waiting, got {s4.state!r}")
+
     for f in failures:
         print(f"  FAIL {f}")
     print("gate 13 (board fold): " + ("PASS" if not failures else f"FAIL: {len(failures)}"))

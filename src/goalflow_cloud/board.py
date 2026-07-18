@@ -56,6 +56,10 @@ class BoardService:
         #: goal_id -> the understanding awaiting a human (for goal_state_get drill-in).
         #: Dropped once confirmed: a settled gate is not something to rejoin.
         self._understandings: dict[str, dict[str, Any]] = {}
+        #: device_id -> the device's current proactive suggestions (M8). NOT goals —
+        #: a list of {id, kind, title, subtitle, detail, goal_text} the board renders
+        #: as "Upcoming & Suggested", each acceptable into a real goal.
+        self._suggestions: dict[str, list[dict[str, Any]]] = {}
 
     # --- reads ---
 
@@ -76,6 +80,28 @@ class BoardService:
 
     def cached_understanding(self, goal_id: str) -> dict[str, Any] | None:
         return self._understandings.get(goal_id)
+
+    # --- proactive suggestions (M8) ---
+
+    def on_suggestions(self, device_id: str, items: list[dict[str, Any]]) -> None:
+        """The device re-scanned: replace the list wholesale (idempotent, like a snapshot)."""
+        self._suggestions[device_id] = list(items)
+
+    def suggestions(self, device_id: str) -> list[dict[str, Any]]:
+        return list(self._suggestions.get(device_id, []))
+
+    def take_suggestion(self, device_id: str, suggestion_id: str) -> dict[str, Any] | None:
+        """Remove and return one suggestion — accepting or dismissing consumes it.
+
+        Returning it lets the accept path read its goal_text; a dismiss ignores the
+        return. Removing on BOTH keeps the list honest: an accepted suggestion has
+        become a goal and a dismissed one is gone, so neither should linger as a card.
+        """
+        remaining = self._suggestions.get(device_id, [])
+        taken = next((s for s in remaining if s.get("id") == suggestion_id), None)
+        if taken is not None:
+            self._suggestions[device_id] = [s for s in remaining if s.get("id") != suggestion_id]
+        return taken
 
     def forget_goal(self, device_id: str, goal_id: str) -> None:
         self._goals.get(device_id, {}).pop(goal_id, None)
@@ -185,22 +211,41 @@ class BoardService:
             return None
 
         alerts = summary.alerts
-        state = "waiting"
+        needs_approval = any(p.get("requires_approval") for p in payload.get("proposals") or [])
+        precheck = payload.get("precheck") or {}
+        precheck_blocked = bool(precheck.get("ok") is False)
+        # The failing probe's `detail` is the remediation sentence ("you are signed out
+        # — sign in and this will resume"). Surfacing it as the card's next step turns a
+        # blocked goal from a mystery into an instruction.
+        block_reason = next(
+            (r.get("detail") for r in precheck.get("results") or []
+             if r.get("status") == "fail" and r.get("detail")),
+            None,
+        )
+
+        # State is decided ONCE here, most-severe-first, rather than set and then
+        # overwritten by a downstream ternary — which is the bug this replaces: a
+        # precheck block set state="waiting" and the ternary recomputed it to
+        # "on_track", so a goal the world had blocked rendered GREEN.
         if (payload.get("safety") or {}).get("gate") == "blocked":
-            # Blocked by the house rules — never, not "not yet". Worth an alert.
+            # Blocked by the house rules — never, not "not yet". Worth a danger alert.
             alerts = _bump(alerts, "danger")
             state = "at_risk"
-        precheck = payload.get("precheck") or {}
-        if precheck and precheck.get("ok") is False:
-            # The world isn't ready. Not the user's fault and not forever, so it is
-            # 'waiting', not 'at_risk' — the distinction the Pre-check Engine exists
-            # to make, carried through to the chip a person actually reads.
+        elif precheck_blocked:
+            # The world isn't ready (signed out, appliance offline). Not the user's
+            # fault and not forever, so 'waiting', not 'at_risk' — the exact
+            # distinction the Pre-check Engine exists to make, now actually reaching
+            # the chip instead of being discarded.
             alerts = _bump(alerts, "warn")
+            state = "waiting"
+        elif needs_approval:
+            state = "waiting"
+        else:
+            state = "on_track"
 
-        needs_approval = any(p.get("requires_approval") for p in payload.get("proposals") or [])
-        return self._put(device_id, summary.model_copy(update={
+        updates: dict[str, Any] = {
             "task_status": "awaiting_approval" if needs_approval else "monitoring",
-            "state": state if state == "at_risk" else ("waiting" if needs_approval else "on_track"),
+            "state": state,
             "alerts": alerts,
             # Deliberately NOT payload["explanation"]. That field is the planner's
             # RATIONALE — a paragraph — and clipping it to fit a card yields "The
@@ -209,7 +254,12 @@ class BoardService:
             # completed tasks instead; until one lands, the card shows none, which is
             # honest: nothing has happened yet.
             "updated_at": _now(),
-        }))
+        }
+        if precheck_blocked and block_reason:
+            # A blocked goal has no task DAG, so next_step would otherwise sit on the
+            # "Working out the steps…" placeholder forever. Show the fix instead.
+            updates["next_step"] = block_reason
+        return self._put(device_id, summary.model_copy(update=updates))
 
     def on_status(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> GoalSummary | None:
         """A status tick: executions, monitoring notes, completion."""
@@ -223,13 +273,29 @@ class BoardService:
         alerts = summary.alerts
 
         # A deferred effect is the world's fault, not the plan's — warn, not danger.
-        if any(e.get("result") == "deferred_precheck" for e in payload.get("executed") or []):
+        # It also holds the goal: the effect runs when the world recovers, so the card
+        # is Waiting (on the world), not On Track. _state_for only flips out of
+        # on_track on a danger, so a warn-only deferral would otherwise read green —
+        # the same false-green the plan-ready precheck fix above closes.
+        deferred = any(e.get("result") == "deferred_precheck" for e in payload.get("executed") or [])
+        if deferred:
             alerts = _bump(alerts, "warn")
 
+        # Most-severe-first, so a deferral can't downgrade a goal that already has a
+        # danger (an adaptation waiting on a person outranks an effect waiting on the
+        # world). _state_for handles the ordinary case.
+        if task_status == "done":
+            state = "completed"
+        elif alerts.severity == "danger":
+            state = "at_risk"
+        elif deferred:
+            state = "waiting"
+        else:
+            state = _state_for(task_status, alerts)
         done = task_status == "done"
         return self._put(device_id, summary.model_copy(update={
             "task_status": task_status,
-            "state": "completed" if done else _state_for(task_status, alerts),
+            "state": state,
             "progress_pct": 100 if done else summary.progress_pct,
             "pending_tasks": 0 if done else summary.pending_tasks,
             "next_step": None if done else summary.next_step,
