@@ -149,6 +149,55 @@ def main() -> int:
     s4 = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g4")
     check(s4.state == "waiting", f"a deferred effect keeps the goal Waiting, got {s4.state!r}")
 
+    # --- v3.6.1 regressions: three bugs a user hit on a live board ---
+
+    # 1. An approved adaptation must CLEAR its alert. _bump only ever counted upward and
+    #    nothing cleared it, so the card kept "1 alert — tap to review" forever, and
+    #    _state_for pinned it to At Risk off that stale danger.
+    board.on_goal_created(DEV, "g5", CONTRACT, None)
+    board.on_proposal(DEV, "g5", {"payload": {"action": "notify about a delivery arriving to an empty house"}})
+    s5 = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g5")
+    check(s5.alerts.count == 1, f"a pending adaptation raises one alert, got {s5.alerts.count}")
+
+    # 2. A PENDING proposal is not activity — it has not happened. Logging it as activity
+    #    made the card print the same sentence twice: once as "done", once as "next".
+    check("notify about a delivery arriving to an empty house" not in s5.activity,
+          f"a pending proposal must not be logged as something that happened, got {s5.activity!r}")
+    check(s5.next_step == "notify about a delivery arriving to an empty house",
+          f"the pending action IS the next step, got {s5.next_step!r}")
+
+    board.on_status(DEV, "g5", {"task_status": "monitoring",
+                                "payload": {"executed": [{"result": "ok"}]}})
+    s5 = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g5")
+    check(s5.alerts.count == 0, f"an executed adaptation clears its alert, got {s5.alerts.count}")
+    check(s5.state != "at_risk", f"and the card stops reading At Risk off it, got {s5.state!r}")
+
+    # 3. Progress spans the GOAL's deadline, not the plan's item spread. v3.5 made plan
+    #    days real dates, so an all-on-one-evening checklist has span 1 — and one Advance
+    #    day drove the card to 100% with the deadline still a week out.
+    # A LIVE contract — its deadline is ahead of today, as a real goal's is. (CONTRACT's
+    # fixed dates are historical, which would make the plan span the later bound and hide
+    # the very regression this checks.)
+    from datetime import date as _date, timedelta as _td
+    deadline = (_date.today() + _td(days=7)).isoformat()
+    live = dict(CONTRACT, time_window={"start": _date.today().isoformat(), "end": deadline})
+    board.on_goal_created(DEV, "g6", live, None)
+    board.on_plan_ready(DEV, "g6", {
+        "plan": [{"id": "s1", "day": 1, "title": "Lock up"}, {"id": "s2", "day": 1, "title": "Arm alarm"}],
+        "proposals": [], "safety": {"gate": "passed"}, "precheck": {"ok": True},
+    })
+    window = board._windows["g6"]
+    from datetime import date, timedelta
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    check(window["end"] > tomorrow,
+          f"a same-day plan must not give a 1-day window when the goal has a later deadline — got {window!r}")
+
+    board.on_status(DEV, "g6", {"task_status": "monitoring",
+                                "payload": {"sim_date": (date.today() + timedelta(days=1)).isoformat()}})
+    s6 = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g6")
+    check(s6.progress_pct < 100,
+          f"one advanced day must not complete a goal whose deadline is days away — got {s6.progress_pct}%")
+
     for f in failures:
         print(f"  FAIL {f}")
     print("gate 13 (board fold): " + ("PASS" if not failures else f"FAIL: {len(failures)}"))

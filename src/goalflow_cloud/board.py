@@ -211,21 +211,31 @@ class BoardService:
     def on_plan_ready(self, device_id: str, goal_id: str, payload: dict[str, Any]) -> GoalSummary | None:
         """A plan arrived: cache it for drill-in, and reflect what it says."""
         self._plans[goal_id] = payload
-        # Anchor day-by-day progress to the plan's OWN day span (v3.3): progress climbs
-        # from ~0% at approval to 100% when the sim clock reaches the plan's last day —
-        # for ANY domain — instead of an LLM-chosen calendar window that could be short
-        # or already past. start is the dispatch date; end = start + N (N = max plan day).
-        plan_span = max((item.get("day") or 0) for item in (payload.get("plan") or [{}])) or 1
-        # Anchor to TODAY (monitoring begins now), not the dispatched window start — an
-        # event goal's start is the event date, which would keep progress at 0% until then.
-        start = date.today().isoformat()
-        self._windows[goal_id] = {
-            "start": start,
-            "end": (date.fromisoformat(start) + timedelta(days=plan_span)).isoformat(),
-        }
         summary = self._get(device_id, goal_id)
         if summary is None:
             return None
+
+        # Anchor day-by-day progress to TODAY (monitoring begins now), not the dispatched
+        # window start — an event goal's start is the event date, which would keep
+        # progress at 0% until then.
+        start = date.today().isoformat()
+        plan_span = max((item.get("day") or 0) for item in (payload.get("plan") or [{}])) or 1
+        end = date.fromisoformat(start) + timedelta(days=plan_span)
+
+        # The horizon is the GOAL's own deadline when it has one, not the spread of the
+        # plan's items. Until v3.5 the device numbered plan days by list POSITION, so the
+        # span happened to equal the item count and every goal got a 5-7 day window by
+        # accident. Now that days are real dates, a vacation checklist that all happens on
+        # departure evening has span 1 — and a single Advance day drove the card to 100%
+        # with the trip still six days out. Take whichever is later: a goal is not finished
+        # before its deadline, and the window must still be long enough for the plan.
+        if summary.eta:
+            try:
+                end = max(end, date.fromisoformat(summary.eta))
+            except ValueError:
+                pass  # a non-ISO eta is not a reason to lose the window
+
+        self._windows[goal_id] = {"start": start, "end": end.isoformat()}
 
         alerts = summary.alerts
         needs_approval = any(p.get("requires_approval") for p in payload.get("proposals") or [])
@@ -317,6 +327,15 @@ class BoardService:
         if deferred:
             alerts = _bump(alerts, "warn")
 
+        # An adaptation that has been approved and actually RAN is resolved — its alert
+        # has to go. _bump only ever counted upward and nothing cleared it, so approving
+        # the proposal left "1 alert — tap to review" on the card for the goal's whole
+        # life, and _state_for kept pinning the card to At Risk off the stale danger.
+        # A finished goal likewise carries no open alerts.
+        executed = payload.get("executed") or []
+        if task_status == "done" or (executed and not deferred and task_status != "adapting"):
+            alerts = GoalAlerts(count=0, severity=None)
+
         # Most-severe-first, so a deferral can't downgrade a goal that already has a
         # danger (an adaptation waiting on a person outranks an effect waiting on the
         # world). _state_for handles the ordinary case.
@@ -352,12 +371,16 @@ class BoardService:
             return None
 
         payload = frame.get("payload") or {}
+        # NOT pushed to `activity`: a proposal is what the agent WANTS to do, and it is
+        # waiting on a person — it has not happened. Recording it as activity claimed it
+        # had, so the card showed the very same sentence twice: once as "✓ done" and
+        # again as "➡ next". activity stays the log of things that actually occurred;
+        # the pending action belongs in next_step alone.
         return self._put(device_id, summary.model_copy(update={
             "task_status": "adapting",
             "state": "waiting",
             "alerts": _bump(summary.alerts, "danger"),
             "next_step": payload.get("action") or summary.next_step,
-            "activity": _push(summary.activity, payload.get("action")),
             "updated_at": _now(),
         }))
 
