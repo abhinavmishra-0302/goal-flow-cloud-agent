@@ -324,17 +324,28 @@ class BoardService:
         # on_track on a danger, so a warn-only deferral would otherwise read green —
         # the same false-green the plan-ready precheck fix above closes.
         deferred = any(e.get("result") == "deferred_precheck" for e in payload.get("executed") or [])
-        if deferred:
-            alerts = _bump(alerts, "warn")
 
         # An adaptation that has been approved and actually RAN is resolved — its alert
         # has to go. _bump only ever counted upward and nothing cleared it, so approving
         # the proposal left "1 alert — tap to review" on the card for the goal's whole
         # life, and _state_for kept pinning the card to At Risk off the stale danger.
         # A finished goal likewise carries no open alerts.
+        # The test is leaving "adapting", NOT having executed something: a DECLINE
+        # executes nothing, so keying off `executed` alone would leave the alert standing
+        # for exactly the case a user is most likely to notice — they said no, and the
+        # card went on insisting it needed them.
         executed = payload.get("executed") or []
-        if task_status == "done" or (executed and not deferred and task_status != "adapting"):
+        answered = summary.task_status == "adapting" and task_status != "adapting"
+        if task_status == "done" or answered or (executed and not deferred and task_status != "adapting"):
             alerts = GoalAlerts(count=0, severity=None)
+
+        # ...and only THEN raise what this tick reports. Order matters: a deferral that
+        # arrives in the same tick that answers an adaptation is a NEW problem and must
+        # survive the clear above. A deferred effect is the world's fault, not the
+        # plan's — warn, not danger. It also holds the goal: the effect runs when the
+        # world recovers, so the card is Waiting (on the world), not On Track.
+        if deferred:
+            alerts = _bump(alerts, "warn")
 
         # Most-severe-first, so a deferral can't downgrade a goal that already has a
         # danger (an adaptation waiting on a person outranks an effect waiting on the

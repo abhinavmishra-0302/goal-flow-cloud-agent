@@ -93,15 +93,22 @@ def main() -> int:
     check(s.alerts.count == 1 and s.alerts.severity == "danger", f"an adaptation alerts, got {s.alerts}")
     check(s.state == "waiting", "an adaptation waits on the user")
 
-    # 5. A deferred effect: the WORLD's fault, not the plan's -> warn, and danger must stick.
+    # 5. A deferred effect: the WORLD's fault, not the plan's -> warn, and it holds the goal.
+    #
+    # SEMANTICS CHANGED in v3.6.1: alerts are what is OUTSTANDING, not a tally of
+    # everything that ever needed attention. This tick both ANSWERS the adaptation from
+    # step 4 (task_status leaves "adapting") and reports a NEW deferral, so the count is
+    # 1 — the deferral — not 2. The old cumulative reading is what left a card saying
+    # "1 alert — tap to review" forever after the user had already approved it, and
+    # pinned the card to At Risk off a danger that no longer existed.
     board.on_status(DEV, "g1", {
         "task_status": "monitoring",
         "payload": {"executed": [{"result": "deferred_precheck"}], "note": "The oven is offline"},
     })
     s = board.snapshot(DEV)[1][0]
-    check(s.alerts.count == 2, f"alerts accumulate, got {s.alerts.count}")
-    check(s.alerts.severity == "danger", "a warn must NOT downgrade an existing danger")
-    check(s.state == "at_risk", f"outstanding danger reads as At Risk, got {s.state!r}")
+    check(s.alerts.count == 1, f"the answered adaptation clears; the new deferral stands, got {s.alerts.count}")
+    check(s.alerts.severity == "warn", f"a deferral is the world's fault -> warn, got {s.alerts.severity!r}")
+    check(s.state == "waiting", f"a deferred effect waits on the WORLD, got {s.state!r}")
 
     # 6. Completion wins over everything.
     board.on_status(DEV, "g1", {"task_status": "done", "payload": {"note": "All set for Sunday"}})
@@ -171,6 +178,16 @@ def main() -> int:
     s5 = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g5")
     check(s5.alerts.count == 0, f"an executed adaptation clears its alert, got {s5.alerts.count}")
     check(s5.state != "at_risk", f"and the card stops reading At Risk off it, got {s5.state!r}")
+
+    # 2b. A DECLINE resolves the adaptation too. It executes nothing, so a clear-rule
+    #     keyed on `executed` leaves the alert up for the case the user notices most:
+    #     they said no, and the card went on insisting it needed them.
+    board.on_goal_created(DEV, "g7", CONTRACT, None)
+    board.on_proposal(DEV, "g7", {"payload": {"action": "swap the paneer for tofu"}})
+    board.on_status(DEV, "g7", {"task_status": "monitoring", "payload": {"executed": []}})
+    s7 = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g7")
+    check(s7.alerts.count == 0, f"a DECLINED adaptation clears its alert too, got {s7.alerts.count}")
+    check(s7.task_status != "adapting", f"and the goal stops being 'adapting', got {s7.task_status!r}")
 
     # 3. Progress spans the GOAL's deadline, not the plan's item spread. v3.5 made plan
     #    days real dates, so an all-on-one-evening checklist has span 1 — and one Advance
