@@ -392,10 +392,14 @@ def interpret_goal(state: GraphState) -> GraphState:
                     "is listed first. E.g. a birthday/party → the party shape; a trip or "
                     "being away from home → the vacation/away shape; hosting guests for a "
                     "dinner → the guest-dinner shape; planning the week's dinners → the "
-                    "meal shape. Do NOT default to meal planning — use the meal shape ONLY "
-                    "when the goal is genuinely about planning meals. The device ROUTES on "
-                    "this value, so a mismatched shape loses its handling. Coin a new short "
-                    "slug only when the goal is a KIND none of the advertised hints covers.",
+                    "meal shape; cutting the electricity/power bill or shifting appliance "
+                    "usage → the energy shape; keeping the kitchen stocked or spending less "
+                    "on groceries → the grocery shape. Do NOT default to meal planning — use "
+                    "the meal shape ONLY when the goal is genuinely about planning meals; a "
+                    "goal about the grocery BILL is the grocery shape, not the meal shape. "
+                    "The device ROUTES on this value, so a mismatched shape loses its "
+                    "handling. Coin a new short slug only when the goal is a KIND none of "
+                    "the advertised hints covers.",
                 ),
                 ("human", goal_text),
             ]
