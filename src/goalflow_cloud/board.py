@@ -24,7 +24,7 @@ and what keeps the board honest.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from goalflow_cloud.models.contract import GoalAlerts, GoalSummary
@@ -211,6 +211,18 @@ class BoardService:
     def on_plan_ready(self, device_id: str, goal_id: str, payload: dict[str, Any]) -> GoalSummary | None:
         """A plan arrived: cache it for drill-in, and reflect what it says."""
         self._plans[goal_id] = payload
+        # Anchor day-by-day progress to the plan's OWN day span (v3.3): progress climbs
+        # from ~0% at approval to 100% when the sim clock reaches the plan's last day —
+        # for ANY domain — instead of an LLM-chosen calendar window that could be short
+        # or already past. start is the dispatch date; end = start + N (N = max plan day).
+        plan_span = max((item.get("day") or 0) for item in (payload.get("plan") or [{}])) or 1
+        # Anchor to TODAY (monitoring begins now), not the dispatched window start — an
+        # event goal's start is the event date, which would keep progress at 0% until then.
+        start = date.today().isoformat()
+        self._windows[goal_id] = {
+            "start": start,
+            "end": (date.fromisoformat(start) + timedelta(days=plan_span)).isoformat(),
+        }
         summary = self._get(device_id, goal_id)
         if summary is None:
             return None

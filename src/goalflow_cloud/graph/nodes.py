@@ -94,7 +94,7 @@ class GraphState(TypedDict, total=False):
 class InterpretedIntent(BaseModel):
     """Structured LLM output for the generic goal interpreter."""
 
-    domain: str = Field(description="Short generic domain id, e.g. meal_plan, chores, errands.")
+    domain: str = Field(description="Short slug naming the KIND of goal — set per the DOMAIN rule in the system prompt (match the advertised goal-shape whose hint fits the goal, else coin one). NOT a default.")
     objective: str = Field(description="A concise normalized objective.")
     title: str = Field(
         default="",
@@ -384,15 +384,18 @@ def interpret_goal(state: GraphState) -> GraphState:
                     "product is for. If nothing it can do relates to the goal — general "
                     "questions, trivia, facts, chit-chat, unrelated tasks — set "
                     "actionable=false, put one short reason in decline_reason, and you may "
-                    "leave time_window empty. Choose `domain` as a short slug fitting the "
-                    "goal (e.g. meal_plan, guest_dinner, vacation_prep). ALWAYS respond by "
-                    "calling the structured function — never answer the user's question "
-                    "directly in prose, even for out-of-scope goals (call it with "
-                    "actionable=false instead).\n\n"
-                    "DOMAIN: prefer one of the advertised goal-shape ids above when the "
-                    "goal fits it — the device ROUTES on that value, so a guest dinner "
-                    "labelled meal_plan quietly loses its guest handling. Coin a new short "
-                    "slug only when none of them fits.",
+                    "leave time_window empty. ALWAYS respond by calling the structured "
+                    "function — never answer the user's question directly in prose, even "
+                    "for out-of-scope goals (call it with actionable=false instead).\n\n"
+                    "DOMAIN: set `domain` to the advertised goal-shape id whose HINT best "
+                    "matches the KIND of goal — read what the goal is ABOUT, not which id "
+                    "is listed first. E.g. a birthday/party → the party shape; a trip or "
+                    "being away from home → the vacation/away shape; hosting guests for a "
+                    "dinner → the guest-dinner shape; planning the week's dinners → the "
+                    "meal shape. Do NOT default to meal planning — use the meal shape ONLY "
+                    "when the goal is genuinely about planning meals. The device ROUTES on "
+                    "this value, so a mismatched shape loses its handling. Coin a new short "
+                    "slug only when the goal is a KIND none of the advertised hints covers.",
                 ),
                 ("human", goal_text),
             ]
@@ -532,12 +535,16 @@ def build_contract(state: GraphState) -> GraphState:
     correlation_id = state.get("correlation_id") or str(uuid4())
     domain = intent["domain"]
     today = date.today()
-    time_window = intent.get("time_window")
-    if domain == "meal_plan":
-        time_window = {
-            "start": today.isoformat(),
-            "end": (today + timedelta(days=6)).isoformat(),
-        }
+    # Monitoring/prep begins NOW, so the window START is real today for EVERY goal — NOT
+    # the LLM's start, which for an event goal ("next Sunday") is the EVENT date and would
+    # peg progress at 0% until then. The LLM's end is the goal's horizon (the card's ETA).
+    # The board's day-by-day progress is anchored to the PLAN's own day span from this
+    # start (BoardService.on_plan_ready).
+    start = today.isoformat()
+    end = (intent.get("time_window") or {}).get("end")
+    if not end or end <= start:
+        end = (today + timedelta(days=6)).isoformat()
+    time_window = {"start": start, "end": end}
 
     context = {
         "family_id": memory.get("family_id"),
