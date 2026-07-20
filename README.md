@@ -1,6 +1,6 @@
 # goal-flow-cloud-agent
 
-Cloud agent for **GoalFlow v2** — a two-tier, **general goal-based agent** for the
+Cloud agent for **GoalFlow v3** — a two-tier, **general goal-based agent** for the
 Samsung Family Hub. GoalFlow is not a meal app: meal planning and guest dinner prep
 are just *domains* riding the same domain-agnostic harness. The cloud tier owns
 **conversation + memory**, LLM-interprets the user's fuzzy goal into a **generic
@@ -25,7 +25,7 @@ UI (tablet chat)  <--WS-->  CLOUD (this repo, hub)  <--WS-->  DEVICE agent (SK p
   - **Approval gate**: the *user via the cloud* (a durable LangGraph
     `interrupt()`); *waits*.
 
-The shared protocol is **CONTRACT v2** — see [`CONTRACT.md`](CONTRACT.md) (this file
+The shared protocol is **CONTRACT v3** — see [`CONTRACT.md`](CONTRACT.md) (this file
 is the canonical copy; the UI and device repos mirror it as typed definitions). The
 protocol is **generic and domain-agnostic**: no meal-specific fields anywhere. A
 `domain` string (`"meal_plan"`, `"guest_dinner"`, ...) names the use case; domain
@@ -59,6 +59,20 @@ specifics live in the device's capability modules plus the free-form
    Nothing firm executes until approval.
 8. **Monitors + adapts**: `status` / `proposal` frames relay to the UI and feed the
    graph's monitor node; a material change re-enters the approval loop.
+
+## The Agent Board (the board fold)
+
+Alongside the per-goal conversation and the family memory, the cloud runs a **third
+tier**: the **board fold** (`src/goalflow_cloud/board.py`, `BoardService`). Every
+other frame is about *one* goal; the board is the *session-level* view of *all* goals
+at once. The hub already sees every frame a goal produces, so `BoardService` folds
+each goal's frames (`understanding` / `dispatch` / `plan_ready` / `task_update` /
+`status` / `proposal`) into **one `GoalSummary` per goal**, and broadcasts a
+`board_snapshot` (every goal, on UI bind or `board_get`) plus a `board_update` (one
+changed goal) to the Agent Board UI. The fold is **deterministic — no LLM, no I/O** —
+so every number on a board card (`state`, `progress_pct`, `alerts`, `activity`,
+`next_step`) is *derived* here from something the device actually said, never guessed.
+See `docs/ARCHITECTURE.md` for the derivation rules.
 
 **LLM-only, no fallbacks.** There is no scripted/mock planner behind the LLM call.
 If the LLM fails, the goal fails loudly with a structured error surfaced to the UI —
@@ -114,14 +128,17 @@ python scripts/run_graph_demo.py "we've got 6 people over Saturday for dinner - 
 ## Repo layout
 
 ```
-CONTRACT.md                     # canonical CONTRACT v2 (generic wire protocol)
-docs/ARCHITECTURE.md            # cloud architecture: graph, memory, hub, logging
+CONTRACT.md                     # canonical CONTRACT v3 (generic wire protocol)
+docs/ARCHITECTURE.md            # cloud architecture: graph, board fold, memory, hub, logging
 docs/diagrams.md                # Mermaid sequence + component diagrams
 scripts/run_graph_demo.py       # run the graph on a goal, print the contract
+scripts/verify_board.py         # gate 13: the board fold's numbers are derived and add up
+scripts/verify_mirrors.py       # gate 14: the contract mirrors have not drifted
 src/goalflow_cloud/
   config.py                     # env-backed settings (OPENROUTER_*, WS_*, LOG_LEVEL)
-  server.py                     # FastAPI WS hub: registry, routing, relays, graph driving
-  models/contract.py            # Pydantic mirror of every CONTRACT v2 message
+  server.py                     # FastAPI WS hub: multi-session registry, routing, relays, graph driving, board pushes
+  board.py                      # BoardService: folds every goal's frames into one GoalSummary (deterministic, no LLM)
+  models/contract.py            # Pydantic mirror of every CONTRACT v3 message
   graph/nodes.py                # the LangGraph StateGraph: nodes, routers, interrupts
   memory/store.py               # family profile loader + hard/soft split
 data/memory/family_profile.json # generic family memory (hard + soft + context)
@@ -129,6 +146,7 @@ run.sh
 ```
 
 See [`CODE_GUIDE.md`](CODE_GUIDE.md) for the code walkthrough and
-`docs/ARCHITECTURE.md` for the full design. The system-level v2 framing (the 11
-harness modules, demo pair, decisions) lives in
-`../goal-flow-agents/docs/V2_DESIGN_PROPOSAL.md`.
+`docs/ARCHITECTURE.md` for the full design. The system-level v3 framing (the
+board-centric flow, the harness modules, demo pair, decisions) lives in
+`../goal-flow-agents/docs/V3_DESIGN_PROPOSAL.md` (the original v2 framing remains in
+`V2_DESIGN_PROPOSAL.md`).

@@ -1,6 +1,6 @@
-# Code Guide — goal-flow-cloud-agent (v2)
+# Code Guide — goal-flow-cloud-agent (v3)
 
-The **cloud agent** is the hub tier of GoalFlow v2, a general goal-based agent. It owns
+The **cloud agent** is the hub tier of GoalFlow v3, a general goal-based agent. It owns
 the conversation and family memory, LLM-interprets the user's fuzzy goal into a **generic
 Task Contract**, drives an advanced **LangGraph StateGraph** (conditional edges,
 `interrupt()`-based HITL, checkpointer), and relays every frame between the UI and the
@@ -13,13 +13,16 @@ See `README.md` for run steps, `CONTRACT.md` for the canonical wire protocol, an
 ## File map
 
 ```
-CONTRACT.md                       # canonical CONTRACT v2 (source of truth; generic)
+CONTRACT.md                       # canonical CONTRACT v3 (source of truth; generic)
 scripts/run_graph_demo.py         # run the graph on any goal text, print the contract
+scripts/verify_board.py           # gate 13: the board fold's numbers are derived and add up
+scripts/verify_mirrors.py         # gate 14: the contract mirrors have not drifted
 data/memory/family_profile.json   # generic family memory (hard + soft + context)
 src/goalflow_cloud/
   config.py                       # Settings dataclass from env (OPENROUTER_*, WS_*, LOG_LEVEL)
-  server.py                       # FastAPI WS hub: registry, routing, relays, graph driving  ← start here
-  models/contract.py              # Pydantic mirror of every CONTRACT v2 message (lenient extras)
+  server.py                       # FastAPI WS hub: multi-session registry, routing, relays, graph driving, board pushes  ← start here
+  board.py                        # BoardService: folds a goal's frames into one GoalSummary per goal (deterministic, no LLM)
+  models/contract.py              # Pydantic mirror of every CONTRACT v3 message (lenient extras)
   memory/store.py                 # profile loader + hard_safety_block / soft_bias_block
   graph/nodes.py                  # the StateGraph: nodes, routers, interrupts, checkpointer
 docs/ARCHITECTURE.md, docs/diagrams.md
@@ -33,19 +36,20 @@ checkpointer** (`build_graph()`), so every `interrupt()` pause is durable and re
 
 **State** (`GraphState`, a `TypedDict`): `goal_text`, `intent`, `memory`, `understanding`,
 `understanding_confirmed`, `contract`, `plan`, `pending_approvals`, `decisions`,
-`task_status` (the CONTRACT v2 lifecycle), `event_log` (append-only,
+`task_status` (the CONTRACT v3 lifecycle), `event_log` (append-only,
 `Annotated[..., add]` reducer), `goal_id`, `correlation_id`, `error`, plus
 `approval_frame` / `monitor_frame` / `explanation` outputs.
 
 **Nodes and edges:**
 
 ```
-interpret_goal ─(error? → explain_block)→ load_memory → present_understanding
-  ─(route_after_understanding)→ build_contract | goal_declined
-build_contract → dispatch_to_device → collect_plan ─(route_on_safety)→ hitl_approval | relay_decisions | explain_block
+interpret_goal ─(route_after_interpret)→ load_memory | decline_out_of_scope | explain_block
+load_memory → present_understanding ─(route_after_understanding)→ build_contract | goal_declined
+build_contract → dispatch_to_device → collect_plan
+  ─(route_on_safety)→ hitl_approval | relay_decisions | explain_block | precheck_wait
 hitl_approval → relay_decisions → monitor ─(route_on_monitor)→ hitl_approval (adapt loop) | monitor | finalize
 explain_block → finalize → END
-goal_declined → END
+goal_declined | decline_out_of_scope | precheck_wait → END
 ```
 
 - **`interpret_goal`** — the only LLM call in this repo: `ChatOpenAI` (OpenRouter
@@ -65,6 +69,10 @@ goal_declined → END
 - **`goal_declined`** — graceful terminal: the user declined the understanding before
   any planning happened, so the goal ends (`task_status="done"`) without ever
   dispatching to the device.
+- **`decline_out_of_scope`** — graceful terminal reached straight from
+  `interpret_goal` (`route_after_interpret`) when the interpreter judges the goal
+  outside what the agent can act on: the run ends with an out-of-scope explanation
+  instead of loading memory or presenting understanding.
 - **`build_contract`** — merges intent + memory into a `dispatch` frame:
   `constraints.hard` copied **verbatim** from memory (never LLM output),
   `constraints.soft` from soft prefs, `autonomy = "tiered"`, mints
@@ -81,6 +89,11 @@ goal_declined → END
   frame. An adaptation `proposal` (or a `material` status) sets `task_status="adapting"`
   and `route_on_monitor` loops back into `hitl_approval` — the **adapt loop**;
   `task_status == "done"` routes to `finalize`.
+- **`precheck_wait`** — terminal hold reached from `collect_plan` when the device's
+  Pre-check Engine reports the world isn't ready (`precheck.ok is False`, e.g. signed
+  out, appliance offline). Unlike a safety block ("never" → `explain_block`), a
+  precheck block is "not yet": the run parks so the goal can resume when the world
+  recovers, rather than falsely completing.
 - **`explain_block` / `finalize`** — the Trace/Explain surface: user-facing explanation
   for safety-blocked plans or LLM errors, then close-out.
 
@@ -106,14 +119,19 @@ on **`type` + sender role, within the sender's session** (`route_message` derive
 
 | Incoming `type` | From   | Cloud action |
 |-----------------|--------|--------------|
-| `user_goal`     | ui     | `start_goal` runs the graph (in a thread) to the `present_understanding` gate → send the `understanding` frame to the UI; on graph `error`, send a terminal `status` frame to the UI instead. |
-| `understanding_response` | ui | `resume_goal` resumes `present_understanding` with `{"confirmed": bool}`; confirmed sends the `dispatch` contract to the device, declined ends the goal (`goal_declined`). |
+| `user_goal`     | ui     | `start_goal` runs the graph (in a thread) to the `present_understanding` gate → send the `understanding` frame to the UI; also folds the goal onto the board (`board.on_understanding`); on graph `error`, send a terminal `status` frame to the UI instead. |
+| `understanding_response` | ui | `resume_goal` resumes `present_understanding` with `{"confirmed": bool}`; confirmed sends the `dispatch` contract to the device and folds the goal (`board.on_goal_created`), declined ends the goal (`goal_declined`) and re-snapshots the board so the card drops. |
 | `approval`      | ui     | `resume_goal` resumes the `hitl_approval` interrupt with the decisions; forward the frame to the device. |
 | `control`       | ui     | Forward to the device (generic clock: `advance_day` / `reset` / `set_date`; plus `trigger_event` for the event-driven demo — cloud makes no logic changes, pure passthrough). |
+| `board_get`     | ui     | Send this session's `board_snapshot` (every goal, folded) — first paint, or to heal a `board_seq` gap. |
+| `goal_state_get`| ui     | Reply from the board's cache with the goal's last `present_plan` / `status` / pending `understanding` (drill-in after a reload); a miss is logged. |
+| `suggestion_action` | ui | Accept or dismiss one proactive suggestion (`BoardService.take_suggestion`); an accept starts a real goal, then re-send `suggestions`. |
 | `capabilities`  | device | Cache the module registry **per session**; relay to the UI (also replayed to a UI when it binds into the session). |
-| `agent_event`   | device | **Passthrough relay** to the UI; best-effort append into the graph's `event_log` via `graph.update_state`. The stream never blocks the graph — streaming lives at the hub layer while the graph waits at its interrupts. |
-| `plan_ready`    | device | `resume_goal` (resumes `collect_plan`); re-wrap as `present_plan` with `payload.knew` added; send to UI. If the run auto-advanced past approval (auto-tier only), forward the resulting `approval_frame` to the device. |
-| `proposal` / `status` | device | Relay to the UI, then feed the graph's `monitor` interrupt (best-effort). |
+| `agent_event`   | device | **Passthrough relay** to the UI; best-effort append into the graph's `event_log` via `graph.update_state`. The stream never blocks the graph — streaming lives at the hub layer while the graph waits at its interrupts. A `task_update` event also folds onto the board (`board.on_task_update`). |
+| `plan_ready`    | device | `resume_goal` (resumes `collect_plan`); re-wrap as `present_plan` with `payload.knew` added; send to UI; fold onto the board (`board.on_plan_ready`). If the run auto-advanced past approval (auto-tier only), forward the resulting `approval_frame` to the device. |
+| `proposal` / `status` | device | Relay to the UI, feed the graph's `monitor` interrupt (best-effort), and fold onto the board (`board.on_proposal` / `board.on_status`). |
+| `suggestions`   | device | Replace this session's proactive-suggestion list (`board.on_suggestions`); re-broadcast `suggestions` to the boards. |
+| `day_advanced`  | device | Relay the global world-tick summary (v3.2) straight through to the boards; the per-goal `status`/`proposal` frames that ride alongside it already moved the cards. |
 
 Device frames are **deduped** per goal on `correlation_id` (plus `seq` for
 `agent_event`) so reconnect replays are dropped.
@@ -128,6 +146,46 @@ UI stuck on "planning".
 dispatched contract — generically: it surfaces `constraints.hard` (allergens, dietary,
 medical, budget, quiet hours), `constraints.soft` (dislikes, prefer), and `context`
 notes as flat display-ready chips. No domain-specific logic.
+
+## The board fold (`board.py`)
+
+`BoardService` is the hub's **third tier**, next to the conversation/graph and the
+family memory. Every other frame is about *one* goal; the board is the *session-level*
+view of *all* goals. It holds per-session state (`device_id → goal_id → GoalSummary`,
+plus a monotonic `board_seq`) and folds each goal's frames — `understanding`,
+`dispatch`, `plan_ready`, `task_update`, `status`, `proposal` — into **one
+`GoalSummary` per goal** (`models/contract.py`). Each `on_*` method returns the updated
+summary; `server.py`'s `push_board` broadcasts it as a `board_update`, and
+`send_board_snapshot` sends the whole set as a `board_snapshot`. The fold is
+**deterministic — no LLM, no I/O** (`scripts/verify_board.py`, gate 13, replays a frame
+sequence and checks the card a person would read). The card is born at
+`on_understanding` (so a goal blocked behind a human is visible), not at dispatch.
+
+Three derivation rules are worth knowing before touching this file (these are
+cloud-internal, *not* wire-contract semantics):
+
+- **`alerts.count` is what is OUTSTANDING, not a running tally.** `_bump` only ever
+  counted upward; `on_status` clears the alert (`count=0`) once the thing that raised
+  it is resolved. An adaptation's alert clears when the goal *leaves* `"adapting"` —
+  the test is `task_status != "adapting"`, **not** whether something executed, because
+  a **decline** executes nothing yet still answers the alert. A `done` goal carries no
+  open alerts. `danger` never downgrades to `warn`.
+- **`activity` lists only things that OCCURRED.** A completed `task_update` title and a
+  `status` note get `_push`ed (last two, "a • b"); a pending `proposal` is **not** —
+  it is what the agent *wants* to do and is waiting on a person, so it belongs in
+  `next_step` alone. Recording it as activity used to make the card show the same
+  sentence twice (✓ done and ➡ next).
+- **Day-based progress (v3.2).** Once a goal is running, `progress_pct` is where the
+  sim date (`status.payload.sim_date`) sits in the goal's window (`_day_progress`), so
+  one Advance-day moves every card; it falls back to the task-DAG `progress_pct` during
+  planning. The window (`on_plan_ready`) spans `max(` the plan's own day-span `,` the
+  goal's `eta` `)` — because since v3.5 plan days are real dates, a checklist that all
+  happens on one evening has span 1, and without the `eta` floor a single Advance-day
+  would drive that card to 100% with the deadline still days out.
+
+`goal_state_get` (drill-in) and the proactive **suggestions** list (M8:
+`on_suggestions` / `take_suggestion`) are also served from here; a device going offline
+marks every unfinished card at-risk (`on_device_offline`).
 
 ## Memory: the hard-vs-soft split (`memory/store.py`)
 
