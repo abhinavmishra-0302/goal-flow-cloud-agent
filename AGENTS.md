@@ -61,13 +61,23 @@ contract lives HERE**: `CONTRACT.md` (mirrored as `types/contract.ts` in the UI 
   **Hard constraints** (allergies, medical) are injected deterministically into the
   contract's `constraints.hard`; **soft prefs** only bias. The safety gate on the
   device reads `constraints.hard` and nothing else.
+- `src/goalflow_cloud/board.py` — **`BoardService`**, the Agent Board fold: it folds every
+  goal's frames (`understanding`/`plan_ready`/`task_update`/`status`/`proposal`) into one
+  `GoalSummary` per goal and broadcasts `board_snapshot`/`board_update`. Deterministic, no
+  LLM. Every number on a board card is DERIVED here. Key rules (v3.6.1/6.2): `alerts` are
+  **outstanding**, not ever-seen — they clear when an adaptation is resolved (approved *or*
+  declined); `activity` is only what has occurred (a pending proposal is not activity); and
+  day-based progress spans the **goal's own deadline**, so one Advance day can't falsely
+  finish it. Regression-covered by `scripts/verify_board.py` (gate 13).
 
 ## Contract touchpoints (what the cloud sends/receives)
 
-Receives from UI: `user_goal`, `understanding_response`, `approval`, `control`.
+Receives from UI: `user_goal`, `understanding_response`, `approval`, `control`,
+`board_get`, `goal_state_get`, `select_device`, `suggestion_action`.
 Receives from device: `capabilities`, `agent_event` (stream), `plan_ready`,
 `proposal`, `status`. Sends to UI: `understanding`, `present_plan` (adds `knew`,
-relays `demo_events`), `agent_event`, `proposal`, `status`. Sends to device:
+relays `demo_events`), `agent_event`, `proposal`, `status`, `board_snapshot`,
+`board_update`, `day_advanced`, `suggestions`. Sends to device:
 `dispatch` (the generic Task Contract), `approval`, `control`. See `CONTRACT.md` for
 exact shapes — it is authoritative and current (includes `understanding`,
 `trigger_event`, `demo_events`, `event_id`, `updated_plan`/`changed_ids`).

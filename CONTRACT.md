@@ -427,6 +427,15 @@ into a summary without asking anyone. The device is not involved.
 - `state` is the board's four chips. `waiting` covers *anything* waiting on a human or
   on the world (an open gate, an approval, a queued plan, a failed precheck) —
   deliberately: from the board, "someone needs to do something" is one idea.
+- `alerts.count` is what is **OUTSTANDING right now, not a running tally of everything
+  that ever needed attention** (v3.6.1). An adaptation raises an alert; approving it —
+  *or declining it* — clears that alert (leaving "adapting" is the test, not having
+  executed something). A tick that resolves one alert and raises another nets to the new
+  one, so the count tracks open items, matching the card's own "N alerts — tap to review".
+- `activity` is the log of things that have **actually occurred** — completed task
+  titles. A pending proposal is NOT activity (it is waiting on a person and belongs in
+  `next_step`); writing one here made the card print the same sentence as both done and
+  next (fixed v3.6.2).
 
 ### `goal_state_get` (ui → cloud)
 
