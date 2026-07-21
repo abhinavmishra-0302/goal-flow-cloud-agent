@@ -124,6 +124,14 @@ isn't exactly one device), and again whenever the connected set changes.
 }
 ```
 
+- The list is **online-only** — a device with no live agent is **omitted**, not sent with
+  `online: false`. A UI can bind (via `hello.device_id` or `select_device`) to a
+  `device_id` that has NO device connected; the cloud binds it to an (empty) session and
+  acks it, so goals then decline with `no_capabilities`. Therefore a UI **must treat "my
+  bound `device_id` is absent from this list" as "my device is offline"** and self-heal:
+  auto-rebind (`select_device`) when exactly one device is online, else show the picker
+  (v4.1 fix — chat-ui `8752f5f`, board-ui `ade4869`, bixby-ui `8e0dafc`).
+
 ### `select_device` (ui → cloud)
 
 Binds this UI socket to a device (the picker's answer). The cloud replies `hello_ack`
@@ -391,6 +399,16 @@ through unchanged when present.
 { "type": "approval", "goal_id": "...", "correlation_id": "...",
   "payload": { "decisions": [ { "proposal_id": "p1", "approved": true } ] } }
 ```
+
+- **`decisions` is the COMPLETE set** for the initial plan — every approval-required
+  proposal (`tier != "auto" && requires_approval`), approved OR declined, in ONE frame.
+  The device RESUMES the whole plan on the FIRST `approval` frame it receives (it lifts
+  its `awaiting_approval` interrupt and executes the approved side-effects, skipping the
+  declined/unlisted ones). A UI that instead sent one frame per proposal click would
+  therefore drop every later proposal and — because the cloud closes the create-phase
+  webview on the first `approval` (see `chat_ui_close`) — close it early. So the UI
+  MUST accumulate its per-proposal clicks and emit a single `approval` once all
+  approval-required proposals are decided (v4.1 fix, chat-ui `6b39ea8`).
 
 ### `proposal` (device → cloud → ui) — adaptation (generic)
 
