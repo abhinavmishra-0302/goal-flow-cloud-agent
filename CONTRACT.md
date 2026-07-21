@@ -209,7 +209,11 @@ dispatch — today, when the interpreter declines an out-of-scope goal.
   "message": "That's outside what I do. I'm your home goal assistant — I can help with <the device's advertised capabilities>. Try one of those and I'll get going." }
 ```
 
-`kind` is `"out_of_scope"` (declined by the interpreter) or `"declined"` (reserved).
+`kind` is `"out_of_scope"` (declined by the interpreter) or `"declined"` (v4.1,
+active). A `"declined"` notice is emitted when the create phase is **cancelled at the
+understanding gate** (`understanding_response { confirmed: false }`, or an aborted
+create flow) — sent ALONGSIDE `chat_ui_close { goal_id }` so the input (Bixby) surface
+can SPEAK the cancellation while the webview closes.
 
 ### `chat_ui_open` / `chat_ui_close` (cloud → ui, v4.1) — the create-phase bracket
 
