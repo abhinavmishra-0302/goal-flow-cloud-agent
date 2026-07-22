@@ -113,17 +113,29 @@ def setup_logging() -> None:
             handler.addFilter(CorrelationIdFilter())
 
 
-def log_frame(direction: str, role: str, frame: dict[str, Any]) -> None:
-    """One structured INFO line per frame: direction, role, type, ids.
+#: Types that recur many times per goal (streamed reasoning) — logged at DEBUG so the
+#: INFO stream stays a readable lifecycle timeline. agent_event carries the device's
+#: token-chunk thinking stream (dozens of frames per plan); it has a UI home (the chat-ui
+#: reasoning transcript) but does not belong in the default relay log.
+_HIGH_FREQUENCY_TYPES = frozenset({"agent_event"})
 
+
+def log_frame(direction: str, role: str, frame: dict[str, Any]) -> None:
+    """One structured line per relayed frame: direction, role, type, ids.
+
+    High-frequency passthrough (see ``_HIGH_FREQUENCY_TYPES``) drops to DEBUG; every
+    other frame is a discrete lifecycle/decision event and stays at INFO.
     """
     correlation_id_var.set(str(frame.get("correlation_id") or "-"))
     goal_id_var.set(str(frame.get("goal_id") or "-"))
-    logger.info(
+    frame_type = frame.get("type", "-")
+    level = logging.DEBUG if frame_type in _HIGH_FREQUENCY_TYPES else logging.INFO
+    logger.log(
+        level,
         "frame direction=%s role=%s type=%s",
         direction,
         role,
-        frame.get("type", "-"),
+        frame_type,
     )
     logger.debug("frame_body direction=%s role=%s body=%s", direction, role, frame)
 
@@ -285,6 +297,13 @@ class ConnectionRegistry:
         if websocket not in session.uis:
             session.uis.append(websocket)
         self._meta[websocket] = ("ui", device_id, surface)
+        logger.info(
+            "ui_bound device_id=%s surface=%s uis=%d device_online=%s",
+            device_id,
+            surface or "(broadcast)",
+            len(session.uis),
+            session.device is not None,
+        )
         if ack:
             await self._ack(websocket, "ui", device_id)
         # Every ui gets the current list, bound or not: it needs the paired device's
