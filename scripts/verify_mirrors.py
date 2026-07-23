@@ -38,6 +38,10 @@ DEVICE_EXEMPT = {
     "board_snapshot", "board_update", "board_get", "goal_state_get", "goal_accepted",
     "devices", "select_device", "user_goal", "understanding", "understanding_response",
     "present_plan", "notice",
+    # v4.1 create-phase bracket — cloud↔ui only. The webview lifecycle (Bixby opens
+    # the chat webview on open, closes it on close) is entirely upstream of the device;
+    # it neither sends nor receives either frame.
+    "chat_ui_open", "chat_ui_close",
     # The device SENDS `suggestions` (so it is NOT exempt from that), but a
     # `suggestion_action` is handled entirely cloud-side — an accept becomes a
     # user_goal the device sees as an ordinary dispatch. The device never sees the

@@ -1,9 +1,10 @@
-# GoalFlow CONTRACT v3 — generic goal-agent WebSocket protocol
+# GoalFlow CONTRACT v4.1 — generic goal-agent WebSocket protocol
 
 **This file is the CANONICAL copy of the shared protocol (the anchor — obey exactly).**
 The mirrors are `src/goalflow_cloud/models/contract.py` (Python),
-`goal-flow-agent-chat-ui/src/types/contract.ts` and
-`goal-flow-agent-board-ui/src/types/contract.ts` (TS), and
+`goal-flow-agent-chat-ui/src/types/contract.ts`,
+`goal-flow-agent-board-ui/src/types/contract.ts` and
+`goal-flow-agent-bixby-ui/src/types/contract.ts` (TS), and
 `goal-flow-device-agent-ubuntu/src/GoalFlow.Device/Contracts/*.cs` (C#).
 **All of them move in ONE pass** — there is no cross-repo atomic commit, so a
 half-mirrored change breaks at runtime rather than at build time. The chat UI's
@@ -25,6 +26,16 @@ contract version bump.
 | `goal_accepted` + `user_goal.client_ref` | with 2 goals in flight, the UI can't otherwise tell which `goal_id` is which (M6) |
 | `suggestions` (device → cloud → ui) | the device proposes goals unprompted from local state — the one goal-less frame it sends (M8) |
 | `suggestion_action` (ui → cloud) | accept a suggestion (→ a `user_goal`) or dismiss it (M8) |
+
+## v4.1 additions (all additive; v3 clients keep working)
+
+| addition | why |
+|---|---|
+| `hello.surface: "input"\|"chat"\|"board"` (ui only, optional) | Bixby is a native app that would otherwise be fed the whole board firehose just to discard it; absent ⇒ receives everything (every v3 client is an absent-surface client) |
+| input-surface delivery fork | the ONE exception to "the cloud does not route by surface" — see *Surface-aware delivery* below |
+| `chat_ui_open { goal_id }` (cloud → ui) | the create phase has begun: Bixby opens the chat webview; the chat UI HARD-RESETS to this goal (kills the stale-previous-goal repaint) |
+| `chat_ui_close { goal_id }` (cloud → ui) | the create phase is over: Bixby closes the webview; the board owns everything after |
+| create-phase replay to a freshly-bound `chat` surface | rehydrates the ephemeral webview on (re)open — kills the connect-vs-understanding race the same way `board_snapshot`-on-bind kills the board's |
 
 ## Transport
 
@@ -67,7 +78,7 @@ plus the free-form `scope` / `context` objects. The same protocol must serve any
 `hello` (client → cloud):
 
 ```json
-{ "type": "hello", "role": "ui", "device_id": "hub-a" }
+{ "type": "hello", "role": "ui", "device_id": "hub-a", "surface": "input" }
 ```
 
 ```json
@@ -80,6 +91,14 @@ plus the free-form `scope` / `context` objects. The same protocol must serve any
 - `device_name` (device only, optional) — human label for the UI's picker; defaults to
   a label that is UNIQUE per agent (it ends with a short slice of the device_id, so a
   picker never shows two identical entries).
+- `surface` (ui only, optional, v4.1) — `"input" | "chat" | "board"`: what this socket
+  is FOR, declared once at handshake and immutable for the socket's lifetime. Absent or
+  empty ⇒ the socket receives the full session broadcast, exactly like every v3 client
+  (which is what makes this additive). Only `"input"` changes delivery today — see
+  *Surface-aware delivery (v4.1)*. `"chat"` additionally opts in to the create-phase
+  replay on bind. Ignored on a `role:"device"` hello. The cloud stores it PER SOCKET
+  alongside `(role, device_id)` in its connection metadata — a session's `uis` list
+  stays flat; surface is a property of the socket, not of the session.
 
 `hello_ack` (cloud → client):
 
@@ -104,6 +123,14 @@ isn't exactly one device), and again whenever the connected set changes.
   ]
 }
 ```
+
+- The list is **online-only** — a device with no live agent is **omitted**, not sent with
+  `online: false`. A UI can bind (via `hello.device_id` or `select_device`) to a
+  `device_id` that has NO device connected; the cloud binds it to an (empty) session and
+  acks it, so goals then decline with `no_capabilities`. Therefore a UI **must treat "my
+  bound `device_id` is absent from this list" as "my device is offline"** and self-heal:
+  auto-rebind (`select_device`) when exactly one device is online, else show the picker
+  (v4.1 fix — chat-ui `8752f5f`, board-ui `ade4869`, bixby-ui `8e0dafc`).
 
 ### `select_device` (ui → cloud)
 
@@ -190,7 +217,69 @@ dispatch — today, when the interpreter declines an out-of-scope goal.
   "message": "That's outside what I do. I'm your home goal assistant — I can help with <the device's advertised capabilities>. Try one of those and I'll get going." }
 ```
 
-`kind` is `"out_of_scope"` (declined by the interpreter) or `"declined"` (reserved).
+`kind` is `"out_of_scope"` (declined by the interpreter) or `"declined"` (v4.1,
+active). A `"declined"` notice is emitted when the create phase is **cancelled at the
+understanding gate** (`understanding_response { confirmed: false }`, or an aborted
+create flow) — sent ALONGSIDE `chat_ui_close { goal_id }` so the input (Bixby) surface
+can SPEAK the cancellation while the webview closes.
+
+### `chat_ui_open` / `chat_ui_close` (cloud → ui, v4.1) — the create-phase bracket
+
+The chat UI is EPHEMERAL on the real device: Bixby (a native app) opens a webview
+hosting it when a goal's create phase begins and closes it when the create phase ends.
+These two frames are that bracket. The device never sees either.
+
+```json
+{ "type": "chat_ui_open",  "goal_id": "..." }
+{ "type": "chat_ui_close", "goal_id": "..." }
+```
+
+**`chat_ui_open`** is emitted the moment the cloud knows the goal WILL have a create
+phase: in `handle_user_goal`, after interpretation returns and the actionability gate
+passes — i.e. on every path that did NOT take the error / `notice out_of_scope` early
+exit — and strictly BEFORE the `understanding` frame for the same goal. (An accepted
+suggestion funnels through `user_goal`, so it brackets identically.) An out-of-scope
+goal emits `notice` and NO `chat_ui_open`: Bixby speaks the notice, no webview opens.
+
+It has a DUAL role, one per surface:
+
+- **`input` (Bixby):** open the webview (or ensure it is open) pointed at the chat UI.
+- **`chat` (the webview):** a **HARD RESET** keyed to `goal_id` — drop ALL state from
+  any prior goal, render the fresh "listening" stage for this `goal_id`, and from now
+  on ignore goal-scoped frames whose `goal_id` differs. The reset is IDEMPOTENT per
+  goal: a `chat_ui_open` for the goal the UI is already keyed to is a no-op (the
+  bind-time replay re-sends it, and resetting then would throw away the very state
+  the replay is about to restore).
+
+**`chat_ui_close`** is emitted when the create phase TERMINATES, on any of:
+
+1. the initial `approval` frame arrives for the create-phase goal (the normal path —
+   see below);
+2. `understanding_response { confirmed: false }` — the goal was cancelled at the gate;
+3. a terminal error `status` ends the create phase after `chat_ui_open` was sent
+   (e.g. the dispatch contract failed to build after confirmation).
+
+Bixby closes the webview **only if `goal_id` matches the goal it currently has open**;
+the chat UI returns to its idle "waiting" state. The board owns everything after.
+
+**Pairing invariant:** `chat_ui_close(g)` is emitted only if `chat_ui_open(g)` was,
+and only while `g` is still the session's current create-phase goal — with ONE
+exception: a `chat_ui_open` for a NEW goal **supersedes** the previous create phase
+*without* an intervening close. (Bixby's rule — close only on matching `goal_id`,
+open = ensure-open-and-retarget — makes the supersede a retarget instead of a
+close/reopen flicker.) Adaptation-time `approval` frames from the board never trigger
+a close: by then the goal is no longer the create-phase goal, so trigger (1) cannot
+match.
+
+**Why close on `approval` and not on execution-started:** (a) the webview should
+vanish at the user's final tap — snappiness is the point of the bracket; (b) there is
+no single "execution started" frame to hook: after approval the device may stream
+`agent_event phase: "executing"`, or defer everything (`deferred_precheck`), or be
+OFFLINE entirely (`send_to_device` returning false already produces a terminal
+status) — closing on approval is correct in every one of those futures, while waiting
+on the device leaves a dead webview open exactly when things go wrong; (c) the v3.1
+handoff is already defined as "approved on chat ⇒ the board is the primary surface" —
+this frame just makes that handoff physical.
 
 ### `dispatch` (cloud → device) — the GENERIC Task Contract
 
@@ -310,6 +399,16 @@ through unchanged when present.
 { "type": "approval", "goal_id": "...", "correlation_id": "...",
   "payload": { "decisions": [ { "proposal_id": "p1", "approved": true } ] } }
 ```
+
+- **`decisions` is the COMPLETE set** for the initial plan — every approval-required
+  proposal (`tier != "auto" && requires_approval`), approved OR declined, in ONE frame.
+  The device RESUMES the whole plan on the FIRST `approval` frame it receives (it lifts
+  its `awaiting_approval` interrupt and executes the approved side-effects, skipping the
+  declined/unlisted ones). A UI that instead sent one frame per proposal click would
+  therefore drop every later proposal and — because the cloud closes the create-phase
+  webview on the first `approval` (see `chat_ui_close`) — close it early. So the UI
+  MUST accumulate its per-proposal clicks and emit a single `approval` once all
+  approval-required proposals are decided (v4.1 fix, chat-ui `6b39ea8`).
 
 ### `proposal` (device → cloud → ui) — adaptation (generic)
 
@@ -490,9 +589,60 @@ stream on a per-goal detail page (`present_plan`, `agent_event`, `status`, `prop
 and it SENDS `control` (world-event / demo-clock commands) and `approval` (world-event
 adaptation decisions). The chat UI keeps goal CREATION — the understanding gate and the
 initial tiered approval; the board keeps everything after. Both are still just `role:ui`
-sockets to the hub, distinguished only by which frames each renders — the cloud does not
-route by surface. `goal_state_get` (above) is what refills the board's detail page for a
-goal it never saw start.
+sockets to the hub, distinguished only by which frames each renders. *"The cloud does
+not route by surface"* held absolutely through v3; as of v4.1 it holds for every
+surface EXCEPT `"input"`, which is forked at delivery (see *Surface-aware delivery*
+below) — `chat` and `board` stay on full broadcast, their split temporal, not
+type-based. `goal_state_get` (above) is what refills the board's detail page for a goal
+it never saw start.
+
+## Surface-aware delivery (v4.1)
+
+One fork, in ONE place. Every cloud→ui frame for a session goes through a single
+fan-out point (`ConnectionRegistry.send_to_uis`); v4.1 adds a per-surface **interest
+predicate** consulted there, in the send loop, per target socket — no per-call-site
+routing table, no new send paths. The same predicate gates the bind-time pushes
+(`capabilities` replay, `board_snapshot`, `suggestions`) in `_bind_ui`.
+
+| surface (from `hello`) | receives via session fan-out |
+|---|---|
+| *(absent / empty — every v3 client)* | **everything** (unchanged) |
+| `"chat"` | **everything** (unchanged — its client-side `INBOUND_TYPES` allowlist keeps doing the filtering) |
+| `"board"` | **everything** (unchanged — same) |
+| `"input"` | ONLY: `hello_ack`, `goal_accepted`, `chat_ui_open`, `chat_ui_close`, `notice` |
+
+Anything not in the `input` row is simply NOT DELIVERED to an input socket — no
+`agent_event`/`status`/board firehose for a native client that would only drop it.
+Handshake/discovery frames sent point-to-point to a specific socket (`hello_ack`,
+`devices`) are outside the fork and always delivered — an input surface still needs the
+device picker to bind. Forking is deliberately NOT extended to `chat`/`board`: their
+allowlists already work, the webview lifecycle already scopes the chat UI in time, and
+a server-side per-type table would reintroduce the "forked to nobody = silently
+dropped" failure mode this contract warns about at the top.
+
+**Create-phase replay cache.** The cloud keeps, per session, the CURRENT create-phase
+goal's state: `{ goal_id, understanding?, present_plan? }` — the exact frames it
+broadcast (the `present_plan` including `payload.knew`), captured as they are sent.
+Lifecycle:
+
+- **created** when `chat_ui_open` is emitted (the goal becomes the session's
+  create-phase goal); `understanding` is captured at emission; `present_plan` at
+  `plan_ready` handling — for the create-phase goal only;
+- **cleared** when `chat_ui_close` is emitted (any of its three triggers);
+- **replaced** wholesale by a superseding `chat_ui_open` for a new goal.
+
+On bind of a socket whose surface is `"chat"` (and only `"chat"` — a legacy
+absent-surface client keeps its exact v3 behaviour), after the existing bind-time
+pushes the cloud REPLAYS: `chat_ui_open { goal_id }`, then the cached `understanding`
+(if the plan hasn't arrived yet), then the cached `present_plan` (if it has). This
+mirrors how the board rehydrates via `board_snapshot` on bind, and it closes the race
+between the webview connecting and `understanding` being computed: connect early and
+the frames arrive by broadcast (the `chat_ui_open`-before-`understanding` ordering
+guarantees the reset lands first); connect late and the replay delivers the same
+sequence. Either way the webview paints the current goal — and ONLY the current goal,
+because the `chat_ui_open` reset discarded everything else. No cache (create phase
+over or never started) ⇒ no replay ⇒ the webview shows its idle state, and Bixby has
+already closed it anyway.
 
 ## Task-status lifecycle
 

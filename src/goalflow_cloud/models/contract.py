@@ -26,6 +26,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 Role = Literal["ui", "device"]
 
+#: UI socket surface (v4.1, ui-only, optional). Declared once at handshake and
+#: immutable for the socket's lifetime. Absent/empty ⇒ the socket receives the full
+#: session broadcast, exactly like every v3 client (which is what makes it additive).
+#: Only ``"input"`` changes delivery today (see the delivery fork in server.py);
+#: ``"chat"`` additionally opts in to the create-phase replay on bind. Kept lenient
+#: (a plain ``str``) rather than a strict Literal so an absent/empty value and any
+#: future surface name flow through without a validation drop.
+Surface = Literal["input", "chat", "board"]
+
 #: Proposal/action tier: reversibility x cost x risk.
 #: auto  = reversible, do without asking (still reported);
 #: light = cheap/low-risk, one-tap approval;
@@ -92,6 +101,10 @@ class Hello(_ContractModel):
     role: Role
     device_id: str = ""
     device_name: str = ""
+    #: v4.1, ui-only: "input" | "chat" | "board". Absent/empty ⇒ full broadcast
+    #: (a v3 client). Ignored on a role:"device" hello. Kept lenient (str, not a
+    #: Literal) so "" and unknown future surfaces never fail validation.
+    surface: str = ""
 
 
 class HelloAck(_ContractModel):
@@ -478,8 +491,43 @@ class Notice(_ContractModel):
 
     type: Literal["notice"] = "notice"
     goal_id: str
+    #: "out_of_scope" = declined by the interpreter's actionability gate;
+    #: "declined" (v4.1, active) = the create flow was cancelled (understanding
+    #: gate declined / aborted) and is emitted ALONGSIDE ``chat_ui_close`` so the
+    #: input (Bixby) surface can SPEAK the cancellation.
     kind: Literal["out_of_scope", "declined"] = "out_of_scope"
     message: str
+
+
+# ---------------------------------------------------------------------------
+# chat_ui_open / chat_ui_close (cloud -> ui, v4.1) — the create-phase bracket
+# ---------------------------------------------------------------------------
+
+
+class ChatUiOpen(_ContractModel):
+    """cloud -> ui: the create phase for ``goal_id`` has begun (v4.1).
+
+    Dual role, one per surface: ``input`` (Bixby) opens/ensures-open the chat
+    webview; ``chat`` (the webview) HARD-RESETS keyed to ``goal_id`` and thereafter
+    ignores goal-scoped frames with a different ``goal_id``. The device never sees
+    it. Emitted strictly BEFORE the goal's ``understanding`` frame.
+    """
+
+    type: Literal["chat_ui_open"] = "chat_ui_open"
+    goal_id: str
+
+
+class ChatUiClose(_ContractModel):
+    """cloud -> ui: the create phase for ``goal_id`` is over (v4.1).
+
+    Bixby closes the webview only if ``goal_id`` matches the goal it currently has
+    open; the board owns the goal after. Emitted on the initial approval, on a
+    declined understanding gate, and on a post-open terminal error. The device
+    never sees it.
+    """
+
+    type: Literal["chat_ui_close"] = "chat_ui_close"
+    goal_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +737,8 @@ ContractMessage = Annotated[
         Proposal,
         Status,
         Notice,
+        ChatUiOpen,
+        ChatUiClose,
         Control,
         DayAdvanced,
         BoardSnapshot,

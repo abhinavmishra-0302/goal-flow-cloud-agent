@@ -36,6 +36,8 @@ from goalflow_cloud.models.contract import (
     BoardGet,
     BoardSnapshot,
     BoardUpdate,
+    ChatUiClose,
+    ChatUiOpen,
     GoalAccepted,
     GoalStateGet,
     Capabilities,
@@ -111,19 +113,58 @@ def setup_logging() -> None:
             handler.addFilter(CorrelationIdFilter())
 
 
-def log_frame(direction: str, role: str, frame: dict[str, Any]) -> None:
-    """One structured INFO line per frame: direction, role, type, ids.
+#: Types that recur many times per goal (streamed reasoning) — logged at DEBUG so the
+#: INFO stream stays a readable lifecycle timeline. agent_event carries the device's
+#: token-chunk thinking stream (dozens of frames per plan); it has a UI home (the chat-ui
+#: reasoning transcript) but does not belong in the default relay log.
+_HIGH_FREQUENCY_TYPES = frozenset({"agent_event"})
 
+
+def log_frame(direction: str, role: str, frame: dict[str, Any]) -> None:
+    """One structured line per relayed frame: direction, role, type, ids.
+
+    High-frequency passthrough (see ``_HIGH_FREQUENCY_TYPES``) drops to DEBUG; every
+    other frame is a discrete lifecycle/decision event and stays at INFO.
     """
     correlation_id_var.set(str(frame.get("correlation_id") or "-"))
     goal_id_var.set(str(frame.get("goal_id") or "-"))
-    logger.info(
+    frame_type = frame.get("type", "-")
+    level = logging.DEBUG if frame_type in _HIGH_FREQUENCY_TYPES else logging.INFO
+    logger.log(
+        level,
         "frame direction=%s role=%s type=%s",
         direction,
         role,
-        frame.get("type", "-"),
+        frame_type,
     )
     logger.debug("frame_body direction=%s role=%s body=%s", direction, role, frame)
+
+
+# ---------------------------------------------------------------------------
+# Surface-aware delivery (v4.1) — the ONE delivery fork
+# ---------------------------------------------------------------------------
+
+#: What an ``input`` surface (Bixby, a native app) receives via the session fan-out.
+#: Everything else in the broadcast it would only parse and drop, so the cloud simply
+#: does not deliver it. Every OTHER surface (``chat``, ``board``, and absent/empty —
+#: every v3 client) stays on the full broadcast, its client-side allowlist doing the
+#: filtering. Handshake/discovery frames sent point-to-point (hello_ack, devices) are
+#: OUTSIDE this fork — an input surface still needs the picker to bind.
+INPUT_SURFACE_FRAMES = frozenset(
+    {"hello_ack", "goal_accepted", "chat_ui_open", "chat_ui_close", "notice"}
+)
+
+
+def wants(surface: str, frame_type: str | None) -> bool:
+    """Per-socket interest predicate for the session fan-out (v4.1).
+
+    The ONE exception to "the cloud does not route by surface": an ``input`` socket
+    receives only the five frames a native client acts on; every other surface
+    (``chat``/``board``/absent) receives everything, unchanged from v3.
+    """
+    if surface == "input":
+        return frame_type in INPUT_SURFACE_FRAMES
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +185,15 @@ class Session:
     device: WebSocket | None = None
     uis: list[WebSocket] = field(default_factory=list)
     capabilities: Capabilities | None = None
+    #: v4.1 create-phase replay cache — the CURRENT create-phase goal's state,
+    #: ``{"goal_id": str, "understanding": dict|None, "present_plan": dict|None}``
+    #: (the exact frames as broadcast, present_plan INCLUDING payload.knew). Created
+    #: at ``chat_ui_open``; understanding/present_plan captured as they are sent;
+    #: cleared at ``chat_ui_close``; replaced wholesale by a superseding open. Keyed
+    #: by SESSION (not goal) — it answers "which goal is the webview about, right
+    #: now" — so it is a tiny structure separate from the board's per-goal cache.
+    #: Replayed to a freshly-bound ``chat`` socket in ``_bind_ui``.
+    create_phase: dict[str, Any] | None = None
 
 
 class ConnectionRegistry:
@@ -160,14 +210,21 @@ class ConnectionRegistry:
     def __init__(self) -> None:
         self._sessions: dict[str, Session] = {}
         self._unbound_uis: list[WebSocket] = []
-        #: reverse lookup for routing + teardown: ws -> (role, device_id | "").
-        self._meta: dict[WebSocket, tuple[Role, str]] = {}
+        #: reverse lookup for routing + teardown: ws -> (role, device_id | "", surface).
+        #: ``surface`` (v4.1) is per-SOCKET state — a device is always "", a ui carries
+        #: its hello.surface — so it lives here rather than on the flat ``Session.uis``.
+        self._meta: dict[WebSocket, tuple[Role, str, str]] = {}
 
     # --- lookup ---
     def session_of(self, websocket: WebSocket) -> str:
         """The device_id a socket is bound to ("" if an unbound ui)."""
         meta = self._meta.get(websocket)
         return meta[1] if meta else ""
+
+    def surface_of(self, websocket: WebSocket) -> str:
+        """This socket's declared surface ("" = full broadcast / a v3 client)."""
+        meta = self._meta.get(websocket)
+        return meta[2] if meta else ""
 
     def _session(self, device_id: str) -> Session:
         return self._sessions.setdefault(device_id, Session(device_id=device_id))
@@ -190,24 +247,26 @@ class ConnectionRegistry:
             except Exception:
                 logger.debug("old_device_close_failed", exc_info=True)
         session.device = websocket
-        self._meta[websocket] = ("device", device_id)
+        self._meta[websocket] = ("device", device_id, "")
         await self._ack(websocket, "device", device_id)
         await self.broadcast_devices()
 
-    async def register_ui(self, websocket: WebSocket, device_id: str) -> None:
+    async def register_ui(self, websocket: WebSocket, device_id: str, surface: str = "") -> None:
         if device_id:
-            await self._bind_ui(websocket, device_id, ack=True)
+            await self._bind_ui(websocket, device_id, ack=True, surface=surface)
             return
         # No device_id: auto-bind when there's exactly ONE device (the common
         # single-home / zero-config case works on any UI, no picker needed).
         online = [s for s in self._sessions.values() if s.device is not None]
         if len(online) == 1:
-            await self._bind_ui(websocket, online[0].device_id, ack=True)
+            await self._bind_ui(websocket, online[0].device_id, ack=True, surface=surface)
             return
         # 0 or 2+ devices: hold unbound and offer the list for discovery/picker.
+        # Surface is stored NOW (immutable for the socket's life) so a later
+        # select_device rebind carries it without the hello being re-read.
         if websocket not in self._unbound_uis:
             self._unbound_uis.append(websocket)
-        self._meta[websocket] = ("ui", "")
+        self._meta[websocket] = ("ui", "", surface)
         await self._ack(websocket, "ui", "")
         await self.send_devices(websocket)
 
@@ -218,7 +277,17 @@ class ConnectionRegistry:
             self._unbound_uis.remove(websocket)
         await self._bind_ui(websocket, device_id, ack=True)
 
-    async def _bind_ui(self, websocket: WebSocket, device_id: str, ack: bool) -> None:
+    async def _bind_ui(
+        self, websocket: WebSocket, device_id: str, ack: bool, surface: str | None = None
+    ) -> None:
+        # Surface is immutable for the socket's life: a rebind (select_device) keeps
+        # whatever was captured at the handshake, so resolve it from _meta when the
+        # caller didn't pass one. _leave_session reads _meta without clearing it, so
+        # this snapshot is still valid below.
+        existing = self._meta.get(websocket)
+        if surface is None:
+            surface = existing[2] if existing else ""
+
         # Re-binding must MOVE the socket, not add it to a second session: leaving it in
         # the old session's ui list would deliver BOTH homes' frames to it — the exact
         # cross-session leak this registry exists to prevent.
@@ -227,13 +296,24 @@ class ConnectionRegistry:
         session = self._session(device_id)
         if websocket not in session.uis:
             session.uis.append(websocket)
-        self._meta[websocket] = ("ui", device_id)
+        self._meta[websocket] = ("ui", device_id, surface)
+        logger.info(
+            "ui_bound device_id=%s surface=%s uis=%d device_online=%s",
+            device_id,
+            surface or "(broadcast)",
+            len(session.uis),
+            session.device is not None,
+        )
         if ack:
             await self._ack(websocket, "ui", device_id)
         # Every ui gets the current list, bound or not: it needs the paired device's
-        # NAME to display, and the list to offer a "change device" affordance.
+        # NAME to display, and the list to offer a "change device" affordance. This is
+        # point-to-point discovery — OUTSIDE the surface fork, so an input surface can
+        # still bind via the picker.
         await self.send_devices(websocket)
-        if session.capabilities is not None:
+        # The bind-time pushes are gated by the SAME interest predicate as the fan-out:
+        # an input surface gets none of the capabilities/board/suggestions firehose.
+        if session.capabilities is not None and wants(surface, "capabilities"):
             caps = session.capabilities.model_dump(mode="json")
             log_frame("out", "ui", caps)
             try:
@@ -242,7 +322,15 @@ class ConnectionRegistry:
                 logger.debug("caps_replay_failed", exc_info=True)
         # First paint for a board: the session's goals, unprompted. A board that had
         # to ASK would render empty for a beat on every reload.
-        await self._replay_board(websocket, device_id)
+        if wants(surface, "board_snapshot"):
+            await self._replay_board(websocket, device_id)
+        # v4.1: rehydrate a freshly-bound chat webview with the CURRENT create-phase
+        # goal — chat_ui_open (the reset), then the cached understanding (only while no
+        # plan yet) or the cached present_plan. Mirrors board_snapshot-on-bind and kills
+        # the connect-vs-understanding race. Chat surface ONLY: an absent-surface (v3)
+        # client keeps byte-for-byte v3 behaviour.
+        if surface == "chat" and session.create_phase is not None:
+            await self._replay_create_phase(websocket, session.create_phase)
 
     def _leave_session(self, websocket: WebSocket, keep: str = "") -> None:
         """Remove a ui socket from the session it currently belongs to (if any other
@@ -250,7 +338,7 @@ class ConnectionRegistry:
         previous = self._meta.get(websocket)
         if previous is None:
             return
-        _, previous_id = previous
+        _, previous_id, _ = previous
         if not previous_id or previous_id == keep:
             return
         session = self._sessions.get(previous_id)
@@ -273,7 +361,7 @@ class ConnectionRegistry:
             self._unbound_uis.remove(websocket)
         if meta is None:
             return
-        role, device_id = meta
+        role, device_id, _ = meta
         session = self._sessions.get(device_id)
         if session is None:
             return
@@ -316,7 +404,15 @@ class ConnectionRegistry:
         if not targets:
             logger.warning("send_drop role=ui device_id=%s reason=no_ui type=%s", device_id, frame.get("type"))
             return
+        # v4.1: the ONE delivery fork. Consult the interest predicate per target
+        # socket, in the send loop — no per-call-site routing table, no new send
+        # paths. Every surface but "input" takes everything (unchanged from v3).
+        frame_type = frame.get("type")
         for websocket in targets:
+            meta = self._meta.get(websocket)
+            surface = meta[2] if meta else ""
+            if not wants(surface, frame_type):
+                continue
             try:
                 await websocket.send_json(frame)
             except Exception:
@@ -341,6 +437,73 @@ class ConnectionRegistry:
                 await websocket.send_json(frame)
         except Exception:
             logger.debug("board_replay_failed", exc_info=True)
+
+    async def _replay_create_phase(self, websocket: WebSocket, create_phase: dict[str, Any]) -> None:
+        """Rehydrate one freshly-bound ``chat`` socket with the current create phase.
+
+        chat_ui_open (the reset), then the cached understanding (only while no plan
+        yet), then the cached present_plan. Point-to-point, like _replay_board.
+        """
+        goal_id = create_phase.get("goal_id")
+        understanding = create_phase.get("understanding")
+        present_plan = create_phase.get("present_plan")
+        try:
+            open_frame = ChatUiOpen(goal_id=goal_id).model_dump(mode="json")
+            log_frame("out", "ui", open_frame)
+            await websocket.send_json(open_frame)
+            if present_plan is None and understanding is not None:
+                log_frame("out", "ui", understanding)
+                await websocket.send_json(understanding)
+            if present_plan is not None:
+                log_frame("out", "ui", present_plan)
+                await websocket.send_json(present_plan)
+        except Exception:
+            logger.debug("create_phase_replay_failed", exc_info=True)
+
+    # --- create-phase replay cache (v4.1) ---
+    def open_create_phase(self, device_id: str, goal_id: str) -> None:
+        """A goal became the session's create-phase goal — create (or REPLACE
+        wholesale, if a previous phase is still open) the replay cache."""
+        self._session(device_id).create_phase = {
+            "goal_id": goal_id,
+            "understanding": None,
+            "present_plan": None,
+        }
+
+    def create_phase_goal(self, device_id: str) -> str | None:
+        """The session's current create-phase goal_id (None = no phase open).
+
+        The guard for every ``chat_ui_close``: a close fires only while its goal is
+        still this — which is what stops board adaptation ``approval`` frames (whose
+        goal is no longer the create-phase goal) from retriggering a close."""
+        session = self._sessions.get(device_id)
+        cp = session.create_phase if session else None
+        return cp.get("goal_id") if cp else None
+
+    def capture_understanding(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> None:
+        """Cache the understanding frame as broadcast (create-phase goal only)."""
+        session = self._sessions.get(device_id)
+        cp = session.create_phase if session else None
+        if cp and cp.get("goal_id") == goal_id:
+            cp["understanding"] = frame
+
+    def capture_present_plan(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> None:
+        """Cache the present_plan frame as broadcast (create-phase goal only)."""
+        session = self._sessions.get(device_id)
+        cp = session.create_phase if session else None
+        if cp and cp.get("goal_id") == goal_id:
+            cp["present_plan"] = frame
+
+    def clear_create_phase(self, device_id: str, goal_id: str) -> bool:
+        """Clear the cache IFF ``goal_id`` is still the create-phase goal.
+
+        Returns whether it matched — the caller emits ``chat_ui_close`` only then."""
+        session = self._sessions.get(device_id)
+        cp = session.create_phase if session else None
+        if cp and cp.get("goal_id") == goal_id:
+            session.create_phase = None
+            return True
+        return False
 
     def set_capabilities(self, device_id: str, capabilities: Capabilities) -> None:
         self._session(device_id).capabilities = capabilities
@@ -418,7 +581,8 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             await registry.register_device(websocket, hello.device_id or "default", hello.device_name)
         else:
             # A ui may arrive bound (?device=<id>) or unbound (await discovery).
-            await registry.register_ui(websocket, hello.device_id)
+            # hello.surface (v4.1) is captured here and immutable for the socket's life.
+            await registry.register_ui(websocket, hello.device_id, hello.surface)
 
         while True:
             frame = await websocket.receive_json()
@@ -539,6 +703,28 @@ async def push_board(device_id: str, summary: Any | None) -> None:
     frame = BoardUpdate(board_seq=board.seq(device_id), goal=summary).model_dump(mode="json")
     log_frame("out", "ui", frame)
     await registry.send_to_uis(device_id, frame)
+
+
+async def emit_chat_ui_open(device_id: str, goal_id: str) -> None:
+    """Open the create-phase bracket (v4.1): create/replace the replay cache and
+    broadcast ``chat_ui_open``. A superseding open for a new goal replaces the cache
+    wholesale (no intervening close — Bixby retargets rather than close/reopen).
+
+    Ordering guarantee: callers invoke this BEFORE the goal's ``understanding``, so
+    the reset lands first on the wire (and the bind-time replay re-sends it in order).
+    """
+    registry.open_create_phase(device_id, goal_id)
+    await registry.send_to_uis(device_id, ChatUiOpen(goal_id=goal_id).model_dump(mode="json"))
+
+
+async def emit_chat_ui_close(device_id: str, goal_id: str) -> None:
+    """Close the create-phase bracket (v4.1), GUARDED: fires only while ``goal_id``
+    is still the session's current create-phase goal (the replay-cache key). That
+    guard is what stops board adaptation ``approval`` frames — whose goal is no longer
+    the create-phase goal — from retriggering a close. Clears the cache when it fires.
+    """
+    if registry.clear_create_phase(device_id, goal_id):
+        await registry.send_to_uis(device_id, ChatUiClose(goal_id=goal_id).model_dump(mode="json"))
 
 
 async def send_board_snapshot(device_id: str) -> None:
@@ -721,6 +907,13 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
         await registry.send_to_uis(device_id, notice.model_dump(mode="json"))
         return
 
+    # The goal WILL have a create phase (it cleared the error + out-of-scope early
+    # exits). Open the bracket NOW, strictly before the understanding broadcast and
+    # before the direct-dispatch fallback — the input surface opens/retargets its
+    # webview, a chat webview hard-resets to this goal. (An accepted suggestion
+    # funnels through here too, so it brackets identically.)
+    await emit_chat_ui_open(device_id, goal_id)
+
     interrupt_payload = state.get("_interrupt")
     if isinstance(interrupt_payload, dict) and interrupt_payload.get("kind") == "understanding_confirmation":
         understanding = interrupt_payload.get("understanding") or {}
@@ -736,7 +929,11 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
             ),
         )
         logger.info("task_status status=grounding gate=understanding")
-        await registry.send_to_uis(device_id, frame.model_dump(mode="json", exclude_none=True))
+        understanding_frame = frame.model_dump(mode="json", exclude_none=True)
+        await registry.send_to_uis(device_id, understanding_frame)
+        # Cache the understanding exactly as broadcast, for replay to a chat webview
+        # that binds mid-create.
+        registry.capture_understanding(device_id, goal_id, understanding_frame)
         # The board gets a card NOW. This gate can hold a goal indefinitely — it is
         # waiting on a person — so a board that only learns about goals at dispatch
         # would show nothing at all for the whole time it matters most.
@@ -753,6 +950,10 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
             await send_device_offline(device_id, goal_id, state.get("correlation_id"))
         return
 
+    # Degenerate terminal: neither an interrupt nor a contract, yet the bracket is
+    # open. Close it (guarded) so the webview cannot dangle — the same reason the
+    # post-confirmation terminal-error paths close below.
+    await emit_chat_ui_close(device_id, goal_id)
     await registry.send_to_uis(device_id,
         {
             "type": "status",
@@ -782,6 +983,19 @@ async def handle_understanding_response(device_id: str, response: UnderstandingR
             {"confirmed": confirmed},
         )
     if not confirmed:
+        # Create phase cancelled at the gate. Close the bracket (guarded) and, per
+        # user decision Q3, ALSO speak a declined notice so the input (Bixby) surface
+        # can confirm the cancellation aloud — the input surface never sees the
+        # status/board frames below.
+        await emit_chat_ui_close(device_id, response.goal_id)
+        await registry.send_to_uis(
+            device_id,
+            Notice(
+                goal_id=response.goal_id,
+                kind="declined",
+                message="Okay, I've cancelled that. Just say the word when you want to try again.",
+            ).model_dump(mode="json"),
+        )
         await registry.send_to_uis(device_id,
             {
                 "type": "status",
@@ -806,6 +1020,9 @@ async def handle_understanding_response(device_id: str, response: UnderstandingR
         return
 
     if state.get("error"):
+        # Post-open terminal error (the goal confirmed, then the graph failed). Close
+        # the bracket (guarded) so the webview doesn't dangle.
+        await emit_chat_ui_close(device_id, response.goal_id)
         await registry.send_to_uis(device_id,
             {
                 "type": "status",
@@ -819,6 +1036,8 @@ async def handle_understanding_response(device_id: str, response: UnderstandingR
 
     frame = state.get("contract")
     if not frame:
+        # Post-open terminal error: confirmed, but no dispatch contract built. Close.
+        await emit_chat_ui_close(device_id, response.goal_id)
         await registry.send_to_uis(device_id,
             {
                 "type": "status",
@@ -851,6 +1070,11 @@ async def handle_approval(device_id: str, approval: Approval) -> None:
     async with goal_lock(approval.goal_id):
         await asyncio.to_thread(graph_nodes.resume_goal, graph, approval.goal_id, decisions)
     await registry.send_to_device(device_id, approval.model_dump(mode="json"))
+    # v4.1: the initial approval ends the create phase — the user's final tap, the
+    # moment the board becomes the primary surface. Close the webview bracket. GUARDED
+    # on "still the create-phase goal", so a board adaptation approval (whose goal is
+    # no longer the create-phase goal) never retriggers a close.
+    await emit_chat_ui_close(device_id, approval.goal_id)
 
 
 # --- device -> cloud -> ui ---------------------------------------------------
@@ -915,7 +1139,12 @@ async def handle_plan_ready(device_id: str, plan_ready: PlanReady) -> None:
         task_status=plan_ready.task_status,
         payload=payload,
     )
-    await registry.send_to_uis(device_id, present.model_dump(mode="json"))
+    present_frame = present.model_dump(mode="json")
+    await registry.send_to_uis(device_id, present_frame)
+    # Cache the present_plan exactly as broadcast (INCLUDING payload.knew) for replay
+    # to a chat webview that binds mid-create — no-op unless this is the create-phase
+    # goal (an adaptation replan for an already-approved goal isn't cached).
+    registry.capture_present_plan(device_id, plan_ready.goal_id, present_frame)
 
     approval_frame = state.get("approval_frame")
     if approval_frame:
