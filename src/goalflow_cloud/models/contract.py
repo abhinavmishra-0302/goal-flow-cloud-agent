@@ -72,6 +72,10 @@ AgentEventKind = Literal[
     "plan_progress",
     #: v3: the device's task ledger moved — the board's progress/next-step/pending.
     "task_update",
+    #: v5: which HARNESS ENGINE is at work (precheck / capability_manager / grounding /
+    #: planner / safety / task_manager / approval / monitor_adapt). Drives the "harness
+    #: pipeline" the UI lights up engine-by-engine. Relayed passthrough like every kind.
+    "harness",
 ]
 
 

@@ -313,7 +313,7 @@ this frame just makes that handoff physical.
 
 ```json
 { "type": "agent_event", "goal_id": "...", "correlation_id": "...", "seq": 1,
-  "event": "phase" | "thinking" | "tool_call" | "tool_result" | "plan_progress" | "task_update",
+  "event": "phase" | "thinking" | "tool_call" | "tool_result" | "plan_progress" | "task_update" | "harness",
   "payload": { } }
 ```
 
@@ -332,6 +332,7 @@ Payload shapes by `event`:
 | `tool_result`   | `{ "module": "...", "function": "...", "summary": "..." }`|
 | `plan_progress` | `{ "item": { } }`                                         |
 | `task_update`   | `{ "task_id": "t2", "title": "find recipes", "state": "monitoring", "depends_on": ["t1"], "progress_pct": 43, "pending_tasks": 4, "next_step": "build the shopping list", "retry_count": 0, "failure_reason": null }` |
+| `harness`       | `{ "module": "safety", "status": "block", "note": "blocks \"peanut sauce\"", "verdict": "1 blocked", "grade": "A1" }` |
 
 **`task_update` (v3)** — the device emits one every time a task changes state. The goal's
 task DAG lives on the DEVICE (only it can ground a decomposition), so this is how the
@@ -345,6 +346,20 @@ DERIVED from task state, never from the clock.
 created | ready | planning | awaiting_approval | executing
 monitoring | adapting | paused | retrying | completed | failed
 ```
+
+**`harness` (v5)** — names the specific HARNESS ENGINE at work, where `phase` is coarse.
+It is what the UI renders as the "harness pipeline" lighting up engine-by-engine — the
+whole point of v5 is that the harness (the star of the system) is finally *visible*.
+
+- `module` ∈ `precheck | capability_manager | grounding | planner | safety | task_manager | approval | monitor_adapt`
+- `status` ∈ `enter | active | pass | block | done | skip` — `active` lights the engine up
+  ("now X is working"), `pass`/`done` resolve it green, `block` resolves it red, `skip` greys it.
+- `note` is the engine's live one-line sub-text; `verdict` a short badge ("12 tools", "ready",
+  "3 steps"); `grade` the safety grade (A0/A1/A2/AX) on `safety` beats.
+
+Additive, like `phase`: an unknown `module`/`status` is ignored, never fatal. Under **presenter
+mode** the device holds each `active` beat for `HARNESS_DWELL_MS` so the pipeline is watchable on
+stage; with the dwell off (default) the beats stream at real, honest speed.
 
 These were unlisted until v3-M6, and the drift that followed is the reason they are
 written down now: the device serialised its enum with `ToString().ToLowerInvariant()`
