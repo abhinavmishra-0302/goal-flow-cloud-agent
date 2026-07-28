@@ -268,9 +268,14 @@ class AgentEvent(_ContractModel):
       thinking:      {"text": "..."}
       tool_call:     {"module": "...", "function": "...", "args": {...}}
       tool_result:   {"module": "...", "function": "...", "summary": "..."}
-      plan_progress: {"item": {...}}
+      plan_progress: {"item": {...}, "total": 7}   # total optional (v5.1)
       task_update:   {"task_id", "title", "state", "depends_on", "progress_pct",
                       "pending_tasks", "next_step", "retry_count", "failure_reason"}
+
+    ``plan_progress.total`` (v5.1, optional) is the finished plan's item count. The
+    device emits every item in one loop after a single non-streaming compose call, so
+    without it a UI cannot know how many rows are still coming and cannot reserve them.
+    Absent on pre-v5.1 devices — unknown, not zero.
 
     ``task_update`` (v3) is how the cloud learns a goal's shape and progress: the task
     DAG lives on the DEVICE (only it can ground a decomposition), so Agent Board's

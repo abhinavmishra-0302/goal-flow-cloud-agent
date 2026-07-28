@@ -330,9 +330,16 @@ Payload shapes by `event`:
 | `thinking`      | `{ "text": "..." }`                                       |
 | `tool_call`     | `{ "module": "...", "function": "...", "args": { } }`     |
 | `tool_result`   | `{ "module": "...", "function": "...", "summary": "..." }`|
-| `plan_progress` | `{ "item": { } }`                                         |
+| `plan_progress` | `{ "item": { }, "total": 7 }`                             |
 | `task_update`   | `{ "task_id": "t2", "title": "find recipes", "state": "monitoring", "depends_on": ["t1"], "progress_pct": 43, "pending_tasks": 4, "next_step": "build the shopping list", "retry_count": 0, "failure_reason": null }` |
 | `harness`       | `{ "module": "safety", "status": "block", "note": "blocks \"peanut sauce\"", "verdict": "1 blocked", "grade": "A1" }` |
+
+**`plan_progress.total`** (v5.1, optional) — how many items the finished plan has. The
+device composes a plan in ONE non-streaming call and then emits every item in a single
+loop, so all N frames land together and a UI cannot tell how many are still coming. With
+`total` a surface can reserve exactly N rows before filling any of them, for a goal of any
+shape — seven dinners, eleven vacation steps — instead of guessing a horizon. Omitted by
+pre-v5.1 devices; a consumer MUST treat it as unknown, not as zero.
 
 **`task_update` (v3)** — the device emits one every time a task changes state. The goal's
 task DAG lives on the DEVICE (only it can ground a decomposition), so this is how the
