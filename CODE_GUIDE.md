@@ -18,6 +18,7 @@ scripts/run_graph_demo.py         # run the graph on any goal text, print the co
 scripts/verify_board.py           # gate 13: the board fold's numbers are derived and add up
 scripts/verify_mirrors.py         # gate 14: the contract mirrors have not drifted
 scripts/verify_constraints.py     # gate 15: constraints resolve per goal; the enforced set is never narrowed
+scripts/verify_capture.py         # gate 16: a household rule is captured only when the user says yes
 data/memory/family_profile.json   # household constraint store (sourced, scoped, expiring)
 src/goalflow_cloud/
   config.py                       # Settings dataclass from env (OPENROUTER_*, WS_*, LOG_LEVEL)
@@ -210,6 +211,19 @@ world state and never sources policy.
   fallback when it fails or picks nothing. Only soft goes near the model.
 - **`applied`** — provenance rows (id / label / source / why) that ride into the
   understanding card as `payload.constraints`.
+
+**v6-M4 — capture from chat.** `detect_constraints` (a node between `interpret_goal`
+and the router) spots household rules the user STATED and PROPOSES them; nothing is
+written until the answer names their ids in `understanding_response.accepted_constraint_ids`.
+`memory.store.append_constraints` is the single write path and enforces two rules the
+caller cannot skip: captures may only **tighten** (a chat message may lower a cap, never
+raise one) and they only ever **append**. A message that is purely a statement
+("we've gone vegan") is un-actionable by design and routes to `capture_gate`, which
+rides the existing understanding wire with `capture_only: true` — no board card, and a
+`notice` of kind `captured` at the end. A rule accepted alongside a goal is re-resolved
+into THAT goal's dispatch, and a goal-scoped rule gets the goal's horizon as its expiry
+so "keep the party under $150" cannot quietly cap every birthday after it.
+Gate: `scripts/verify_capture.py` (gate 16).
 
 `build_contract` copies the resolved `hard` block into `dispatch.constraints.hard` as
 data; the device's deterministic Safety filter enforces exactly that block and nothing

@@ -192,11 +192,20 @@ row per applied constraint, with `source` ∈ `account | derived | chat` and `wh
 saying whether it was enforced always, picked for this domain, or captured. `knew` is
 unchanged, so a UI that ignores `constraints` keeps working.
 
+**v6-M4 — capture (additive).** When the message STATES a household rule, the payload
+also carries `proposed_constraints` — `[{id, kind, value, enforcement, label, quote,
+expires_on}]` — and the response answers with `accepted_constraint_ids`. Only the ids
+sent back are ever written: the model proposes, the user disposes, and a confirmed
+GOAL never implies a confirmed RULE. When the message is *only* a statement
+("we've gone vegan"), `capture_only: true` says there is no plan coming and the gate
+is asking about the rules alone; confirming it ends with a `notice` of kind
+`captured`, and no board card is ever created.
+
 ### `understanding_response` (ui → cloud)
 
 ```json
 { "type": "understanding_response", "goal_id": "...",
-  "payload": { "confirmed": true } }
+  "payload": { "confirmed": true, "accepted_constraint_ids": ["proposed-1"] } }
 ```
 
 If `confirmed` is `true`, the graph resumes to `dispatch`; if `false`, it ends
