@@ -299,7 +299,8 @@ this frame just makes that handoff physical.
   "constraints": {
     "hard": { "allergens": [], "medical": [], "dietary": [],
               "budget_cap": null, "quiet_hours": null,
-              "peak_hours": null, "away_window": null },
+              "peak_hours": null, "away_window": null,
+              "budget_envelope": null },
     "soft": { }
   },
   "scope": { },
@@ -317,6 +318,14 @@ this frame just makes that handoff physical.
   where a `meal_plan` goal carries the weekly grocery cap. `peak_hours` (peak
   electricity tariff, HH:mm) and `away_window` (the house is empty, ISO **dates**) are
   new in v6; enforcement of them lands with the device rules in v6-M2.
+- **v6-M3 — `budget_envelope`** (`{"cap": 600.0, "period": "monthly"}`) is the shared
+  pool EVERY goal draws from. Per-goal caps alone cannot stop two goals spending the
+  same money: a $200 party and a $120 grocery week each fit their own ceiling and
+  together blow a month. The **device** resolves this goal's effective ceiling as
+  `min(budget_cap, cap − spent)` when it arms the policy, and again on approval and
+  each day tick — the cap is policy from the account, the spend is world state the
+  device owns. The rules themselves still read `constraints.hard` and nothing else;
+  the arithmetic happens in a resolution step BEFORE arming.
 - `constraints.soft` holds preferences: they bias planning, never gate it.
 - `scope` is a **domain-flexible** object (whatever the domain needs — no fixed shape).
 - `time_window` is **RELATIVE to real today** (or the control-set clock) — never a

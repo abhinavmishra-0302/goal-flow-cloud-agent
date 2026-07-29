@@ -84,7 +84,9 @@ def main() -> int:
               f"quiet hours are household-wide, missing on {domain}")
 
     # 4. The v5 contract is preserved where it was already right: a meal goal's hard
-    #    block must be exactly what v5 dispatched, or this refactor moved the demo.
+    #    block must be exactly what v5 dispatched — plus the household envelope, which
+    #    every goal draws from and which the DEVICE (not this resolver) narrows the
+    #    goal's own cap against.
     check(
         resolved["meal_plan"]["hard"] == {
             "allergens": ["peanuts"],
@@ -92,9 +94,16 @@ def main() -> int:
             "dietary": ["no_pork"],
             "budget_cap": 120.0,
             "quiet_hours": {"start": "21:30", "end": "07:00"},
+            "budget_envelope": {"cap": 600.0, "period": "monthly"},
         },
-        f"meal_plan hard block drifted from v5: {resolved['meal_plan']['hard']}",
+        f"meal_plan hard block drifted: {resolved['meal_plan']['hard']}",
     )
+
+    # 4b. The envelope is household-wide: EVERY goal must carry it, or two goals can
+    #     spend the same money while each stays inside its own cap.
+    for domain, r in list(resolved.items()) + [("plant_care", coined)]:
+        check(r["hard"].get("budget_envelope") == {"cap": 600.0, "period": "monthly"},
+              f"{domain} must carry the household envelope, got {r['hard'].get('budget_envelope')}")
 
     # 5. Soft bias is domain-shaped — the visible half of the fix.
     veg_prefs = resolved["meal_plan"]["soft"].get("prefer", [])
