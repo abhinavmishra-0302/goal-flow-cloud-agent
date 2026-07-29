@@ -65,6 +65,9 @@ contract lives HERE**: `CONTRACT.md` (mirrored as `types/contract.ts` in the UI 
   domain-picked, soft picked by a small LLM relevance pass with tag matching as the
   fallback. `constraints.hard` is built by code and the device's safety gate reads it
   and nothing else. Gate: `scripts/verify_constraints.py`.
+  `GOALFLOW_PROFILE_PATH` points the store at a scratch copy (the cloud's `--data`);
+  an absent path is seeded from the repo's copy on first use. Without it, a demo's
+  captures write into the committed seed.
   **v6-M4:** `detect_constraints` proposes rules the user states in chat; only the ids
   returned in `understanding_response.accepted_constraint_ids` are written, via
   `append_constraints` (tighten-only, append-only). A pure statement routes to

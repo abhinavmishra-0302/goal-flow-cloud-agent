@@ -40,9 +40,12 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
+
+from goalflow_cloud.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -67,14 +70,35 @@ HARD_SCALAR_KINDS: tuple[str, ...] = (
 CONTEXT_KIND = "context"
 
 
-def load_family_profile(path: Path = DEFAULT_PROFILE_PATH) -> dict[str, Any]:
-    """Read and return the constraint store JSON (resolved from the repo root)."""
-    profile_path = path
-    if not profile_path.is_absolute():
-        repo_root = Path(__file__).resolve().parents[3]
-        profile_path = repo_root / profile_path
+def profile_path(path: Path | None = None) -> Path:
+    """Resolve which store file to use — the caller's, the configured one, or the seed.
 
-    with profile_path.open(encoding="utf-8") as profile_file:
+    ``GOALFLOW_PROFILE_PATH`` is the device's ``--data`` for household policy: point it
+    at a scratch copy and a demo's captures stop dirtying the repo's seed. A configured
+    path that does not exist yet is SEEDED from the repo's copy on first use, so a
+    demo is one env var rather than a setup step someone forgets.
+    """
+    resolved = path
+    if resolved is None:
+        configured = get_settings().profile_path.strip()
+        resolved = Path(configured) if configured else DEFAULT_PROFILE_PATH
+
+    if not resolved.is_absolute():
+        resolved = Path(__file__).resolve().parents[3] / resolved
+
+    if not resolved.exists():
+        seed = Path(__file__).resolve().parents[3] / DEFAULT_PROFILE_PATH
+        if resolved == seed:
+            return resolved
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(seed, resolved)
+        logger.info("profile_seeded path=%s from=%s", resolved, seed)
+    return resolved
+
+
+def load_family_profile(path: Path | None = None) -> dict[str, Any]:
+    """Read and return the constraint store JSON."""
+    with profile_path(path).open(encoding="utf-8") as profile_file:
         return json.load(profile_file)
 
 
@@ -164,7 +188,7 @@ def resolve_constraints(
 
 def append_constraints(
     entries: list[dict[str, Any]],
-    path: Path = DEFAULT_PROFILE_PATH,
+    path: Path | None = None,
     today: date | None = None,
 ) -> list[dict[str, Any]]:
     """Persist user-confirmed constraints into the store; return what was written.
@@ -184,11 +208,9 @@ def append_constraints(
     Ids are stamped here so two captures of the same thing cannot collide.
     """
     today = today or date.today()
-    profile_path = path
-    if not profile_path.is_absolute():
-        profile_path = Path(__file__).resolve().parents[3] / profile_path
+    target = profile_path(path)
 
-    with profile_path.open(encoding="utf-8") as profile_file:
+    with target.open(encoding="utf-8") as profile_file:
         profile = json.load(profile_file)
 
     existing_ids = {entry.get("id") for entry in profile.get("constraints", [])}
@@ -215,10 +237,10 @@ def append_constraints(
         written.append(candidate)
 
     if written:
-        with profile_path.open("w", encoding="utf-8") as profile_file:
+        with target.open("w", encoding="utf-8") as profile_file:
             json.dump(profile, profile_file, indent=2, ensure_ascii=False)
             profile_file.write("\n")
-        logger.info("constraints_captured ids=%s", [entry["id"] for entry in written])
+        logger.info("constraints_captured path=%s ids=%s", target, [entry["id"] for entry in written])
     return written
 
 

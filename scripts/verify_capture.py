@@ -21,6 +21,7 @@ the file the next goal reads.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -34,6 +35,7 @@ from goalflow_cloud.memory.store import (  # noqa: E402
     DEFAULT_PROFILE_PATH,
     append_constraints,
     load_family_profile,
+    profile_path,
     resolve_constraints,
 )
 
@@ -95,17 +97,17 @@ def main() -> int:
 
     # 3. THE WRITE PATH, against a real copy of the store.
     with tempfile.TemporaryDirectory() as tmp:
-        profile_path = Path(tmp) / "family_profile.json"
-        shutil.copy(Path(__file__).resolve().parents[1] / DEFAULT_PROFILE_PATH, profile_path)
+        store_file = Path(tmp) / "family_profile.json"
+        shutil.copy(Path(__file__).resolve().parents[1] / DEFAULT_PROFILE_PATH, store_file)
 
-        before = load_family_profile(profile_path)
-        written = append_constraints(accepted, path=profile_path, today=TODAY)
+        before = load_family_profile(store_file)
+        written = append_constraints(accepted, path=store_file, today=TODAY)
         check(len(written) == 1, f"the accepted rule is written once, got {written}")
         check(written[0]["source"] == "chat", f"a captured rule is sourced to chat, got {written[0].get('source')}")
         check(written[0]["captured_on"] == TODAY.isoformat(), "a captured rule records when it was said")
         check(written[0]["id"].startswith("chat-dietary-"), f"stored id is minted here, got {written[0]['id']}")
 
-        after = load_family_profile(profile_path)
+        after = load_family_profile(store_file)
         check(len(after["constraints"]) == len(before["constraints"]) + 1,
               "capture APPENDS — nothing in the store is replaced or removed")
 
@@ -119,23 +121,59 @@ def main() -> int:
 
         # 5. TIGHTEN ONLY. A cap may come down from chat; it may never go up.
         loosen = [{"kind": "budget_cap", "value": 900.0, "enforcement": "hard", "applies_to": ["birthday_party"]}]
-        check(append_constraints(loosen, path=profile_path, today=TODAY) == [],
+        check(append_constraints(loosen, path=store_file, today=TODAY) == [],
               "raising a $200 party cap to $900 from chat must be refused")
         tighten = [{"kind": "budget_cap", "value": 150.0, "enforcement": "hard", "applies_to": ["birthday_party"]}]
-        check(len(append_constraints(tighten, path=profile_path, today=TODAY)) == 1,
+        check(len(append_constraints(tighten, path=store_file, today=TODAY)) == 1,
               "lowering the party cap to $150 from chat is a real constraint and must stick")
-        party = resolve_constraints(load_family_profile(profile_path), "birthday_party", today=TODAY)
+        party = resolve_constraints(load_family_profile(store_file), "birthday_party", today=TODAY)
         check(party["hard"]["budget_cap"] == 150.0,
               f"the tightened cap must win over the standing $200, got {party['hard']['budget_cap']}")
 
         # 6. Two captures of the same kind on the same day must not collide.
         again = append_constraints([{"kind": "dietary", "value": ["no_shellfish"], "enforcement": "hard"}],
-                                   path=profile_path, today=TODAY)
+                                   path=store_file, today=TODAY)
         check(again and again[0]["id"] != written[0]["id"], "a second capture gets its own id")
 
         # The seed profile must be untouched by all of the above.
         check(json.loads((Path(__file__).resolve().parents[1] / DEFAULT_PROFILE_PATH).read_text())
               == before, "the real store must not be written by this gate")
+
+    # 7. GOALFLOW_PROFILE_PATH — the device's `--data` for household policy. Without
+    #    it, demoing capture writes into the repo's seed and someone has to remember
+    #    to `git checkout` afterwards; the device has had a scratch world for
+    #    milestones. A configured path that does not exist yet must SEED itself, or
+    #    the override is one more setup step to forget.
+    with tempfile.TemporaryDirectory() as tmp:
+        scratch = Path(tmp) / "nested" / "profile.json"
+        os.environ["GOALFLOW_PROFILE_PATH"] = str(scratch)
+        try:
+            check(not scratch.exists(), "fixture starts with no scratch profile")
+            resolved = profile_path()
+            check(resolved == scratch and scratch.exists(),
+                  f"a configured path is created and seeded on first use, got {resolved}")
+            check(load_family_profile()["family_id"] == before["family_id"],
+                  "the scratch copy starts as a copy of the seed")
+
+            # Guarded: if the override is ignored, this write lands in the REAL seed.
+            # The gate must say so and stop, not crash on a missing scratch file — a
+            # gate that dies is a gate whose verdict nobody can read.
+            if not scratch.exists():
+                check(False, "the override was ignored — a capture here would write to the repo's seed")
+            else:
+                written = append_constraints(
+                    [{"kind": "allergens", "value": ["shellfish"], "enforcement": "hard"}], today=TODAY
+                )
+                check(len(written) == 1, "a capture writes to the configured path")
+                check("shellfish" in json.loads(scratch.read_text())["constraints"][-1]["value"],
+                      "the capture landed in the scratch copy")
+            check(json.loads((Path(__file__).resolve().parents[1] / DEFAULT_PROFILE_PATH).read_text()) == before,
+                  "THE SEED IS UNTOUCHED — that is the whole point of the override")
+        finally:
+            os.environ.pop("GOALFLOW_PROFILE_PATH", None)
+
+    check(profile_path().name == "family_profile.json" and "data/memory" in str(profile_path()),
+          "with the env var unset, the seed is used again")
 
     for f in failures:
         print(f"  FAIL {f}")

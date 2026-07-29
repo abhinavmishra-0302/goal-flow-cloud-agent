@@ -40,6 +40,17 @@ class Settings:
         default_factory=lambda: int(os.getenv("OPENROUTER_MAX_TOKENS", "2500"))
     )
 
+    # --- Household constraint store ---
+    #: Where the household constraint store lives (v6). Empty = the repo's seed,
+    #: `data/memory/family_profile.json`.
+    #:
+    #: THE DEVICE'S `--data` EQUIVALENT. Capture (v6-M4) WRITES to this file when a
+    #: user confirms a rule, so a demo run dirties the repo's seed — while the device
+    #: has run against a scratch world for milestones. Point this at a copy and the
+    #: seed stays pristine; a path that does not exist yet is seeded FROM the seed on
+    #: first use, exactly like `ProgramHelpers.EnsureDataDir` on the device.
+    profile_path: str = field(default_factory=lambda: os.getenv("GOALFLOW_PROFILE_PATH", ""))
+
     # --- Structured logging ---
     #: Standard logging level name (DEBUG/INFO/WARNING/ERROR).
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
