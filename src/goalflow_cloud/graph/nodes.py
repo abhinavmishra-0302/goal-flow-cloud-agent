@@ -72,6 +72,8 @@ class GraphState(TypedDict, total=False):
     #: v6-M4: household rules the user STATED in this message, awaiting confirmation.
     #: Proposals only — nothing here is policy until the user says yes at the gate.
     proposed_constraints: list[dict[str, Any]]
+    #: v6-M4: the message asks for nothing — it only states a household fact.
+    statement_only: bool
     #: Pre-planning understanding shown to the user before dispatch.
     understanding: dict[str, Any]
     #: User response to the understanding gate.
@@ -446,14 +448,6 @@ def interpret_goal(state: GraphState) -> GraphState:
                     "questions, trivia, facts, chit-chat, unrelated tasks — set "
                     "actionable=false, put one short reason in decline_reason, and you may "
                     "leave time_window empty.\n\n"
-                    "A BARE STATEMENT OF FACT IS NOT A GOAL. \"We've gone vegan\", \"Aarav is "
-                    "allergic to peanuts\", \"we're away next week\" on their own tell you "
-                    "something about the household; they do not ask for anything. Set "
-                    "actionable=false with decline_reason \"a statement, not a goal\" — do NOT "
-                    "invent the plan you imagine they meant. Something downstream remembers "
-                    "the fact; inventing a week of dinners nobody asked for does not. A "
-                    "statement that ALSO asks for something (\"plan our dinners — we've gone "
-                    "vegan\") is still a goal.\n\n"
                     "ALWAYS respond by calling the structured "
                     "function — never answer the user's question directly in prose, even "
                     "for out-of-scope goals (call it with actionable=false instead).\n\n"
@@ -702,6 +696,14 @@ class _ProposedConstraint(BaseModel):
 
 class _CaptureResult(BaseModel):
     constraints: list[_ProposedConstraint] = Field(default_factory=list)
+    statement_only: bool = Field(
+        default=False,
+        description=(
+            "True ONLY when the message asks for nothing at all — it just states a fact "
+            "about the household ('we've gone vegan'). False whenever it asks for "
+            "anything to be done, arranged or got ready, even indirectly."
+        ),
+    )
 
 
 def detect_constraints(state: GraphState) -> GraphState:
@@ -720,7 +722,7 @@ def detect_constraints(state: GraphState) -> GraphState:
     logger.info("graph_node_enter node=detect_constraints")
     goal_text = state.get("goal_text", "").strip()
     if not goal_text:
-        return {"proposed_constraints": []}
+        return {"proposed_constraints": [], "statement_only": False}
 
     settings = get_settings()
     max_tokens = settings.openrouter_max_tokens
@@ -733,16 +735,13 @@ def detect_constraints(state: GraphState) -> GraphState:
     # at is what lets it say so — and a household-wide $150 would be resolved away by
     # the more specific standing cap, which is a silent way to ignore the user.
     intent = state.get("intent") or {}
-    # The interpreter has already judged this message. When it says "a statement, not
-    # a goal", that is a strong prior that a household rule IS in there — and without
-    # passing it on, the same sentence was found half the time and missed the other
-    # half, leaving the user with an out-of-scope redirect for something they told us.
-    statement_hint = (
-        "\n\nThe goal interpreter judged this message to be a STATEMENT rather than a request, "
-        "so it very probably states a household rule. Read it again before returning nothing."
-        if intent.get("actionable") is False
-        else ""
-    )
+    # THE STATEMENT/GOAL CALL LIVES HERE, not in the interpreter. Teaching the
+    # interpreter that "a bare statement is not a goal" cost it a goal it had always
+    # got right — "get the house ready, we're away all next week" started coming back
+    # un-actionable, because the rule and the counter-example look alike from there.
+    # This node is already reading the message for household rules, so it is the one
+    # place where "does this ask for anything?" is a natural question.
+    statement_hint = ""
     domain = intent.get("domain") or ""
     scope_hint = (
         f"This message also asks for a '{domain}' goal. A rule that is really about THAT goal — a "
@@ -768,6 +767,13 @@ def detect_constraints(state: GraphState) -> GraphState:
                     "system",
                     "You spot HOUSEHOLD RULES a person states in passing, so a home assistant can "
                     "remember them instead of asking again next week.\n\n"
+                    "FIRST answer statement_only: does this message ask for ANYTHING to be done, "
+                    "arranged or got ready? If it asks for nothing and merely states a fact about "
+                    "the household, statement_only is TRUE — \"we've gone vegan\", \"Aarav is "
+                    "allergic to peanuts\", \"no dairy for two weeks\" are all statement_only. If "
+                    "it asks for something, even indirectly (\"plan our dinners\", \"get the house "
+                    "ready, we're away next week\"), statement_only is FALSE — the facts in it are "
+                    "context for a job that was requested.\n\n"
                     f"Real today is {today.isoformat()}.\n\n"
                     "Return a constraint ONLY for a standing fact or rule about the household: a diet "
                     "('we've gone vegan', 'no dairy for a month'), an allergy, a medical restriction, a "
@@ -789,21 +795,93 @@ def detect_constraints(state: GraphState) -> GraphState:
         )
         proposed = [c.model_dump(mode="json") for c in (getattr(result, "constraints", None) or [])]
         proposed = [c for c in proposed if _capture_is_sane(c)]
+        proposed = _dedupe_captures(proposed)
         for index, entry in enumerate(proposed, start=1):
             # A proposal id is only needed to answer with ("I accept #2"); the STORED
             # id is minted at write time, so these never reach the file.
             entry["id"] = f"proposed-{index}"
-            entry["label"] = entry.get("label") or str(entry.get("kind", "")).replace("_", " ")
-        logger.info("graph_node_exit node=detect_constraints proposed=%d", len(proposed))
+            # A label of "dietary" tells the user nothing — the thought line read
+            # "dietary and dietary" for two rules. Fall back to what the rule SAYS.
+            entry["label"] = entry.get("label") or _constraint_display(entry.get("kind", ""), entry.get("value"))
+        statement_only = bool(getattr(result, "statement_only", False)) and bool(proposed)
+        logger.info(
+            "graph_node_exit node=detect_constraints proposed=%d statement_only=%s",
+            len(proposed), statement_only,
+        )
         return {
             "proposed_constraints": proposed,
-            "event_log": [_event(state, "constraints_proposed", {"count": len(proposed)})],
+            "statement_only": statement_only,
+            "event_log": [
+                _event(state, "constraints_proposed", {"count": len(proposed), "statement_only": statement_only})
+            ],
         }
     except Exception:
         # Capture is a convenience, not a gate. Losing it costs the user a repeat;
         # failing the goal over it would cost them the goal.
         logger.exception("constraint_capture_failed — continuing without capture")
-        return {"proposed_constraints": []}
+        return {"proposed_constraints": [], "statement_only": False}
+
+
+#: What a named diet actually forbids. The device's safety vocabulary matches THINGS
+#: — "dairy" expands to milk, paneer, cheese — so a dietary value of "vegan" reads
+#: like a rule and blocks precisely nothing. The prompt asks for avoid-slugs and
+#: usually obliges; this is the deterministic backstop for the times it does not,
+#: because "captured but unenforceable" is the one outcome capture must never have.
+_DIET_RESTRICTIONS: dict[str, list[str]] = {
+    "vegan": ["no_meat", "no_dairy", "no_eggs", "no_honey"],
+    "vegetarian": ["no_meat"],
+    "pescatarian": ["no_meat"],
+    "halal": ["no_pork", "no_alcohol"],
+    "kosher": ["no_pork", "no_shellfish"],
+    "dairy_free": ["no_dairy"],
+    "gluten_free": ["no_gluten"],
+    "nut_free": ["no_nuts"],
+    "lactose_free": ["no_dairy"],
+}
+
+
+def _expand_diet(value: Any) -> Any:
+    """Turn a diet's NAME into the things it forbids; leave everything else alone."""
+    items = value if isinstance(value, list) else [value]
+    expanded: list[str] = []
+    changed = False
+    for item in items:
+        slug = str(item).strip().lower().replace(" ", "_").replace("-", "_")
+        if slug in _DIET_RESTRICTIONS:
+            expanded.extend(_DIET_RESTRICTIONS[slug])
+            changed = True
+        elif str(item).strip():
+            expanded.append(str(item).strip())
+    if not changed:
+        return value
+    logger.info("constraint_capture_expanded value=%s -> %s", value, expanded)
+    return list(dict.fromkeys(expanded))
+
+
+def _dedupe_captures(proposed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One rule, one row.
+
+    The model happily returns "we've gone vegan" as both a hard dietary rule and a
+    soft preference. Two identical-looking rows at a confirmation gate is a question
+    the user cannot answer — and ticking both would store the same thing twice. The
+    HARD one wins: between two readings of the same sentence, keep the one that
+    actually constrains.
+    """
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in proposed:
+        value = entry.get("value")
+        key = (
+            entry["kind"],
+            ",".join(sorted(str(v) for v in value)) if isinstance(value, list) else str(value),
+        )
+        incumbent = by_key.get(key)
+        if incumbent is None:
+            by_key[key] = entry
+        elif entry.get("enforcement") == "hard" and incumbent.get("enforcement") != "hard":
+            by_key[key] = entry
+    if len(by_key) != len(proposed):
+        logger.info("constraint_capture_deduped %d -> %d", len(proposed), len(by_key))
+    return list(by_key.values())
 
 
 def _capture_is_sane(entry: dict[str, Any]) -> bool:
@@ -817,6 +895,8 @@ def _capture_is_sane(entry: dict[str, Any]) -> bool:
             logger.warning("constraint_capture_unknown_kind kind=%s — dropped", entry.get("kind"))
         return False
     entry["kind"] = kind
+    if kind == "dietary":
+        entry["value"] = _expand_diet(entry["value"])
     if entry.get("enforcement") == "hard" and kind not in _CAPTURABLE_HARD_KINDS:
         # A "hard" anything-else would ride into constraints.hard where no device rule
         # enforces it — a constraint that reads as a guarantee and blocks nothing.
@@ -870,6 +950,11 @@ def route_after_interpret_or_capture(state: GraphState) -> str:
     """
     if state.get("error"):
         return "explain_block"
+    # A message that only STATES something goes to capture even when the interpreter
+    # judged it actionable — left alone, "we've gone vegan" came back as a whole week
+    # of invented dinners nobody asked for.
+    if state.get("statement_only") and state.get("proposed_constraints"):
+        return "capture_gate"
     if (state.get("intent") or {}).get("actionable") is False:
         return "capture_gate" if state.get("proposed_constraints") else "decline_out_of_scope"
     return "load_memory"
