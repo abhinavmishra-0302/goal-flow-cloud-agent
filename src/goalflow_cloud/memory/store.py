@@ -53,7 +53,15 @@ DEFAULT_PROFILE_PATH = Path("data/memory/family_profile.json")
 HARD_LIST_KINDS: tuple[str, ...] = ("allergens", "dietary", "medical")
 
 #: Hard kinds that hold ONE value per goal, and so are domain-picked.
-HARD_SCALAR_KINDS: tuple[str, ...] = ("budget_cap", "quiet_hours", "peak_hours", "away_window")
+HARD_SCALAR_KINDS: tuple[str, ...] = (
+    "budget_cap",
+    "quiet_hours",
+    "peak_hours",
+    "away_window",
+    #: The shared pool every goal draws from. Household-wide by nature, but resolved
+    #: through the same path so a domain could override it if one ever needs to.
+    "budget_envelope",
+)
 
 #: The soft kind whose entries are free-text household notes, not a preference list.
 CONTEXT_KIND = "context"

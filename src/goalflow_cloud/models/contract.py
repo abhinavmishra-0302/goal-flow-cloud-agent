@@ -230,6 +230,11 @@ class HardConstraints(_ContractModel):
     #: v6, ISO DATES e.g. {"start": "2026-07-30", "end": "2026-08-06"} — the house is
     #: empty; nothing may be scheduled to run in it. (Enforced from M2.)
     away_window: dict[str, str] | None = None
+    #: v6-M3, e.g. {"cap": 600.0, "period": "monthly"} — the shared pool EVERY goal
+    #: draws from. The device resolves this goal's effective ceiling as
+    #: min(budget_cap, cap - spent), because per-goal caps alone cannot stop two
+    #: goals spending the same money.
+    budget_envelope: dict[str, Any] | None = None
 
 
 class Constraints(_ContractModel):

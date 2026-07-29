@@ -239,6 +239,17 @@ def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
             knew[label] = f"{window.get('start', '?')}–{window.get('end', '?')}"
         elif isinstance(window, str) and window.strip():
             knew[label] = window.strip()
+
+    envelope = hard.get("budget_envelope")
+    if isinstance(envelope, dict) and envelope.get("cap"):
+        # The pool, not this goal's slice — the device narrows the goal's own cap to
+        # whatever is left of it, so the chip says what the household has, not what
+        # the goal may spend.
+        period = str(envelope.get("period") or "").strip()
+        try:
+            knew["envelope"] = f"${float(envelope['cap']):g}" + (f" {period}" if period else "")
+        except (TypeError, ValueError):
+            knew["envelope"] = f"${envelope['cap']}"
     return knew
 
 
@@ -269,6 +280,9 @@ def _constraint_display(kind: str, value: Any) -> str:
         start, end = value.get("start"), value.get("end")
         if start or end:
             return f"{start or '?'}–{end or '?'}"
+        if value.get("cap") is not None:
+            period = str(value.get("period") or "").strip()
+            return f"${value['cap']:g}" + (f" {period}" if period else "")
         return ""
     if isinstance(value, list):
         return ", ".join(str(item).replace("_", " ") for item in value)
