@@ -37,11 +37,13 @@ specifics live in the device's capability modules plus the free-form
 1. **Interprets** the natural-language goal via a real LLM structured-output call
    (OpenRouter) into `{domain, objective, success_criteria, scope, time_window}` —
    the time window computed **relative to real today**, never hardcoded.
-2. **Loads memory** (`data/memory/family_profile.json`) with a strict split:
-   the **hard** block (allergens, medical, dietary, budget_cap, quiet_hours) is
-   injected **verbatim** into `constraints.hard` as pure data — the LLM never
-   generates, edits, or paraphrases the safety policy; **soft** preferences and
-   family context only bias planning.
+2. **Resolves the household constraint store** (`data/memory/family_profile.json`)
+   **for this goal**: every constraint carries its source, scope and expiry, and the
+   **hard** block is assembled by code — allergens/medical/dietary unioned across the
+   whole store (never narrowed), caps and windows picked per domain, so a vacation
+   goal carries a travel cap and an away window instead of the weekly grocery cap.
+   The LLM never generates, edits, or paraphrases the safety policy; its only say is
+   which **soft** preferences are relevant, and those only bias planning.
 3. **Presents its understanding and waits**: the confirm-understanding gate. The
    graph parks at a durable `interrupt()` (`present_understanding`) and sends the
    UI an `understanding` frame — a short LLM-authored summary plus the `knew`
@@ -140,8 +142,8 @@ src/goalflow_cloud/
   board.py                      # BoardService: folds every goal's frames into one GoalSummary (deterministic, no LLM)
   models/contract.py            # Pydantic mirror of every CONTRACT v3 message
   graph/nodes.py                # the LangGraph StateGraph: nodes, routers, interrupts
-  memory/store.py               # family profile loader + hard/soft split
-data/memory/family_profile.json # generic family memory (hard + soft + context)
+  memory/store.py               # constraint store loader + per-goal resolution
+data/memory/family_profile.json # household constraint store (sourced, scoped, expiring)
 run.sh
 ```
 

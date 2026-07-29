@@ -16,9 +16,11 @@ Key invariants:
 - LLM-ONLY: interpret_goal is a real structured-output LLM call via OpenRouter;
   there is NO scripted fallback. Failure sets state["error"] and routes to
   explain_block.
-- Hard constraints flow through load_memory as DATA, verbatim into
-  contract.constraints.hard. The LLM never generates, edits, or paraphrases
-  the safety policy. "LLM plans, code checks."
+- Hard constraints flow through load_memory as DATA — resolved from the
+  household constraint store BY CODE (memory.store.resolve_constraints), then
+  copied into contract.constraints.hard. The LLM never generates, edits, or
+  paraphrases the safety policy; its only say over constraints is which SOFT
+  preferences are relevant. "LLM plans, code checks."
 - The device does the actual planning (SK function calling); the cloud graph
   pauses at its hand-off points and is resumed by the WS hub.
 """
@@ -41,7 +43,7 @@ from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field, ValidationError
 
 from goalflow_cloud.config import get_settings
-from goalflow_cloud.memory.store import hard_safety_block, load_family_profile, soft_bias_block
+from goalflow_cloud.memory.store import load_family_profile, resolve_constraints, soft_candidates
 from goalflow_cloud.models.contract import Dispatch
 
 logger = logging.getLogger(__name__)
@@ -225,27 +227,64 @@ def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
             knew["budget"] = f"${float(hard['budget_cap']):g}"
         except (TypeError, ValueError):
             knew["budget"] = f"${hard['budget_cap']}"
-    quiet = hard.get("quiet_hours")
-    if quiet:
-        # NOT str(dict) — that renders "{'start': '21:30', 'end': '07:00'}" into a
-        # user-facing chip: a Python literal, quotes and braces included, on a fridge
-        # door. These chips are the agent proving it listened, so they have to read
-        # like a person wrote them.
-        if isinstance(quiet, dict) and (quiet.get("start") or quiet.get("end")):
-            knew["quiet hours"] = f"{quiet.get('start', '?')}–{quiet.get('end', '?')}"
-        elif isinstance(quiet, str) and quiet.strip():
-            knew["quiet hours"] = quiet.strip()
+    # NOT str(dict) — that renders "{'start': '21:30', 'end': '07:00'}" into a
+    # user-facing chip: a Python literal, quotes and braces included, on a fridge
+    # door. These chips are the agent proving it listened, so they have to read
+    # like a person wrote them.
+    for label, key in (("quiet hours", "quiet_hours"), ("peak tariff", "peak_hours"), ("away", "away_window")):
+        window = hard.get(key)
+        if not window:
+            continue
+        if isinstance(window, dict) and (window.get("start") or window.get("end")):
+            knew[label] = f"{window.get('start', '?')}–{window.get('end', '?')}"
+        elif isinstance(window, str) and window.strip():
+            knew[label] = window.strip()
     return knew
+
+
+def _applied_constraints(applied: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Display-ready provenance rows: what was applied, and where it came from.
+
+    Values are rendered here, not in the UI, for the same reason the ``knew`` chips
+    are: a raw ``{'start': ..., 'end': ...}`` on a fridge door reads like a bug.
+    """
+    rows: list[dict[str, Any]] = []
+    for entry in applied or []:
+        rows.append(
+            {
+                "id": entry.get("id", ""),
+                "label": entry.get("label", ""),
+                "value": _constraint_display(entry.get("kind", ""), entry.get("value")),
+                "enforcement": entry.get("enforcement", "soft"),
+                "source": entry.get("source", "account"),
+                "why": entry.get("why", ""),
+            }
+        )
+    return rows
+
+
+def _constraint_display(kind: str, value: Any) -> str:
+    """One constraint value as a person would write it."""
+    if isinstance(value, dict):
+        start, end = value.get("start"), value.get("end")
+        if start or end:
+            return f"{start or '?'}–{end or '?'}"
+        return ""
+    if isinstance(value, list):
+        return ", ".join(str(item).replace("_", " ") for item in value)
+    if isinstance(value, bool) or value is None:
+        return ""
+    if kind == "budget_cap" and isinstance(value, (int, float)):
+        return f"${value:g}"
+    return str(value).replace("_", " ")
 
 
 def _understanding_thought_fallback(intent: dict[str, Any], hard: dict[str, Any], domain: str) -> str:
     tw = intent.get("time_window") or {}
-    constraint_count = (
-        len(hard.get("allergens") or [])
-        + len(hard.get("medical") or [])
-        + len(hard.get("dietary") or [])
-        + (1 if hard.get("budget_cap") else 0)
-        + (1 if hard.get("quiet_hours") else 0)
+    # Counted off the resolved block rather than a fixed list of five keys, so a new
+    # hard kind (peak_hours, away_window, …) is included the day it is added.
+    constraint_count = sum(
+        len(value) if isinstance(value, list) else (1 if value else 0) for value in hard.values()
     )
     label = domain.replace("_", " ")
     start = tw.get("start", "")
@@ -456,27 +495,152 @@ def interpret_goal(state: GraphState) -> GraphState:
 
 
 def load_memory(state: GraphState) -> GraphState:
-    """Memory & Constraints: load the generic profile, split hard/soft.
+    """Memory & Constraints: resolve the household constraint store FOR THIS GOAL.
 
-    TODO(v2-M1):
-    - memory.store.load_family_profile() -> state["memory"].
-    - profile["hard"] is the safety policy (allergens, medical, dietary,
-      budget_cap, quiet_hours): kept as DATA for verbatim injection.
-    - profile["soft"] + members + context: planning bias only.
+    v6: the store is a library of sourced, scoped, expiring entries, and this node
+    resolves it against the goal's domain — so a vacation goal carries a travel cap
+    and an away window instead of the $120 weekly grocery cap that every goal used
+    to inherit.
+
+    The split that matters: ``resolve_constraints`` builds the HARD block from store
+    data by code alone. The LLM's only say is ``_relevant_soft_ids`` — which SOFT
+    preferences to send — and that call is allowed to fail, because tag matching
+    inside the resolver is a complete fallback.
     """
     logger.info("graph_node_enter node=load_memory")
     profile = load_family_profile()
+    domain = (state.get("intent") or {}).get("domain", "")
+    today = date.today()
+
+    soft_ids = _relevant_soft_ids(state, profile, domain, today)
+    resolved = resolve_constraints(profile, domain, today=today, soft_ids=soft_ids)
+
     memory = {
         "family_id": profile.get("family_id"),
-        "hard": hard_safety_block(profile),
-        "bias": soft_bias_block(profile),
+        "hard": resolved["hard"],
+        "bias": {
+            "members": list(profile.get("members", [])),
+            "soft": resolved["soft"],
+            "context": resolved["context"],
+        },
+        # Provenance: which entries were picked, from where, and why. Rides into the
+        # understanding card and the logs — a block the user cannot trace is a block
+        # they will not trust.
+        "applied": resolved["applied"],
     }
-    logger.info("graph_node_exit node=load_memory family_id=%s", memory.get("family_id"))
+    logger.info(
+        "graph_node_exit node=load_memory family_id=%s domain=%s applied=%d picked=%s",
+        memory.get("family_id"),
+        domain,
+        len(resolved["applied"]),
+        "relevance" if soft_ids else "tagged",
+    )
     return {
         "memory": memory,
         "task_status": "grounding",
-        "event_log": [_event(state, "memory_loaded", {"family_id": memory.get("family_id")})],
+        "event_log": [
+            _event(
+                state,
+                "memory_loaded",
+                {
+                    "family_id": memory.get("family_id"),
+                    "domain": domain,
+                    "constraints": [entry["id"] for entry in resolved["applied"]],
+                },
+            )
+        ],
     }
+
+
+class _SoftSelection(BaseModel):
+    """Structured LLM output for the soft-preference relevance pass."""
+
+    ids: list[str] = Field(
+        default_factory=list,
+        description="Ids of the soft entries worth sending with THIS goal. Omit the rest.",
+    )
+
+
+def _relevant_soft_ids(
+    state: GraphState,
+    profile: dict[str, Any],
+    domain: str,
+    today: date,
+) -> list[str] | None:
+    """Ask a small LLM call which SOFT preferences this goal should carry.
+
+    Why the model is allowed near this at all: ``applies_to`` tags only know the
+    domains someone thought to write down, and the interpreter is free to COIN a
+    domain slug for a goal nobody anticipated — that goal would fall back to the
+    household-wide entries alone. Relevance covers what tagging cannot.
+
+    Why it is allowed to fail: this is SOFT bias only. Returning None hands the
+    resolver back to tag matching, which is a complete answer on its own. Nothing
+    here touches the hard block.
+    """
+    candidates = soft_candidates(profile, today)
+    if not candidates:
+        return None
+
+    intent = state.get("intent") or {}
+    settings = get_settings()
+    max_tokens = settings.openrouter_max_tokens
+    # 1200, not the ~40 an id list actually needs: the default model is a REASONING
+    # model, and its reasoning tokens are drawn from this same budget. At 200 the
+    # thinking consumed the allowance and the function call never landed — the call
+    # returned None, no exception, and every goal quietly fell back to tag matching.
+    # A relevance pass that silently never runs is worse than not having one.
+    selection_tokens = min(max_tokens, 1200) if isinstance(max_tokens, int) and max_tokens > 0 else 1200
+    try:
+        llm = ChatOpenAI(
+            model=settings.openrouter_model,
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+            temperature=0,
+            max_tokens=selection_tokens,
+            timeout=20,
+            max_retries=0,
+        )
+        structured_llm = llm.with_structured_output(_SoftSelection, method="function_calling")
+        selection = structured_llm.invoke(
+            [
+                (
+                    "system",
+                    "You pick which household PREFERENCES are worth sending with a goal. "
+                    "These are soft biases, never safety rules — you are not deciding what is "
+                    "allowed, only what is relevant.\n\n"
+                    "Return the ids that would make a planner's output better for THIS goal, "
+                    "and leave out the ones that would only add noise: a vacation checklist "
+                    "does not need the family's dinner preferences, and a meal plan does not "
+                    "need the departure routine. Household notes about who is busy when are "
+                    "usually worth keeping. Prefer a few good ones over all of them; return "
+                    "no ids at all rather than padding the list.",
+                ),
+                (
+                    "human",
+                    "Goal: {objective}\nDomain: {domain}\n\nCandidates (JSON):\n{candidates}".format(
+                        objective=intent.get("objective") or state.get("goal_text", ""),
+                        domain=domain or "(none)",
+                        candidates=candidates,
+                    ),
+                ),
+            ]
+        )
+        ids = [str(i) for i in (getattr(selection, "ids", None) or []) if str(i).strip()]
+        known = {entry["id"] for entry in candidates}
+        # Drop hallucinated ids rather than letting them silently select nothing —
+        # an empty result after filtering falls back to tags, which is correct.
+        picked = [i for i in ids if i in known]
+        if len(picked) != len(ids):
+            logger.warning("soft_relevance_unknown_ids dropped=%s", sorted(set(ids) - known))
+        if not picked:
+            # Not an error — tags are a complete answer — but say so out loud. This
+            # is the only signal that the pass ran and chose nothing.
+            logger.info("soft_relevance_empty domain=%s — using applies_to tags", domain)
+        return picked or None
+    except Exception:
+        logger.exception("soft_relevance_llm_failed — falling back to applies_to tags")
+        return None
 
 
 def present_understanding(state: GraphState) -> GraphState:
@@ -496,6 +660,10 @@ def present_understanding(state: GraphState) -> GraphState:
         "time_window": intent.get("time_window") or {},
         "hard": hard,
         "knew": _hard_knew(hard),
+        # v6 provenance, additive: WHERE each constraint came from and why it was
+        # picked for this goal. `knew` stays exactly as it was, so no UI has to
+        # change to ship this — the chips keep working and this rides alongside.
+        "constraints": _applied_constraints(memory.get("applied")),
         "thought": _understanding_thought(intent, hard, domain),
     }
     incoming = interrupt(
@@ -526,11 +694,12 @@ def present_understanding(state: GraphState) -> GraphState:
 def build_contract(state: GraphState) -> GraphState:
     """Assemble + validate the generic Task Contract (models.contract.Dispatch).
 
-    TODO(v2-M1):
-    - Merge intent (LLM) with constraints.hard copied VERBATIM from memory.
-    - constraints.soft from soft prefs; scope/context stay domain-flexible.
-    - autonomy = "tiered"; mint goal_id + correlation_id.
-    - Validate via Dispatch(**frame); stash the frame in state["contract"].
+    Merges the LLM's intent with the constraints ``load_memory`` already RESOLVED
+    for this goal's domain: ``constraints.hard`` is copied straight out of
+    ``state["memory"]["hard"]`` — no edit, no paraphrase, nothing derived from the
+    model — while ``soft``/``context`` carry the picked bias. ``autonomy`` is
+    "tiered"; goal_id + correlation_id are minted here; ``Dispatch(**frame)``
+    validates before the frame leaves the cloud.
     """
     logger.info("graph_node_enter node=build_contract")
     intent = state["intent"]

@@ -57,10 +57,14 @@ contract lives HERE**: `CONTRACT.md` (mirrored as `types/contract.ts` in the UI 
   `_ContractModel` uses `extra="allow"` so new nested device fields (e.g.
   `demo_events`, `updated_plan`) pass through without cloud changes.
   `Control.command` Literal includes `"trigger_event"`.
-- `src/goalflow_cloud/memory/store.py` + `data/memory/family_profile.json` — memory.
-  **Hard constraints** (allergies, medical) are injected deterministically into the
-  contract's `constraints.hard`; **soft prefs** only bias. The safety gate on the
-  device reads `constraints.hard` and nothing else.
+- `src/goalflow_cloud/memory/store.py` + `data/memory/family_profile.json` — the
+  **household constraint store** (v6): a library of entries, each with `kind`, `value`,
+  `enforcement`, `source` (account/derived/chat), `scope`, `applies_to`, expiry.
+  `resolve_constraints()` resolves it PER GOAL — hard list kinds unioned across the
+  store regardless of domain (the enforced set is never narrowed), cap/window kinds
+  domain-picked, soft picked by a small LLM relevance pass with tag matching as the
+  fallback. `constraints.hard` is built by code and the device's safety gate reads it
+  and nothing else. Gate: `scripts/verify_constraints.py`.
 - `src/goalflow_cloud/board.py` — **`BoardService`**, the Agent Board fold: it folds every
   goal's frames (`understanding`/`plan_ready`/`task_update`/`status`/`proposal`) into one
   `GoalSummary` per goal and broadcasts `board_snapshot`/`board_update`. Deterministic, no
