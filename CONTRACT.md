@@ -178,10 +178,19 @@ dispatch. The graph is paused until the UI answers with `understanding_response`
     "objective": "...",
     "domain": "meal_plan",
     "knew": { "allergens": ["peanuts"], "budget": "$120" },
+    "constraints": [
+      { "id": "c-cap-travel", "label": "travel budget", "value": "$1500",
+        "enforcement": "hard", "source": "account", "why": "domain" }
+    ],
     "thought": "I'll shape a meal plan around your constraints before planning.",
     "time_window": { "start": "<ISO>", "end": "<ISO>" }
   } }
 ```
+
+`constraints` (v6, **additive**) is the provenance list behind the `knew` chips: one
+row per applied constraint, with `source` ∈ `account | derived | chat` and `why`
+saying whether it was enforced always, picked for this domain, or captured. `knew` is
+unchanged, so a UI that ignores `constraints` keeps working.
 
 ### `understanding_response` (ui → cloud)
 
@@ -289,7 +298,8 @@ this frame just makes that handoff physical.
   "success_criteria": ["..."],
   "constraints": {
     "hard": { "allergens": [], "medical": [], "dietary": [],
-              "budget_cap": null, "quiet_hours": null },
+              "budget_cap": null, "quiet_hours": null,
+              "peak_hours": null, "away_window": null },
     "soft": { }
   },
   "scope": { },
@@ -299,7 +309,14 @@ this frame just makes that handoff physical.
 ```
 
 - `constraints.hard` is a **safety policy** object (allergens, medical, dietary,
-  budget_cap, quiet_hours, ...). It is the **ONLY** thing the Safety filter enforces.
+  budget_cap, quiet_hours, peak_hours, away_window, ...). It is the **ONLY** thing the
+  Safety filter enforces. **v6:** the cloud RESOLVES it per goal from the household
+  constraint store, by code — the list kinds (allergens/dietary/medical) are unioned
+  across the whole store regardless of domain, while the cap and window kinds are
+  domain-picked, so a `vacation_prep` goal carries a travel cap and an away window
+  where a `meal_plan` goal carries the weekly grocery cap. `peak_hours` (peak
+  electricity tariff, HH:mm) and `away_window` (the house is empty, ISO **dates**) are
+  new in v6; enforcement of them lands with the device rules in v6-M2.
 - `constraints.soft` holds preferences: they bias planning, never gate it.
 - `scope` is a **domain-flexible** object (whatever the domain needs — no fixed shape).
 - `time_window` is **RELATIVE to real today** (or the control-set clock) — never a

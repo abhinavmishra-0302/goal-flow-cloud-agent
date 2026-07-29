@@ -206,18 +206,30 @@ class UserGoal(_ContractModel):
 class HardConstraints(_ContractModel):
     """The safety policy — the ONLY block the device Safety filter enforces.
 
-    Injected VERBATIM from family memory (memory/store.py "hard" block);
-    never generated or paraphrased by the LLM. Extra keys are allowed so new
-    policy dimensions can flow through without a contract bump.
+    Resolved for THIS GOAL by code (memory/store.py ``resolve_constraints``) from
+    the household constraint store; never generated or paraphrased by the LLM.
+    Extra keys are allowed so new policy dimensions can flow through without a
+    contract bump.
+
+    v6: the list kinds are unioned across the whole store regardless of domain (the
+    enforced set is never narrowed by relevance), while the window/cap kinds below
+    are domain-picked — which is why a vacation goal carries a travel cap and an
+    away window where a meal goal carries the weekly grocery cap.
     """
 
     allergens: list[str] = Field(default_factory=list)
     medical: list[str] = Field(default_factory=list)
     dietary: list[str] = Field(default_factory=list)
-    #: Currency-agnostic spend ceiling (None = no cap).
+    #: Currency-agnostic spend ceiling (None = no cap). Domain-picked in v6.
     budget_cap: float | None = None
     #: e.g. {"start": "21:30", "end": "07:00"} — no noisy appliances inside.
     quiet_hours: dict[str, str] | None = None
+    #: v6, e.g. {"start": "17:00", "end": "21:00"} — peak electricity tariff; heavy
+    #: appliance runs inside it are blocked on the goals scoped to it.
+    peak_hours: dict[str, str] | None = None
+    #: v6, ISO DATES e.g. {"start": "2026-07-30", "end": "2026-08-06"} — the house is
+    #: empty; nothing may be scheduled to run in it. (Enforced from M2.)
+    away_window: dict[str, str] | None = None
 
 
 class Constraints(_ContractModel):
@@ -384,6 +396,10 @@ class UnderstandingPayload(_ContractModel):
     domain: str = ""
     #: Display-ready hard-constraint chips, same shape as PlanPayload.knew.
     knew: dict[str, Any] = Field(default_factory=dict)
+    #: v6, ADDITIVE: one row per applied constraint — {id, label, value, enforcement,
+    #: source, why}. Provenance for the gate: a block the user cannot trace is a
+    #: block they will not trust. `knew` is unchanged, so a UI may ignore this.
+    constraints: list[dict[str, Any]] = Field(default_factory=list)
     thought: str = ""
     time_window: dict[str, str] | None = None
 
