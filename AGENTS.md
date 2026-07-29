@@ -65,6 +65,11 @@ contract lives HERE**: `CONTRACT.md` (mirrored as `types/contract.ts` in the UI 
   domain-picked, soft picked by a small LLM relevance pass with tag matching as the
   fallback. `constraints.hard` is built by code and the device's safety gate reads it
   and nothing else. Gate: `scripts/verify_constraints.py`.
+  **v6-M4:** `detect_constraints` proposes rules the user states in chat; only the ids
+  returned in `understanding_response.accepted_constraint_ids` are written, via
+  `append_constraints` (tighten-only, append-only). A pure statement routes to
+  `capture_gate` — the same understanding wire with `capture_only: true`, no board card,
+  ending in a `notice` of kind `captured`. Gate: `scripts/verify_capture.py`.
 - `src/goalflow_cloud/board.py` — **`BoardService`**, the Agent Board fold: it folds every
   goal's frames (`understanding`/`plan_ready`/`task_update`/`status`/`proposal`) into one
   `GoalSummary` per goal and broadcasts `board_snapshot`/`board_update`. Deterministic, no

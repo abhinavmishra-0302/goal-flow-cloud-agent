@@ -405,6 +405,13 @@ class UnderstandingPayload(_ContractModel):
     #: source, why}. Provenance for the gate: a block the user cannot trace is a
     #: block they will not trust. `knew` is unchanged, so a UI may ignore this.
     constraints: list[dict[str, Any]] = Field(default_factory=list)
+    #: v6-M4, ADDITIVE: household rules the user STATED in this message, awaiting a
+    #: yes. Proposals only — the LLM never writes policy, so nothing here applies
+    #: until it comes back in `understanding_response.accepted_constraint_ids`.
+    proposed_constraints: list[dict[str, Any]] = Field(default_factory=list)
+    #: v6-M4: this gate is a constraint capture, not a goal — there is no plan
+    #: coming, and the UI should ask only about the rules.
+    capture_only: bool = False
     thought: str = ""
     time_window: dict[str, str] | None = None
 
@@ -421,6 +428,10 @@ class Understanding(_ContractModel):
 
 class UnderstandingResponsePayload(_ContractModel):
     confirmed: bool
+    #: v6-M4: which proposed constraints the user actually said yes to. Absent or
+    #: empty means none — silence never captures a household rule, and confirming
+    #: the GOAL does not silently confirm a rule that rode along with it.
+    accepted_constraint_ids: list[str] = Field(default_factory=list)
 
 
 class UnderstandingResponse(_ContractModel):
@@ -525,7 +536,9 @@ class Notice(_ContractModel):
     #: "declined" (v4.1, active) = the create flow was cancelled (understanding
     #: gate declined / aborted) and is emitted ALONGSIDE ``chat_ui_close`` so the
     #: input (Bixby) surface can SPEAK the cancellation.
-    kind: Literal["out_of_scope", "declined"] = "out_of_scope"
+    #: "captured" (v6-M4) = the message stated a household rule rather than a goal;
+    #: the rule was confirmed and remembered, and no plan was ever coming.
+    kind: Literal["out_of_scope", "declined", "captured"] = "out_of_scope"
     message: str
 
 

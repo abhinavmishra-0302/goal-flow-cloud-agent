@@ -162,6 +162,95 @@ def resolve_constraints(
     return {"hard": hard, "soft": soft, "context": context, "applied": applied}
 
 
+def append_constraints(
+    entries: list[dict[str, Any]],
+    path: Path = DEFAULT_PROFILE_PATH,
+    today: date | None = None,
+) -> list[dict[str, Any]]:
+    """Persist user-confirmed constraints into the store; return what was written.
+
+    This is the ONLY write path into household policy, and it exists because the
+    user said yes — never because a model proposed something (see R2 in
+    docs/V6_CONSTRAINTS.md). Two rules are enforced here rather than trusted to the
+    caller:
+
+    - **Tighten only.** A captured cap may lower an existing ceiling, never raise or
+      remove one. "Keep the party under $150" is a constraint; "we can spend $900 on
+      the party now" is a policy change, and a chat message is not where that
+      happens. Anything looser is dropped and logged.
+    - **Nothing is removed.** Entries are appended. Relaxing a household rule is a
+      deliberate act somewhere with more ceremony than a sentence typed at a fridge.
+
+    Ids are stamped here so two captures of the same thing cannot collide.
+    """
+    today = today or date.today()
+    profile_path = path
+    if not profile_path.is_absolute():
+        profile_path = Path(__file__).resolve().parents[3] / profile_path
+
+    with profile_path.open(encoding="utf-8") as profile_file:
+        profile = json.load(profile_file)
+
+    existing_ids = {entry.get("id") for entry in profile.get("constraints", [])}
+    written: list[dict[str, Any]] = []
+    for entry in entries:
+        candidate = dict(entry)
+        candidate["source"] = "chat"
+        candidate.setdefault("scope", "household")
+        candidate.setdefault("applies_to", ["*"])
+        candidate.setdefault("enforcement", "soft")
+        candidate["captured_on"] = today.isoformat()
+
+        if not _tightens(profile, candidate, today):
+            logger.warning(
+                "constraint_capture_rejected kind=%s value=%s — a captured constraint may only tighten",
+                candidate.get("kind"),
+                candidate.get("value"),
+            )
+            continue
+
+        candidate["id"] = _unique_id(candidate, existing_ids, today)
+        existing_ids.add(candidate["id"])
+        profile.setdefault("constraints", []).append(candidate)
+        written.append(candidate)
+
+    if written:
+        with profile_path.open("w", encoding="utf-8") as profile_file:
+            json.dump(profile, profile_file, indent=2, ensure_ascii=False)
+            profile_file.write("\n")
+        logger.info("constraints_captured ids=%s", [entry["id"] for entry in written])
+    return written
+
+
+def _tightens(profile: dict[str, Any], candidate: dict[str, Any], today: date) -> bool:
+    """True when this capture only ever narrows what is already allowed.
+
+    Numeric ceilings must come DOWN. Everything else is additive by nature — a new
+    allergen or preference restricts, it cannot permit — so it passes.
+    """
+    value = candidate.get("value")
+    if not _is_number(value):
+        return True
+
+    domains = [d for d in candidate.get("applies_to", ["*"]) if d != "*"] or [""]
+    for domain in domains:
+        current = resolve_constraints(profile, domain, today=today)["hard"].get(candidate.get("kind", ""))
+        if _is_number(current) and value >= current:
+            return False
+    return True
+
+
+def _unique_id(candidate: dict[str, Any], taken: set[str | None], today: date) -> str:
+    """A stable, readable id: chat-<kind>-<date>, suffixed if that is already taken."""
+    base = f"chat-{candidate.get('kind', 'constraint')}-{today.isoformat()}"
+    if base not in taken:
+        return base
+    suffix = 2
+    while f"{base}-{suffix}" in taken:
+        suffix += 1
+    return f"{base}-{suffix}"
+
+
 def soft_candidates(profile: dict[str, Any], today: date | None = None) -> list[dict[str, Any]]:
     """The soft entries a relevance pass may choose from (id + kind + value + tags).
 
