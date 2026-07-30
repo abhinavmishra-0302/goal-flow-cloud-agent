@@ -330,6 +330,11 @@ class PlanItem(_ContractModel):
     when: str | None = None
     why: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    #: v7: absent or "planned" is a normal row; "skipped" is a day deliberately left
+    #: empty — still rendered, styled down, carrying its reason. Deleting the row was
+    #: the alternative and it is worse: a shorter plan says nothing about WHY.
+    status: str | None = None
+    status_reason: str | None = None
 
 
 class PlanProposal(_ContractModel):
@@ -565,7 +570,10 @@ class Notice(_ContractModel):
     #: input (Bixby) surface can SPEAK the cancellation.
     #: "captured" (v6-M4) = the message stated a household rule rather than a goal;
     #: the rule was confirmed and remembered, and no plan was ever coming.
-    kind: Literal["out_of_scope", "declined", "captured"] = "out_of_scope"
+    #: v7: "updating_goals" is NOT terminal — it captions the chat's saving screen while
+    #: the cloud pushes a household change to the user's other goals. Kept a plain str so
+    #: a new kind never fails validation and vanishes.
+    kind: str
     message: str
 
 
@@ -698,6 +706,11 @@ class GoalSummary(_ContractModel):
     alerts: GoalAlerts = Field(default_factory=GoalAlerts)
     #: The last couple of human-readable things that happened.
     activity: list[str] = Field(default_factory=list)
+    #: v7: this plan changed WITHOUT an approval, because another goal the user already
+    #: approved changed the household. Rendered as one informational line on the card and
+    #: a dismissible notice on the detail page — deliberately NOT an alert, which means
+    #: "you still have to decide". Here there is nothing left to decide.
+    plan_changed_note: str | None = None
     updated_at: str = ""
 
 

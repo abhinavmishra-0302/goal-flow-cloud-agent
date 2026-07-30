@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import date, timedelta
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,7 +31,7 @@ from pydantic import ValidationError
 from goalflow_cloud.board import BoardService
 from goalflow_cloud.config import get_settings
 from goalflow_cloud.graph import nodes as graph_nodes
-from goalflow_cloud.memory.store import load_family_profile, resolve_constraints
+from goalflow_cloud.memory.store import append_constraints, load_family_profile, resolve_constraints
 from goalflow_cloud.models.contract import (
     AgentEvent,
     Approval,
@@ -43,6 +44,7 @@ from goalflow_cloud.models.contract import (
     GoalStateGet,
     Capabilities,
     Control,
+    ControlPayload,
     DayAdvanced,
     Devices,
     Hello,
@@ -1107,11 +1109,135 @@ async def handle_approval(device_id: str, approval: Approval) -> None:
     async with goal_lock(approval.goal_id):
         await asyncio.to_thread(graph_nodes.resume_goal, graph, approval.goal_id, decisions)
     await registry.send_to_device(device_id, approval.model_dump(mode="json"))
+    # v7 — THE CROSS-GOAL MOMENT. Approving a goal can change the HOUSEHOLD, and every
+    # other running goal is planning against a household that no longer exists. Done
+    # BEFORE the webview closes, so the chat surface can hold its "saving, and updating
+    # your other goals…" screen for exactly as long as the work takes.
+    await fan_out_household_change(device_id, approval.goal_id)
     # v4.1: the initial approval ends the create phase — the user's final tap, the
     # moment the board becomes the primary surface. Close the webview bracket. GUARDED
     # on "still the create-phase goal", so a board adaptation approval (whose goal is
     # no longer the create-phase goal) never retriggers a close.
     await emit_chat_ui_close(device_id, approval.goal_id)
+
+
+#: Hard kinds whose arrival changes what OTHER goals should be planning, not merely what
+#: they may do. An away window empties days; a peak-tariff window only reshapes when
+#: something runs, which the safety gate already handles at actuation without a re-plan.
+HOUSEHOLD_WIDE_KINDS = ("away_window",)
+
+
+async def fan_out_household_change(device_id: str, approved_goal_id: str) -> None:
+    """Promote an approved goal's window to the household, and re-plan whoever it moves.
+
+    THE SHAPE OF THE MOMENT. Goal 2 says "we're away Thursday and Friday". Until it is
+    approved that is a proposal, so it binds only itself; approving it makes it a fact
+    about the household, and a meal week that is still planning dinners for Thursday is
+    now planning against a household that does not exist.
+
+    Two halves, and the order matters. First the window is WRITTEN to the store as a
+    household-scoped, chat-sourced, self-expiring entry — so it survives a restart, shows
+    its provenance, and retires itself rather than shadowing every future trip. Then every
+    OTHER active goal is re-resolved against the new store and, where its enforced set
+    actually moved, sent down to re-plan.
+
+    NOT AN APPROVAL. The user approved this when they approved goal 2; asking again would
+    be asking the same question twice. See ControlCommands.ConstraintsChanged.
+    """
+    contract = dispatched_contracts.get(approved_goal_id)
+    if not contract:
+        return
+    hard = (contract.get("constraints") or {}).get("hard") or {}
+    window = next((hard[kind] for kind in HOUSEHOLD_WIDE_KINDS if isinstance(hard.get(kind), dict)), None)
+    if not window or not (window.get("start") and window.get("end")):
+        return
+
+    written = await asyncio.to_thread(
+        append_constraints,
+        [{
+            "kind": "away_window",
+            "value": {"start": window["start"], "end": window["end"]},
+            "enforcement": "hard",
+            "scope": "household",
+            "applies_to": ["*"],
+            "label": "away window",
+            "note": f"you approved “{contract.get('title') or contract.get('objective', 'a goal')}”",
+            # Retires itself the day the family is back. A permanent away window would
+            # quietly empty every future meal week for the same two dates.
+            "expires_on": window["end"],
+        }],
+    )
+    if not written:
+        # Already known — a re-sent approval, or a reconnect replaying one. The store is
+        # append-only and idempotent enough to say nothing rather than write a duplicate.
+        logger.info("household_window_unchanged goal=%s", approved_goal_id)
+        return
+
+    logger.info("household_window_written goal=%s start=%s end=%s",
+                approved_goal_id, window["start"], window["end"])
+
+    profile = await asyncio.to_thread(load_family_profile)
+    today = date.today()
+    _, summaries = board.snapshot(device_id)
+    pushed = 0
+    for summary in summaries:
+        if summary.goal_id == approved_goal_id or summary.state in ("done", "declined"):
+            continue
+        other = dispatched_contracts.get(summary.goal_id)
+        if not other:
+            continue
+        domain = other.get("domain") or ""
+        resolved = resolve_constraints(profile, domain, today=today)
+        before = (other.get("constraints") or {}).get("hard") or {}
+        after = resolved["hard"]
+        if after == before:
+            continue
+
+        # Say it before doing it, so the chat's saving screen can caption itself with
+        # what is actually happening rather than a generic spinner. Sent once, on the
+        # first goal that moves — the user does not need a running commentary.
+        if pushed == 0:
+            await registry.send_to_uis(device_id, Notice(
+                goal_id=approved_goal_id,
+                kind="updating_goals",
+                message=f"Updating {summary.title} — you're away {_window_words(window)}.",
+            ).model_dump(mode="json"))
+        pushed += 1
+
+        note = (
+            f"Plan changed — you're away {_window_words(window)}. Review."
+        )
+        steer = (
+            f"The family is away from {window['start']} to {window['end']} inclusive — nobody is home "
+            "on those dates. Mark every plan row that falls inside that range as skipped, with a short "
+            "title saying so and a status_reason naming this as the reason. Adjust the days immediately "
+            "before and after if it helps: use up what would spoil before leaving, and keep the first "
+            "day back light because the kitchen will be bare."
+        )
+        await registry.send_to_device(device_id, Control(
+            goal_id=summary.goal_id,
+            command="constraints_changed",
+            payload=ControlPayload(hard=after, steer=steer, note=note),
+        ).model_dump(mode="json"))
+        # Keep the cached contract in step, or the next fan-out compares against a
+        # household two changes old and decides nothing moved.
+        other.setdefault("constraints", {})["hard"] = after
+        logger.info("household_change_pushed goal=%s domain=%s", summary.goal_id, domain)
+
+
+def _window_words(window: dict[str, Any]) -> str:
+    """"2026-07-30".."2026-07-31" -> "Thu & Fri" — the card has one line, not a date range."""
+    try:
+        start = date.fromisoformat(window["start"])
+        end = date.fromisoformat(window["end"])
+    except (KeyError, TypeError, ValueError):
+        return "while you're away"
+    days = [(start + timedelta(days=i)).strftime("%a") for i in range((end - start).days + 1)]
+    if len(days) == 1:
+        return days[0]
+    if len(days) == 2:
+        return f"{days[0]} & {days[1]}"
+    return f"{days[0]}–{days[-1]}"
 
 
 # --- device -> cloud -> ui ---------------------------------------------------

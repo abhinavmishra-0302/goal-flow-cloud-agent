@@ -251,8 +251,15 @@ def append_constraints(
       happens. Anything looser is dropped and logged.
     - **Nothing is removed.** Entries are appended. Relaxing a household rule is a
       deliberate act somewhere with more ceremony than a sentence typed at a fridge.
+    - **Saying the same thing twice writes once** (v7). An entry that is ALREADY live,
+      identical in kind, value and reach, is skipped rather than appended with a suffixed
+      id. This was found by the cross-goal gate on its first run: a re-sent approval, or a
+      reconnect replaying one, wrote a second identical away window — and since the
+      caller re-plans every goal whose constraints moved, a duplicate write meant a
+      duplicate re-plan of a plan the user had already watched change. Append-only is
+      about never REMOVING; it was never a reason to write the same fact twice.
 
-    Ids are stamped here so two captures of the same thing cannot collide.
+    Ids are stamped here so two captures of DIFFERENT things cannot collide.
     """
     today = today or date.today()
     target = profile_path(path)
@@ -269,6 +276,14 @@ def append_constraints(
         candidate.setdefault("applies_to", ["*"])
         candidate.setdefault("enforcement", "soft")
         candidate["captured_on"] = today.isoformat()
+
+        if _already_live(profile, candidate, today):
+            logger.info(
+                "constraint_capture_duplicate kind=%s value=%s — already in force, not written again",
+                candidate.get("kind"),
+                candidate.get("value"),
+            )
+            continue
 
         if not _tightens(profile, candidate, today):
             logger.warning(
@@ -289,6 +304,26 @@ def append_constraints(
             profile_file.write("\n")
         logger.info("constraints_captured path=%s ids=%s", target, [entry["id"] for entry in written])
     return written
+
+
+def _already_live(profile: dict[str, Any], candidate: dict[str, Any], today: date) -> bool:
+    """True when an identical, non-expired entry is already in force.
+
+    Compared on what the entry MEANS — kind, value and reach — not on its id or the day
+    it was captured, because the point is that re-stating a rule that is already true
+    changes nothing and should therefore write nothing.
+    """
+    def identity(entry: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            entry.get("kind"),
+            json.dumps(entry.get("value"), sort_keys=True, default=str),
+            entry.get("scope", "household"),
+            tuple(sorted(entry.get("applies_to") or ["*"])),
+            entry.get("enforcement", "soft"),
+        )
+
+    want = identity(candidate)
+    return any(identity(entry) == want for entry in active_constraints(profile, today))
 
 
 def _tightens(profile: dict[str, Any], candidate: dict[str, Any], today: date) -> bool:

@@ -364,6 +364,22 @@ class BoardService:
         # back to the task-DAG progress when there's no usable window/sim_date.
         day_prog = self._day_progress(self._windows.get(goal_id) or {}, payload.get("sim_date"))
         progress = 100 if done else (day_prog if day_prog is not None else summary.progress_pct)
+
+        # v7 — THE PLAN CHANGED WITHOUT BEING ASKED. Another goal the user already
+        # approved moved the household under this one. It is NOT an alert: an alert means
+        # "you still have to decide", and there is nothing left to decide. It is a line
+        # saying it is already done. Sticky until the user dismisses it, so it survives
+        # the day ticks between the change and their next look at the board.
+        changed_note = payload.get("plan_changed_note") or summary.plan_changed_note
+
+        # The cached plan must move with it, or opening the goal after a restart (or from
+        # a second tab) shows the plan the device replaced.
+        if payload.get("updated_plan") and goal_id in self._plans:
+            self._plans[goal_id] = {
+                **self._plans[goal_id],
+                "plan": payload["updated_plan"],
+            }
+
         return self._put(device_id, summary.model_copy(update={
             "task_status": task_status,
             "state": state,
@@ -372,6 +388,7 @@ class BoardService:
             "next_step": None if done else summary.next_step,
             "alerts": alerts,
             "activity": _push(summary.activity, payload.get("note")),
+            "plan_changed_note": None if done else changed_note,
             "updated_at": _now(),
         }))
 

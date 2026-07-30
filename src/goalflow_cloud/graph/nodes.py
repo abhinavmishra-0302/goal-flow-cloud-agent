@@ -544,6 +544,35 @@ def interpret_goal(state: GraphState) -> GraphState:
         }
 
 
+def _align_away_window(resolved: dict[str, Any], intent: dict[str, Any]) -> None:
+    """Make the away window mean the days the user actually SAID (v7). In place.
+
+    THE STORE SAYS THERE IS ONE; THE GOAL SAYS WHEN. The seeded entry is what declares
+    that this kind of goal has an away window at all and where the fact comes from — the
+    same R3 split as everywhere else, with policy naming the kind and the world supplying
+    the value. Its seeded offsets are a placeholder, and using them would put the demo in
+    the position of saying "Thursday and Friday" while the system quietly held a
+    different week.
+
+    Only ever narrows what already resolved: a domain with no away window does not gain
+    one here, so this cannot invent a household-wide block out of a goal's phrasing.
+    """
+    window = (resolved.get("hard") or {}).get("away_window")
+    if not isinstance(window, dict):
+        return
+    stated = intent.get("time_window") or {}
+    start, end = stated.get("start"), stated.get("end")
+    if not (start and end):
+        return
+    resolved["hard"]["away_window"] = {"start": start, "end": end}
+    if isinstance(resolved.get("hard_display"), dict) and "away_window" in resolved["hard_display"]:
+        resolved["hard_display"]["away_window"] = {"start": start, "end": end}
+    for row in resolved.get("applied") or []:
+        if row.get("kind") == "away_window":
+            row["value"] = {"start": start, "end": end}
+    logger.info("away_window_aligned start=%s end=%s", start, end)
+
+
 def load_memory(state: GraphState) -> GraphState:
     """Memory & Constraints: resolve the household constraint store FOR THIS GOAL.
 
@@ -564,6 +593,7 @@ def load_memory(state: GraphState) -> GraphState:
 
     soft_ids = _relevant_soft_ids(state, profile, domain, today)
     resolved = resolve_constraints(profile, domain, today=today, soft_ids=soft_ids)
+    _align_away_window(resolved, state.get("intent") or {})
 
     memory = {
         "family_id": profile.get("family_id"),
