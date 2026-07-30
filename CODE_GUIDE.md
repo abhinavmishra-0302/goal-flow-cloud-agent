@@ -20,6 +20,8 @@ scripts/verify_board.py           # gate 13: the board fold's numbers are derive
 scripts/verify_mirrors.py         # gate 14: the contract mirrors have not drifted
 scripts/verify_constraints.py     # gate 15: constraints resolve per goal; the enforced set is never narrowed
 scripts/verify_capture.py         # gate 16: a household rule is captured only when the user says yes
+scripts/verify_persistence.py     # gate 12: a goal survives a cloud restart at its gate
+scripts/verify_generic_gate.py    # gate 10: actionability is generic (needs an API key — the slow one)
 data/memory/family_profile.json   # household constraint store (sourced, scoped, expiring)
 src/goalflow_cloud/
   config.py                       # Settings dataclass from env (OPENROUTER_*, WS_*, LOG_LEVEL)
@@ -32,9 +34,10 @@ src/goalflow_cloud/
 
 ## The LangGraph StateGraph (`graph/nodes.py`)
 
-One graph run per goal, `thread_id = goal_id`, compiled with a **`MemorySaver`
-checkpointer** (`build_graph()`), so every `interrupt()` pause is durable and resumable
-(swap in a persistent checkpointer without touching the graph).
+One graph run per goal, `thread_id = goal_id`, compiled with a **`SqliteSaver`
+checkpointer** at `data/goalflow.db` (`default_checkpointer()`), so every `interrupt()` pause
+survives a process restart — kill the cloud mid-demo, restart it, and the goal is still
+waiting at its gate. Gate 12 (`scripts/verify_persistence.py`) is what proves it.
 
 **State** (`GraphState`, a `TypedDict`): `goal_text`, `intent`, `memory`, `understanding`,
 `understanding_confirmed`, `contract`, `plan`, `pending_approvals`, `decisions`,
@@ -45,7 +48,10 @@ checkpointer** (`build_graph()`), so every `interrupt()` pause is durable and re
 **Nodes and edges:**
 
 ```
-interpret_goal ─(route_after_interpret)→ load_memory | decline_out_of_scope | explain_block
+interpret_goal → detect_constraints
+detect_constraints ─(route_after_interpret_or_capture)→ load_memory | capture_gate
+                                                      | decline_out_of_scope | explain_block
+capture_gate → END                        (a statement, not a goal: the rule is offered, then it ends)
 load_memory → present_understanding ─(route_after_understanding)→ build_contract | goal_declined
 build_contract → dispatch_to_device → collect_plan
   ─(route_on_safety)→ hitl_approval | relay_decisions | explain_block | precheck_wait
@@ -54,15 +60,22 @@ explain_block → finalize → END
 goal_declined | decline_out_of_scope | precheck_wait → END
 ```
 
-- **`interpret_goal`** — the only LLM call in this repo: `ChatOpenAI` (OpenRouter
+This repo makes **three** LLM calls, all structured and all optional-to-fail: `interpret_goal`,
+the soft-relevance pass inside `load_memory`, and `detect_constraints`. Only the first can end a
+run — the other two degrade to a deterministic fallback.
+
+- **`interpret_goal`** — `ChatOpenAI` (OpenRouter
   base_url/model from `config.py`) with `with_structured_output(InterpretedIntent)`,
   producing `{domain, objective, success_criteria, scope, time_window}`. The prompt
   passes **real today** so `time_window` is always relative, never hardcoded.
   **LLM-only:** any failure (exception, missing time_window) sets `state["error"]` and
   `route_after_interpret` sends the run to `explain_block` — there is no scripted
   fallback anywhere.
-- **`load_memory`** — loads the profile via `memory/store.py`; keeps the `hard` block as
-  data and bundles `soft` + members + context as planning bias.
+- **`detect_constraints`** — reads the message for household rules the user just stated and
+  decides whether it is a goal at all (`statement_only`). It PROPOSES; it never writes.
+- **`load_memory`** — resolves the constraint store **for this goal's domain** via
+  `memory/store.py` (§ "Memory" below): `hard` is assembled by code only, `soft` is picked by a
+  small relevance call with tag-matching as the fallback.
 - **`present_understanding`** — the **confirm-understanding gate**: second `interrupt()`.
   Builds a short LLM-authored `thought` one-liner plus the `knew` hard-constraint chips
   and pauses (`kind: "understanding_confirmation"`) until the hub resumes it with the
@@ -264,5 +277,6 @@ Frozen `Settings` dataclass from env (`.env` via python-dotenv): `OPENROUTER_API
   new `domain` string and a free-form `scope`.
 - **Real memory:** replace `memory/store.py`'s JSON read with a vector store for soft
   prefs — but keep the hard block a deterministic, non-semantic lookup.
-- **Durable restarts:** swap `MemorySaver` for a persistent LangGraph checkpointer in
-  `build_graph()` — the interrupt/resume contract is unchanged.
+- **Multi-home memory:** `memory/store.py` reads ONE `family_profile.json` for every
+  session — the graph is isolated per `goal_id`, the household store is not. Keying it by
+  `device_id` is the next real step.

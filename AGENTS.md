@@ -23,7 +23,8 @@ Change `CONTRACT.md` first when the protocol moves.
 ## Stack & run
 
 - Python 3.11+, FastAPI + `uvicorn`, **LangGraph** (StateGraph + `interrupt()` HITL +
-  `MemorySaver` checkpointer, `thread_id = goal_id`). **LLM-only** via OpenRouter —
+  a **`SqliteSaver`** checkpointer at `data/goalflow.db`, `thread_id = goal_id` — a goal
+  survives a cloud restart still waiting at its gate). **LLM-only** via OpenRouter —
   no scripted/rules fallback; it fails loudly.
 - Run the hub: `./run.sh` (sources `.env`, runs `uvicorn goalflow_cloud.server:app`
   on `WS_HOST:WS_PORT`, default `0.0.0.0:8000`, WS endpoint `/ws`).
@@ -45,10 +46,12 @@ Change `CONTRACT.md` first when the protocol moves.
   session; every frame is logged with a correlation id (this log is the presenter
   "Show agent flow" feed).
 - `src/goalflow_cloud/graph/nodes.py` — the LangGraph StateGraph. Node flow:
-  `interpret_goal → load_memory → present_understanding [interrupt] → build_contract
-  → dispatch_to_device → collect_plan [interrupt] → hitl_approval [interrupt] →
-  relay_decisions → monitor → finalize`, with branches `goal_declined` (user declined
-  the understanding) and `explain_block`. Router: `route_after_understanding`.
+  `interpret_goal → detect_constraints → load_memory → present_understanding [interrupt]
+  → build_contract → dispatch_to_device → collect_plan → hitl_approval [interrupt] →
+  relay_decisions → monitor → finalize`, with branches `capture_gate` (a stated rule, no
+  goal — ends at the notice), `goal_declined`, `decline_out_of_scope`, `explain_block` and
+  `precheck_wait`. Routers: `route_after_interpret_or_capture`, `route_after_understanding`,
+  `route_on_safety`, `route_on_monitor`.
   The interpreter picks `domain` by preferring one of the device's advertised
   `capabilities.domains[].id` values (the device routes on the EXACT string), coining
   a new slug only when none fit — there is NO `_canonical_domain()` normalizer (that
@@ -117,7 +120,7 @@ NO logic change for the event-driven meal demo — `trigger_event` control + dev
 - **Known limitation:** `device_id` scopes message *delivery* (multi-session) and
   `goal_id` scopes each graph run (already isolated), but `memory/store.py` /
   `family_profile.json` is still GLOBAL — shared across every session, not per-home.
-- **Known risk:** `MemorySaver` + the `asyncio.to_thread` fan-out in `server.py` isn't
+- **Known risk:** the checkpointer + the `asyncio.to_thread` fan-out in `server.py` isn't
   proven thread-safe under truly-parallel graph writes (concurrent sessions hitting the
   graph at once). If races surface, wrap the graph invoke/resume/`update_state` calls in
   one `asyncio.Lock` — cloud graph steps are fast; the LLM work happens on the device.
