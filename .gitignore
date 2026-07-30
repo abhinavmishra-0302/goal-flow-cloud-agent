@@ -34,3 +34,9 @@ htmlcov/
 # got committed in v3-M6 — so the glob has to be explicit.
 data/goalflow.db
 data/goalflow.db-*
+
+# The scratch household store (v6). GOALFLOW_PROFILE_PATH points a demo run at a
+# copy so capture does not write to the committed seed; the copy itself is a run
+# artefact — the path FINAL_DEMO.md tells you to configure, so it is ignored here
+# rather than left for someone to `git checkout` after every rehearsal.
+data/memory/demo_profile.json
