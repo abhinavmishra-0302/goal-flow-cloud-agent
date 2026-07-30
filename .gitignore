@@ -39,4 +39,9 @@ data/goalflow.db-*
 # copy so capture does not write to the committed seed; the copy itself is a run
 # artefact — the path FINAL_DEMO.md tells you to configure, so it is ignored here
 # rather than left for someone to `git checkout` after every rehearsal.
-data/memory/demo_profile.json
+# Every scratch copy of the constraint store, not just the one the demo happens to use.
+# GOALFLOW_PROFILE_PATH can point anywhere, and a run WRITES to whatever it points at —
+# so naming one file left every other scratch profile trackable, and `git add -A` duly
+# committed a test one. The seed is family_profile.json; everything else here is residue.
+data/memory/*_profile.json
+!data/memory/family_profile.json
