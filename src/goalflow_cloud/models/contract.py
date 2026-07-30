@@ -282,7 +282,7 @@ class AgentEvent(_ContractModel):
 
     Payload shape depends on ``event``:
       phase:         {"phase": "grounding"|"planning"|"checking"|"awaiting_approval"}
-      thinking:      {"text": "..."}
+      thinking:      {"text": "...", "kind"?, "step"?, "detail"?}   # v7
       tool_call:     {"module": "...", "function": "...", "args": {...}}
       tool_result:   {"module": "...", "function": "...", "summary": "..."}
       plan_progress: {"item": {...}, "total": 7}   # total optional (v5.1)
@@ -297,6 +297,13 @@ class AgentEvent(_ContractModel):
     ``task_update`` (v3) is how the cloud learns a goal's shape and progress: the task
     DAG lives on the DEVICE (only it can ground a decomposition), so Agent Board's
     numbers are folded from these rather than guessed from the clock.
+
+    ``thinking.kind`` (v7, optional) is ``narration`` | ``step`` | ``notice``; absent
+    means ``narration``, which is every thinking event emitted before v7. A ``step``
+    carries ``step`` (headline) and ``detail`` (sub-line) and is WHOLE on arrival, never
+    fragmented — so a client renders it immediately instead of accumulating chunks and
+    guessing where one thought ends. ``text`` still holds "step — detail", so a client
+    that ignores the new fields is unaffected.
     """
 
     type: Literal["agent_event"] = "agent_event"
@@ -357,6 +364,13 @@ class ImpactItem(_ContractModel):
     value: str
 
 
+class RejectedOption(_ContractModel):
+    """One option the planner considered and did not take, and why (v7)."""
+
+    option: str
+    reason: str
+
+
 class PlanPayload(_ContractModel):
     """The plan_ready payload: plan + tiered proposals + safety + impact."""
 
@@ -365,6 +379,12 @@ class PlanPayload(_ContractModel):
     safety: SafetyResult
     impact: list[ImpactItem] = Field(default_factory=list)
     explanation: str = ""
+    #: v7, model-authored and DISPLAY ONLY: how many options were weighed, and which
+    #: were discarded with the reason each time. Nothing downstream reads them — a
+    #: lookup table cannot reject, so this is the clearest evidence a person can be
+    #: given that something reasoned. Absent is normal.
+    considered: int | None = None
+    rejected: list[RejectedOption] | None = None
     #: Cloud-added on present_plan only: the personalization "what it knew".
     knew: dict[str, Any] | None = None
 

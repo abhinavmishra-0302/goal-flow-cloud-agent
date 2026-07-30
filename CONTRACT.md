@@ -27,7 +27,7 @@ past.
 | v4.1 | `hello.surface`, the input-surface delivery fork, `chat_ui_open`/`chat_ui_close`, create-phase replay on bind |
 | v5.1 | `agent_event: harness`, `plan_progress.total` |
 | v6 | `constraints.hard`: `peak_hours`, `away_window`, `budget_envelope`; `understanding.constraints` (provenance) and `proposed_constraints`/`capture_only`; `understanding_response.accepted_constraint_ids` |
-| v7 | `understanding.preferences` (the soft half, one row per entry); `understanding.constraints[].kind`; store-side `display_to` narrows `knew`/`constraints` on both the gate and `present_plan` without touching what is dispatched or enforced |
+| v7 | `understanding.preferences` (the soft half, one row per entry); `understanding.constraints[].kind`; store-side `display_to` narrows `knew`/`constraints` on both the gate and `present_plan` without touching what is dispatched or enforced; `agent_event: thinking` gains `kind`/`step`/`detail`; `plan_ready.payload` gains `considered`/`rejected` |
 
 ## Transport
 
@@ -374,12 +374,21 @@ Payload shapes by `event`:
 | `event`         | `payload`                                                 |
 |-----------------|-----------------------------------------------------------|
 | `phase`         | `{ "phase": "queued" \| "grounding" \| "planning" \| "checking" \| "awaiting_approval" \| "executing" \| "monitoring" \| "adapting" }` |
-| `thinking`      | `{ "text": "..." }`                                       |
+| `thinking`      | `{ "text": "...", "kind"?: "narration" \| "step" \| "notice", "step"?: "...", "detail"?: "..." }` |
 | `tool_call`     | `{ "module": "...", "function": "...", "args": { } }`     |
 | `tool_result`   | `{ "module": "...", "function": "...", "summary": "..." }`|
 | `plan_progress` | `{ "item": { }, "total": 7 }`                             |
 | `task_update`   | `{ "task_id": "t2", "title": "find recipes", "state": "monitoring", "depends_on": ["t1"], "progress_pct": 43, "pending_tasks": 4, "next_step": "build the shopping list", "retry_count": 0, "failure_reason": null }` |
 | `harness`       | `{ "module": "safety", "status": "block", "note": "blocks \"peanut sauce\"", "verdict": "1 blocked", "grade": "A1" }` |
+
+**`thinking.kind`** (v7, optional) — `narration` | `step` | `notice`; absent means
+`narration`, which is every thinking event emitted before v7. A **`step`** carries `step`
+(headline) and `detail` (sub-line) and is **whole on arrival, never fragmented**, so a
+client renders it immediately instead of accumulating chunks and guessing where one
+thought ends. `text` still holds `"step — detail"`, so a client that ignores the new
+fields is unaffected. This exists because the compose call is not streamed and keeps its
+plan JSON off this channel deliberately: through v6 the planner emitted **nothing** on a
+healthy run, and a silent engine is indistinguishable from a broken one.
 
 **`plan_progress.total`** (v5.1, optional) — how many items the finished plan has. The
 device composes a plan in ONE non-streaming call and then emits every item in a single
@@ -446,10 +455,17 @@ next. It exists so a waiting goal is visible rather than appearing stalled.
       { "id": "day3-football", "day": 3, "label": "Thu",
         "title": "Football practice", "kind": "calendar.event_overlap", "order": 3 }
     ],
+    "considered": 17,
+    "rejected": [ { "option": "pork belly stir-fry", "reason": "no pork" } ],
     "explanation": "..."
   } }
 ```
 
+- `considered` / `rejected` (v7, optional) are **model-authored and display-only**.
+  Nothing downstream reads them: a wrong rejection reason costs a wrong sentence, which
+  is the right price for the clearest evidence a person can be given that something
+  reasoned rather than looked up — a lookup table cannot reject. Absent is normal, and a
+  model that weighed nothing is told to omit them rather than invent a number.
 - `plan[].day` is the **1-based plan-day index** — the source of truth for
   meal-week ordering (the UI renders "Day N"; events target a plan item by `day`).
 - `demo_events` (optional) is a display catalog of **presenter-fired** demo events.
