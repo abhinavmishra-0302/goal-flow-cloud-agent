@@ -17,7 +17,9 @@ CONTRACT.md                       # canonical CONTRACT v3 (source of truth; gene
 scripts/run_graph_demo.py         # run the graph on any goal text, print the contract
 scripts/verify_board.py           # gate 13: the board fold's numbers are derived and add up
 scripts/verify_mirrors.py         # gate 14: the contract mirrors have not drifted
-data/memory/family_profile.json   # generic family memory (hard + soft + context)
+scripts/verify_constraints.py     # gate 15: constraints resolve per goal; the enforced set is never narrowed
+scripts/verify_capture.py         # gate 16: a household rule is captured only when the user says yes
+data/memory/family_profile.json   # household constraint store (sourced, scoped, expiring)
 src/goalflow_cloud/
   config.py                       # Settings dataclass from env (OPENROUTER_*, WS_*, LOG_LEVEL)
   server.py                       # FastAPI WS hub: multi-session registry, routing, relays, graph driving, board pushes  ← start here
@@ -187,19 +189,46 @@ cloud-internal, *not* wire-contract semantics):
 `on_suggestions` / `take_suggestion`) are also served from here; a device going offline
 marks every unfinished card at-risk (`on_device_offline`).
 
-## Memory: the hard-vs-soft split (`memory/store.py`)
+## Memory: the household constraint store (`memory/store.py`) — v6
 
-`data/memory/family_profile.json` is generic (serves any domain):
+`data/memory/family_profile.json` is a **library of constraint entries**, one per fact,
+each carrying `kind`, `value`, `enforcement` (hard/soft), `source`
+(`account` | `derived` | `chat`), `scope`, `applies_to` and an optional expiry. It is the
+**account's** copy of household policy and pushes DOWN to the device; the device owns
+world state and never sources policy.
 
-- **`hard`** — the safety policy (`allergens`, `medical`, `dietary`, `budget_cap`,
-  `quiet_hours`). `hard_safety_block()` returns it **verbatim** and `build_contract`
-  copies it as data into `dispatch.constraints.hard` — a pure data path the LLM never
-  generates, edits, or paraphrases. The device's deterministic Safety filter enforces
-  exactly this block and nothing else ("LLM plans, code checks").
-  `scripts/run_graph_demo.py` asserts this invariant on every run.
-- **`soft` + `members` + `context`** — `soft_bias_block()` bundles these as planning
-  bias only; `soft` lands in `constraints.soft`, the rest grounds `dispatch.context`.
-  Never safety-enforced.
+`resolve_constraints(profile, domain, today, soft_ids)` resolves it **for one goal**:
+
+- **hard list kinds** (`allergens`, `dietary`, `medical`) are **unioned across every
+  entry, `applies_to` ignored**. The enforced set is never narrowed by relevance — a
+  wrong relevance pick must cost a noisy plan, never a safety miss.
+- **hard scalar kinds** (`budget_cap`, `quiet_hours`, `peak_hours`, `away_window`) are
+  **domain-picked**: most specific `applies_to` wins, ties go to the stricter value.
+  This is why a `vacation_prep` goal carries a $1500 travel cap and an away window
+  where `meal_plan` carries the $120 weekly cap — before v6 every goal got the $120.
+- **soft entries** are picked by relevance: `load_memory` runs a small structured LLM
+  call (`_relevant_soft_ids`) over `soft_candidates()`, and tag matching is a complete
+  fallback when it fails or picks nothing. Only soft goes near the model.
+- **`applied`** — provenance rows (id / label / source / why) that ride into the
+  understanding card as `payload.constraints`.
+
+**v6-M4 — capture from chat.** `detect_constraints` (a node between `interpret_goal`
+and the router) spots household rules the user STATED and PROPOSES them; nothing is
+written until the answer names their ids in `understanding_response.accepted_constraint_ids`.
+`memory.store.append_constraints` is the single write path and enforces two rules the
+caller cannot skip: captures may only **tighten** (a chat message may lower a cap, never
+raise one) and they only ever **append**. A message that is purely a statement
+("we've gone vegan") is un-actionable by design and routes to `capture_gate`, which
+rides the existing understanding wire with `capture_only: true` — no board card, and a
+`notice` of kind `captured` at the end. A rule accepted alongside a goal is re-resolved
+into THAT goal's dispatch, and a goal-scoped rule gets the goal's horizon as its expiry
+so "keep the party under $150" cannot quietly cap every birthday after it.
+Gate: `scripts/verify_capture.py` (gate 16).
+
+`build_contract` copies the resolved `hard` block into `dispatch.constraints.hard` as
+data; the device's deterministic Safety filter enforces exactly that block and nothing
+else ("LLM plans, code checks"). Gated by `scripts/verify_constraints.py` (gate 15);
+`scripts/run_graph_demo.py` re-resolves and asserts the dispatched block matches.
 
 ## Structured logging (first-class)
 

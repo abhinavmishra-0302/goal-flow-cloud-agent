@@ -10,7 +10,7 @@ import json
 import sys
 
 from goalflow_cloud.graph.nodes import build_graph, start_goal
-from goalflow_cloud.memory.store import load_family_profile
+from goalflow_cloud.memory.store import load_family_profile, resolve_constraints
 from goalflow_cloud.models.contract import Dispatch
 
 DEFAULT_GOAL = "we've got 6 people over Saturday for dinner - sort it"
@@ -24,12 +24,14 @@ def main() -> None:
     frame = start_goal(build_graph(), goal_text, goal_id="demo-goal")
     dispatch = Dispatch(**frame)
 
-    # Invariant check: constraints.hard must equal the profile's hard block
-    # VERBATIM (the LLM never touches the safety policy).
-    profile_hard = load_family_profile()["hard"]
+    # Invariant check (v6): constraints.hard must equal the store RESOLVED for this
+    # goal's domain — by code, deterministically. The LLM picks the domain and the
+    # soft bias; it never touches the safety policy, so re-resolving here must
+    # reproduce the dispatched block exactly.
+    expected_hard = resolve_constraints(load_family_profile(), dispatch.domain)["hard"]
     contract_hard = dispatch.constraints.hard.model_dump(exclude_none=True)
-    assert contract_hard == {k: v for k, v in profile_hard.items() if v is not None}, (
-        f"hard constraints drifted: {contract_hard} != {profile_hard}"
+    assert contract_hard == {k: v for k, v in expected_hard.items() if v is not None}, (
+        f"hard constraints drifted: {contract_hard} != {expected_hard}"
     )
 
     print(json.dumps(frame, indent=2, sort_keys=True))

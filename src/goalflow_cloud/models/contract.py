@@ -206,18 +206,35 @@ class UserGoal(_ContractModel):
 class HardConstraints(_ContractModel):
     """The safety policy — the ONLY block the device Safety filter enforces.
 
-    Injected VERBATIM from family memory (memory/store.py "hard" block);
-    never generated or paraphrased by the LLM. Extra keys are allowed so new
-    policy dimensions can flow through without a contract bump.
+    Resolved for THIS GOAL by code (memory/store.py ``resolve_constraints``) from
+    the household constraint store; never generated or paraphrased by the LLM.
+    Extra keys are allowed so new policy dimensions can flow through without a
+    contract bump.
+
+    v6: the list kinds are unioned across the whole store regardless of domain (the
+    enforced set is never narrowed by relevance), while the window/cap kinds below
+    are domain-picked — which is why a vacation goal carries a travel cap and an
+    away window where a meal goal carries the weekly grocery cap.
     """
 
     allergens: list[str] = Field(default_factory=list)
     medical: list[str] = Field(default_factory=list)
     dietary: list[str] = Field(default_factory=list)
-    #: Currency-agnostic spend ceiling (None = no cap).
+    #: Currency-agnostic spend ceiling (None = no cap). Domain-picked in v6.
     budget_cap: float | None = None
     #: e.g. {"start": "21:30", "end": "07:00"} — no noisy appliances inside.
     quiet_hours: dict[str, str] | None = None
+    #: v6, e.g. {"start": "17:00", "end": "21:00"} — peak electricity tariff; heavy
+    #: appliance runs inside it are blocked on the goals scoped to it.
+    peak_hours: dict[str, str] | None = None
+    #: v6, ISO DATES e.g. {"start": "2026-07-30", "end": "2026-08-06"} — the house is
+    #: empty; nothing may be scheduled to run in it. (Enforced from M2.)
+    away_window: dict[str, str] | None = None
+    #: v6-M3, e.g. {"cap": 600.0, "period": "monthly"} — the shared pool EVERY goal
+    #: draws from. The device resolves this goal's effective ceiling as
+    #: min(budget_cap, cap - spent), because per-goal caps alone cannot stop two
+    #: goals spending the same money.
+    budget_envelope: dict[str, Any] | None = None
 
 
 class Constraints(_ContractModel):
@@ -384,6 +401,17 @@ class UnderstandingPayload(_ContractModel):
     domain: str = ""
     #: Display-ready hard-constraint chips, same shape as PlanPayload.knew.
     knew: dict[str, Any] = Field(default_factory=dict)
+    #: v6, ADDITIVE: one row per applied constraint — {id, label, value, enforcement,
+    #: source, why}. Provenance for the gate: a block the user cannot trace is a
+    #: block they will not trust. `knew` is unchanged, so a UI may ignore this.
+    constraints: list[dict[str, Any]] = Field(default_factory=list)
+    #: v6-M4, ADDITIVE: household rules the user STATED in this message, awaiting a
+    #: yes. Proposals only — the LLM never writes policy, so nothing here applies
+    #: until it comes back in `understanding_response.accepted_constraint_ids`.
+    proposed_constraints: list[dict[str, Any]] = Field(default_factory=list)
+    #: v6-M4: this gate is a constraint capture, not a goal — there is no plan
+    #: coming, and the UI should ask only about the rules.
+    capture_only: bool = False
     thought: str = ""
     time_window: dict[str, str] | None = None
 
@@ -400,6 +428,10 @@ class Understanding(_ContractModel):
 
 class UnderstandingResponsePayload(_ContractModel):
     confirmed: bool
+    #: v6-M4: which proposed constraints the user actually said yes to. Absent or
+    #: empty means none — silence never captures a household rule, and confirming
+    #: the GOAL does not silently confirm a rule that rode along with it.
+    accepted_constraint_ids: list[str] = Field(default_factory=list)
 
 
 class UnderstandingResponse(_ContractModel):
@@ -504,7 +536,9 @@ class Notice(_ContractModel):
     #: "declined" (v4.1, active) = the create flow was cancelled (understanding
     #: gate declined / aborted) and is emitted ALONGSIDE ``chat_ui_close`` so the
     #: input (Bixby) surface can SPEAK the cancellation.
-    kind: Literal["out_of_scope", "declined"] = "out_of_scope"
+    #: "captured" (v6-M4) = the message stated a household rule rather than a goal;
+    #: the rule was confirmed and remembered, and no plan was ever coming.
+    kind: Literal["out_of_scope", "declined", "captured"] = "out_of_scope"
     message: str
 
 

@@ -16,9 +16,11 @@ Key invariants:
 - LLM-ONLY: interpret_goal is a real structured-output LLM call via OpenRouter;
   there is NO scripted fallback. Failure sets state["error"] and routes to
   explain_block.
-- Hard constraints flow through load_memory as DATA, verbatim into
-  contract.constraints.hard. The LLM never generates, edits, or paraphrases
-  the safety policy. "LLM plans, code checks."
+- Hard constraints flow through load_memory as DATA — resolved from the
+  household constraint store BY CODE (memory.store.resolve_constraints), then
+  copied into contract.constraints.hard. The LLM never generates, edits, or
+  paraphrases the safety policy; its only say over constraints is which SOFT
+  preferences are relevant. "LLM plans, code checks."
 - The device does the actual planning (SK function calling); the cloud graph
   pauses at its hand-off points and is resumed by the WS hub.
 """
@@ -41,7 +43,12 @@ from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field, ValidationError
 
 from goalflow_cloud.config import get_settings
-from goalflow_cloud.memory.store import hard_safety_block, load_family_profile, soft_bias_block
+from goalflow_cloud.memory.store import (
+    append_constraints,
+    load_family_profile,
+    resolve_constraints,
+    soft_candidates,
+)
 from goalflow_cloud.models.contract import Dispatch
 
 logger = logging.getLogger(__name__)
@@ -62,6 +69,11 @@ class GraphState(TypedDict, total=False):
     intent: dict[str, Any]
     #: Loaded memory profile: hard safety block + soft prefs + family context.
     memory: dict[str, Any]
+    #: v6-M4: household rules the user STATED in this message, awaiting confirmation.
+    #: Proposals only — nothing here is policy until the user says yes at the gate.
+    proposed_constraints: list[dict[str, Any]]
+    #: v6-M4: the message asks for nothing — it only states a household fact.
+    statement_only: bool
     #: Pre-planning understanding shown to the user before dispatch.
     understanding: dict[str, Any]
     #: User response to the understanding gate.
@@ -225,27 +237,78 @@ def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
             knew["budget"] = f"${float(hard['budget_cap']):g}"
         except (TypeError, ValueError):
             knew["budget"] = f"${hard['budget_cap']}"
-    quiet = hard.get("quiet_hours")
-    if quiet:
-        # NOT str(dict) — that renders "{'start': '21:30', 'end': '07:00'}" into a
-        # user-facing chip: a Python literal, quotes and braces included, on a fridge
-        # door. These chips are the agent proving it listened, so they have to read
-        # like a person wrote them.
-        if isinstance(quiet, dict) and (quiet.get("start") or quiet.get("end")):
-            knew["quiet hours"] = f"{quiet.get('start', '?')}–{quiet.get('end', '?')}"
-        elif isinstance(quiet, str) and quiet.strip():
-            knew["quiet hours"] = quiet.strip()
+    # NOT str(dict) — that renders "{'start': '21:30', 'end': '07:00'}" into a
+    # user-facing chip: a Python literal, quotes and braces included, on a fridge
+    # door. These chips are the agent proving it listened, so they have to read
+    # like a person wrote them.
+    for label, key in (("quiet hours", "quiet_hours"), ("peak tariff", "peak_hours"), ("away", "away_window")):
+        window = hard.get(key)
+        if not window:
+            continue
+        if isinstance(window, dict) and (window.get("start") or window.get("end")):
+            knew[label] = f"{window.get('start', '?')}–{window.get('end', '?')}"
+        elif isinstance(window, str) and window.strip():
+            knew[label] = window.strip()
+
+    envelope = hard.get("budget_envelope")
+    if isinstance(envelope, dict) and envelope.get("cap"):
+        # The pool, not this goal's slice — the device narrows the goal's own cap to
+        # whatever is left of it, so the chip says what the household has, not what
+        # the goal may spend.
+        period = str(envelope.get("period") or "").strip()
+        try:
+            knew["envelope"] = f"${float(envelope['cap']):g}" + (f" {period}" if period else "")
+        except (TypeError, ValueError):
+            knew["envelope"] = f"${envelope['cap']}"
     return knew
+
+
+def _applied_constraints(applied: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Display-ready provenance rows: what was applied, and where it came from.
+
+    Values are rendered here, not in the UI, for the same reason the ``knew`` chips
+    are: a raw ``{'start': ..., 'end': ...}`` on a fridge door reads like a bug.
+    """
+    rows: list[dict[str, Any]] = []
+    for entry in applied or []:
+        rows.append(
+            {
+                "id": entry.get("id", ""),
+                "label": entry.get("label", ""),
+                "value": _constraint_display(entry.get("kind", ""), entry.get("value")),
+                "enforcement": entry.get("enforcement", "soft"),
+                "source": entry.get("source", "account"),
+                "why": entry.get("why", ""),
+            }
+        )
+    return rows
+
+
+def _constraint_display(kind: str, value: Any) -> str:
+    """One constraint value as a person would write it."""
+    if isinstance(value, dict):
+        start, end = value.get("start"), value.get("end")
+        if start or end:
+            return f"{start or '?'}–{end or '?'}"
+        if value.get("cap") is not None:
+            period = str(value.get("period") or "").strip()
+            return f"${value['cap']:g}" + (f" {period}" if period else "")
+        return ""
+    if isinstance(value, list):
+        return ", ".join(str(item).replace("_", " ") for item in value)
+    if isinstance(value, bool) or value is None:
+        return ""
+    if kind == "budget_cap" and isinstance(value, (int, float)):
+        return f"${value:g}"
+    return str(value).replace("_", " ")
 
 
 def _understanding_thought_fallback(intent: dict[str, Any], hard: dict[str, Any], domain: str) -> str:
     tw = intent.get("time_window") or {}
-    constraint_count = (
-        len(hard.get("allergens") or [])
-        + len(hard.get("medical") or [])
-        + len(hard.get("dietary") or [])
-        + (1 if hard.get("budget_cap") else 0)
-        + (1 if hard.get("quiet_hours") else 0)
+    # Counted off the resolved block rather than a fixed list of five keys, so a new
+    # hard kind (peak_hours, away_window, …) is included the day it is added.
+    constraint_count = sum(
+        len(value) if isinstance(value, list) else (1 if value else 0) for value in hard.values()
     )
     label = domain.replace("_", " ")
     start = tw.get("start", "")
@@ -384,7 +447,8 @@ def interpret_goal(state: GraphState) -> GraphState:
                     "product is for. If nothing it can do relates to the goal — general "
                     "questions, trivia, facts, chit-chat, unrelated tasks — set "
                     "actionable=false, put one short reason in decline_reason, and you may "
-                    "leave time_window empty. ALWAYS respond by calling the structured "
+                    "leave time_window empty.\n\n"
+                    "ALWAYS respond by calling the structured "
                     "function — never answer the user's question directly in prose, even "
                     "for out-of-scope goals (call it with actionable=false instead).\n\n"
                     "DOMAIN: set `domain` to the advertised goal-shape id whose HINT best "
@@ -456,27 +520,523 @@ def interpret_goal(state: GraphState) -> GraphState:
 
 
 def load_memory(state: GraphState) -> GraphState:
-    """Memory & Constraints: load the generic profile, split hard/soft.
+    """Memory & Constraints: resolve the household constraint store FOR THIS GOAL.
 
-    TODO(v2-M1):
-    - memory.store.load_family_profile() -> state["memory"].
-    - profile["hard"] is the safety policy (allergens, medical, dietary,
-      budget_cap, quiet_hours): kept as DATA for verbatim injection.
-    - profile["soft"] + members + context: planning bias only.
+    v6: the store is a library of sourced, scoped, expiring entries, and this node
+    resolves it against the goal's domain — so a vacation goal carries a travel cap
+    and an away window instead of the $120 weekly grocery cap that every goal used
+    to inherit.
+
+    The split that matters: ``resolve_constraints`` builds the HARD block from store
+    data by code alone. The LLM's only say is ``_relevant_soft_ids`` — which SOFT
+    preferences to send — and that call is allowed to fail, because tag matching
+    inside the resolver is a complete fallback.
     """
     logger.info("graph_node_enter node=load_memory")
     profile = load_family_profile()
+    domain = (state.get("intent") or {}).get("domain", "")
+    today = date.today()
+
+    soft_ids = _relevant_soft_ids(state, profile, domain, today)
+    resolved = resolve_constraints(profile, domain, today=today, soft_ids=soft_ids)
+
     memory = {
         "family_id": profile.get("family_id"),
-        "hard": hard_safety_block(profile),
-        "bias": soft_bias_block(profile),
+        "hard": resolved["hard"],
+        "bias": {
+            "members": list(profile.get("members", [])),
+            "soft": resolved["soft"],
+            "context": resolved["context"],
+        },
+        # Provenance: which entries were picked, from where, and why. Rides into the
+        # understanding card and the logs — a block the user cannot trace is a block
+        # they will not trust.
+        "applied": resolved["applied"],
     }
-    logger.info("graph_node_exit node=load_memory family_id=%s", memory.get("family_id"))
+    logger.info(
+        "graph_node_exit node=load_memory family_id=%s domain=%s applied=%d picked=%s",
+        memory.get("family_id"),
+        domain,
+        len(resolved["applied"]),
+        "relevance" if soft_ids else "tagged",
+    )
     return {
         "memory": memory,
         "task_status": "grounding",
-        "event_log": [_event(state, "memory_loaded", {"family_id": memory.get("family_id")})],
+        "event_log": [
+            _event(
+                state,
+                "memory_loaded",
+                {
+                    "family_id": memory.get("family_id"),
+                    "domain": domain,
+                    "constraints": [entry["id"] for entry in resolved["applied"]],
+                },
+            )
+        ],
     }
+
+
+class _SoftSelection(BaseModel):
+    """Structured LLM output for the soft-preference relevance pass."""
+
+    ids: list[str] = Field(
+        default_factory=list,
+        description="Ids of the soft entries worth sending with THIS goal. Omit the rest.",
+    )
+
+
+def _relevant_soft_ids(
+    state: GraphState,
+    profile: dict[str, Any],
+    domain: str,
+    today: date,
+) -> list[str] | None:
+    """Ask a small LLM call which SOFT preferences this goal should carry.
+
+    Why the model is allowed near this at all: ``applies_to`` tags only know the
+    domains someone thought to write down, and the interpreter is free to COIN a
+    domain slug for a goal nobody anticipated — that goal would fall back to the
+    household-wide entries alone. Relevance covers what tagging cannot.
+
+    Why it is allowed to fail: this is SOFT bias only. Returning None hands the
+    resolver back to tag matching, which is a complete answer on its own. Nothing
+    here touches the hard block.
+    """
+    candidates = soft_candidates(profile, today)
+    if not candidates:
+        return None
+
+    intent = state.get("intent") or {}
+    settings = get_settings()
+    max_tokens = settings.openrouter_max_tokens
+    # 1200, not the ~40 an id list actually needs: the default model is a REASONING
+    # model, and its reasoning tokens are drawn from this same budget. At 200 the
+    # thinking consumed the allowance and the function call never landed — the call
+    # returned None, no exception, and every goal quietly fell back to tag matching.
+    # A relevance pass that silently never runs is worse than not having one.
+    selection_tokens = min(max_tokens, 1200) if isinstance(max_tokens, int) and max_tokens > 0 else 1200
+    try:
+        llm = ChatOpenAI(
+            model=settings.openrouter_model,
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+            temperature=0,
+            max_tokens=selection_tokens,
+            timeout=20,
+            max_retries=0,
+        )
+        structured_llm = llm.with_structured_output(_SoftSelection, method="function_calling")
+        selection = structured_llm.invoke(
+            [
+                (
+                    "system",
+                    "You pick which household PREFERENCES are worth sending with a goal. "
+                    "These are soft biases, never safety rules — you are not deciding what is "
+                    "allowed, only what is relevant.\n\n"
+                    "Return the ids that would make a planner's output better for THIS goal, "
+                    "and leave out the ones that would only add noise: a vacation checklist "
+                    "does not need the family's dinner preferences, and a meal plan does not "
+                    "need the departure routine. Household notes about who is busy when are "
+                    "usually worth keeping. Prefer a few good ones over all of them; return "
+                    "no ids at all rather than padding the list.",
+                ),
+                (
+                    "human",
+                    "Goal: {objective}\nDomain: {domain}\n\nCandidates (JSON):\n{candidates}".format(
+                        objective=intent.get("objective") or state.get("goal_text", ""),
+                        domain=domain or "(none)",
+                        candidates=candidates,
+                    ),
+                ),
+            ]
+        )
+        ids = [str(i) for i in (getattr(selection, "ids", None) or []) if str(i).strip()]
+        known = {entry["id"] for entry in candidates}
+        # Drop hallucinated ids rather than letting them silently select nothing —
+        # an empty result after filtering falls back to tags, which is correct.
+        picked = [i for i in ids if i in known]
+        if len(picked) != len(ids):
+            logger.warning("soft_relevance_unknown_ids dropped=%s", sorted(set(ids) - known))
+        if not picked:
+            # Not an error — tags are a complete answer — but say so out loud. This
+            # is the only signal that the pass ran and chose nothing.
+            logger.info("soft_relevance_empty domain=%s — using applies_to tags", domain)
+        return picked or None
+    except Exception:
+        logger.exception("soft_relevance_llm_failed — falling back to applies_to tags")
+        return None
+
+
+class _ProposedConstraint(BaseModel):
+    """One household rule the user just STATED, proposed for confirmation."""
+
+    kind: str = Field(description="allergens | dietary | medical | budget_cap | dislikes | prefer | habits")
+    value: Any = Field(
+        description=(
+            "A list of short avoid-slugs (['no_dairy', 'no_meat']), a number for a cap, "
+            "or a short string. For a diet, list what must be AVOIDED — never the diet's "
+            "name: 'vegan' names a philosophy, 'no_dairy' names a thing to keep out of a "
+            "recipe, and only the second one can be checked."
+        )
+    )
+    enforcement: str = Field(default="soft", description="'hard' only for allergens/dietary/medical/budget_cap.")
+    scope: str = Field(
+        default="household",
+        description="'goal' if the rule is about THIS goal only (a spend limit for this party); else 'household'.",
+    )
+    applies_to: list[str] = Field(
+        default_factory=lambda: ["*"],
+        description="['*'] for a standing household rule; [this goal's domain] when scope is 'goal'.",
+    )
+    label: str = Field(default="", description="Two or three words a person would recognise: 'no dairy'.")
+    quote: str = Field(default="", description="The user's own words this came from, verbatim and short.")
+    expires_on: str = Field(default="", description="ISO date, ONLY if the user time-boxed it ('for two weeks').")
+
+
+class _CaptureResult(BaseModel):
+    constraints: list[_ProposedConstraint] = Field(default_factory=list)
+    statement_only: bool = Field(
+        default=False,
+        description=(
+            "True ONLY when the message asks for nothing at all — it just states a fact "
+            "about the household ('we've gone vegan'). False whenever it asks for "
+            "anything to be done, arranged or got ready, even indirectly."
+        ),
+    )
+
+
+def detect_constraints(state: GraphState) -> GraphState:
+    """Spot household rules the user STATED, and propose them — never apply them.
+
+    "We've gone vegan" is not a goal; it is a standing fact about the household, and
+    a home assistant that makes you re-say it every week is not remembering anything.
+    But a model must not write the policy it is then checked against (R2), so this
+    node only ever PROPOSES: the confirmation happens at the gate, and
+    ``memory.store.append_constraints`` is the single write path.
+
+    It runs before the actionability router because a message can be pure statement
+    ("we've gone vegan", no goal attached) — which the interpreter correctly judges
+    un-actionable, and which must be captured rather than declined.
+    """
+    logger.info("graph_node_enter node=detect_constraints")
+    goal_text = state.get("goal_text", "").strip()
+    if not goal_text:
+        return {"proposed_constraints": [], "statement_only": False}
+
+    settings = get_settings()
+    max_tokens = settings.openrouter_max_tokens
+    # Same reasoning-token trap as the relevance pass: too small a budget and the
+    # structured call never lands, silently.
+    capture_tokens = min(max_tokens, 1200) if isinstance(max_tokens, int) and max_tokens > 0 else 1200
+    today = date.today()
+    # A limit stated WITH a goal usually belongs to that goal ("keep the party under
+    # $150"), not to the household forever. Telling the model which goal it is looking
+    # at is what lets it say so — and a household-wide $150 would be resolved away by
+    # the more specific standing cap, which is a silent way to ignore the user.
+    intent = state.get("intent") or {}
+    # THE STATEMENT/GOAL CALL LIVES HERE, not in the interpreter. Teaching the
+    # interpreter that "a bare statement is not a goal" cost it a goal it had always
+    # got right — "get the house ready, we're away all next week" started coming back
+    # un-actionable, because the rule and the counter-example look alike from there.
+    # This node is already reading the message for household rules, so it is the one
+    # place where "does this ask for anything?" is a natural question.
+    statement_hint = ""
+    domain = intent.get("domain") or ""
+    scope_hint = (
+        f"This message also asks for a '{domain}' goal. A rule that is really about THAT goal — a "
+        f"spend limit for this party, a rule for this trip — takes scope='goal' and applies_to=['{domain}']. "
+        "A standing household rule takes scope='household' and applies_to=['*']."
+        if domain
+        else "There is no goal here, only a statement: use scope='household' and applies_to=['*']."
+    )
+    try:
+        llm = ChatOpenAI(
+            model=settings.openrouter_model,
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+            temperature=0,
+            max_tokens=capture_tokens,
+            timeout=20,
+            max_retries=0,
+        )
+        structured_llm = llm.with_structured_output(_CaptureResult, method="function_calling")
+        result = structured_llm.invoke(
+            [
+                (
+                    "system",
+                    "You spot HOUSEHOLD RULES a person states in passing, so a home assistant can "
+                    "remember them instead of asking again next week.\n\n"
+                    "FIRST answer statement_only: does this message ask for ANYTHING to be done, "
+                    "arranged or got ready? If it asks for nothing and merely states a fact about "
+                    "the household, statement_only is TRUE — \"we've gone vegan\", \"Aarav is "
+                    "allergic to peanuts\", \"no dairy for two weeks\" are all statement_only. If "
+                    "it asks for something, even indirectly (\"plan our dinners\", \"get the house "
+                    "ready, we're away next week\"), statement_only is FALSE — the facts in it are "
+                    "context for a job that was requested.\n\n"
+                    f"Real today is {today.isoformat()}.\n\n"
+                    "Return a constraint ONLY for a standing fact or rule about the household: a diet "
+                    "('we've gone vegan', 'no dairy for a month'), an allergy, a medical restriction, a "
+                    "spending limit ('keep the party under $150'), a strong preference or routine.\n\n"
+                    "Return NOTHING for an ordinary goal or request. 'Plan our dinners this week' states "
+                    "no rule — it is just the job. Most messages produce no constraints, and that is the "
+                    "correct answer; inventing one puts words in the family's mouth.\n\n"
+                    "NEVER propose removing, relaxing or raising an existing rule. 'We can eat pork "
+                    "again' and 'raise the budget to $900' are not constraints — return nothing for "
+                    "them. You may only ever propose something MORE restrictive.\n\n"
+                    "enforcement='hard' only for allergens, dietary, medical and budget_cap — things a "
+                    "plan must be BLOCKED for violating. Preferences, dislikes and routines are 'soft'.\n"
+                    "Set expires_on only when the user time-boxed it, resolved to an ISO date.\n"
+                    "quote must be the user's own words, short and verbatim.\n\n"
+                    f"{scope_hint}{statement_hint}",
+                ),
+                ("human", goal_text),
+            ]
+        )
+        proposed = [c.model_dump(mode="json") for c in (getattr(result, "constraints", None) or [])]
+        proposed = [c for c in proposed if _capture_is_sane(c)]
+        proposed = _dedupe_captures(proposed)
+        for index, entry in enumerate(proposed, start=1):
+            # A proposal id is only needed to answer with ("I accept #2"); the STORED
+            # id is minted at write time, so these never reach the file.
+            entry["id"] = f"proposed-{index}"
+            # A label of "dietary" tells the user nothing — the thought line read
+            # "dietary and dietary" for two rules. Fall back to what the rule SAYS.
+            entry["label"] = entry.get("label") or _constraint_display(entry.get("kind", ""), entry.get("value"))
+        statement_only = bool(getattr(result, "statement_only", False)) and bool(proposed)
+        logger.info(
+            "graph_node_exit node=detect_constraints proposed=%d statement_only=%s",
+            len(proposed), statement_only,
+        )
+        return {
+            "proposed_constraints": proposed,
+            "statement_only": statement_only,
+            "event_log": [
+                _event(state, "constraints_proposed", {"count": len(proposed), "statement_only": statement_only})
+            ],
+        }
+    except Exception:
+        # Capture is a convenience, not a gate. Losing it costs the user a repeat;
+        # failing the goal over it would cost them the goal.
+        logger.exception("constraint_capture_failed — continuing without capture")
+        return {"proposed_constraints": [], "statement_only": False}
+
+
+#: What a named diet actually forbids. The device's safety vocabulary matches THINGS
+#: — "dairy" expands to milk, paneer, cheese — so a dietary value of "vegan" reads
+#: like a rule and blocks precisely nothing. The prompt asks for avoid-slugs and
+#: usually obliges; this is the deterministic backstop for the times it does not,
+#: because "captured but unenforceable" is the one outcome capture must never have.
+_DIET_RESTRICTIONS: dict[str, list[str]] = {
+    "vegan": ["no_meat", "no_dairy", "no_eggs", "no_honey"],
+    "vegetarian": ["no_meat"],
+    "pescatarian": ["no_meat"],
+    "halal": ["no_pork", "no_alcohol"],
+    "kosher": ["no_pork", "no_shellfish"],
+    "dairy_free": ["no_dairy"],
+    "gluten_free": ["no_gluten"],
+    "nut_free": ["no_nuts"],
+    "lactose_free": ["no_dairy"],
+}
+
+
+def _expand_diet(value: Any) -> Any:
+    """Turn a diet's NAME into the things it forbids; leave everything else alone."""
+    items = value if isinstance(value, list) else [value]
+    expanded: list[str] = []
+    changed = False
+    for item in items:
+        slug = str(item).strip().lower().replace(" ", "_").replace("-", "_")
+        if slug in _DIET_RESTRICTIONS:
+            expanded.extend(_DIET_RESTRICTIONS[slug])
+            changed = True
+        elif str(item).strip():
+            expanded.append(str(item).strip())
+    if not changed:
+        return value
+    logger.info("constraint_capture_expanded value=%s -> %s", value, expanded)
+    return list(dict.fromkeys(expanded))
+
+
+def _dedupe_captures(proposed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One rule, one row.
+
+    The model happily returns "we've gone vegan" as both a hard dietary rule and a
+    soft preference. Two identical-looking rows at a confirmation gate is a question
+    the user cannot answer — and ticking both would store the same thing twice. The
+    HARD one wins: between two readings of the same sentence, keep the one that
+    actually constrains.
+    """
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in proposed:
+        value = entry.get("value")
+        key = (
+            entry["kind"],
+            ",".join(sorted(str(v) for v in value)) if isinstance(value, list) else str(value),
+        )
+        incumbent = by_key.get(key)
+        if incumbent is None:
+            by_key[key] = entry
+        elif entry.get("enforcement") == "hard" and incumbent.get("enforcement") != "hard":
+            by_key[key] = entry
+    if len(by_key) != len(proposed):
+        logger.info("constraint_capture_deduped %d -> %d", len(proposed), len(by_key))
+    return list(by_key.values())
+
+
+def _capture_is_sane(entry: dict[str, Any]) -> bool:
+    """Drop or repair proposals the prompt asked for but the model may still get wrong."""
+    kind = _KIND_SYNONYMS.get(str(entry.get("kind") or "").strip().lower())
+    if not kind or entry.get("value") in (None, "", [], {}):
+        # An unrecognised kind is NOT stored as-is. It would resolve to nothing —
+        # neither unioned into the hard block nor picked as bias — so the user would
+        # be told their rule was remembered while it silently did nothing at all.
+        if entry.get("kind"):
+            logger.warning("constraint_capture_unknown_kind kind=%s — dropped", entry.get("kind"))
+        return False
+    entry["kind"] = kind
+    if kind == "dietary":
+        entry["value"] = _expand_diet(entry["value"])
+    if entry.get("enforcement") == "hard" and kind not in _CAPTURABLE_HARD_KINDS:
+        # A "hard" anything-else would ride into constraints.hard where no device rule
+        # enforces it — a constraint that reads as a guarantee and blocks nothing.
+        logger.warning("constraint_capture_downgraded kind=%s — no rule enforces it", kind)
+        entry["enforcement"] = "soft"
+    return True
+
+
+#: The hard kinds a person can state in chat AND the device actually enforces.
+#: quiet_hours / peak_hours / away_window are windows the account or the calendar
+#: owns; capturing one from a sentence would be guessing at a schedule.
+_CAPTURABLE_HARD_KINDS = {"allergens", "dietary", "medical", "budget_cap"}
+
+#: Model wording → the store's kind. The model reaches for "diet" and "allergy" as
+#: readily as the canonical names, and a kind the resolver does not recognise is a
+#: constraint that resolves to nothing — so map what is obviously the same thing and
+#: drop the rest rather than storing a rule that cannot act.
+_KIND_SYNONYMS = {
+    kind: kind
+    for kind in ("allergens", "dietary", "medical", "budget_cap", "dislikes", "prefer", "habits", "context")
+} | {
+    "allergy": "allergens",
+    "allergies": "allergens",
+    "allergen": "allergens",
+    "diet": "dietary",
+    "diets": "dietary",
+    "dietary_restriction": "dietary",
+    "dietary_restrictions": "dietary",
+    "medical_condition": "medical",
+    "health": "medical",
+    "budget": "budget_cap",
+    "budget_limit": "budget_cap",
+    "spend_cap": "budget_cap",
+    "cap": "budget_cap",
+    "dislike": "dislikes",
+    "preference": "prefer",
+    "preferences": "prefer",
+    "prefers": "prefer",
+    "habit": "habits",
+    "routine": "habits",
+    "routines": "habits",
+}
+
+
+def route_after_interpret_or_capture(state: GraphState) -> str:
+    """Actionable goals plan; un-actionable ones with a captured rule still land somewhere.
+
+    Without this branch "we've gone vegan" gets the out-of-scope redirect — technically
+    correct (it is not a goal) and exactly the wrong answer, because the user just told
+    the assistant something it should remember.
+    """
+    if state.get("error"):
+        return "explain_block"
+    # A message that only STATES something goes to capture even when the interpreter
+    # judged it actionable — left alone, "we've gone vegan" came back as a whole week
+    # of invented dinners nobody asked for.
+    if state.get("statement_only") and state.get("proposed_constraints"):
+        return "capture_gate"
+    if (state.get("intent") or {}).get("actionable") is False:
+        return "capture_gate" if state.get("proposed_constraints") else "decline_out_of_scope"
+    return "load_memory"
+
+
+def capture_gate(state: GraphState) -> GraphState:
+    """The user stated a rule and no goal: confirm it, then remember it.
+
+    Rides the EXISTING understanding gate wire rather than minting a frame kind —
+    that card is already "here is what I understood, yes or no?", and this is the
+    same question about a smaller thing. ``capture_only`` tells the UI there is no
+    plan coming.
+    """
+    logger.info("graph_node_enter node=capture_gate")
+    proposed = state.get("proposed_constraints") or []
+    understanding = {
+        "objective": state.get("goal_text", ""),
+        "title": "",
+        "domain": "",
+        "time_window": {},
+        "hard": {},
+        "knew": {},
+        "constraints": [],
+        "capture_only": True,
+        "proposed_constraints": proposed,
+        "thought": _capture_thought(proposed),
+    }
+    incoming = interrupt(
+        {
+            "kind": "understanding_confirmation",
+            "goal_id": state.get("goal_id"),
+            "understanding": understanding,
+        }
+    )
+    if isinstance(incoming, dict) and "payload" in incoming:
+        incoming = incoming["payload"]
+    accepted = _accepted_constraints(incoming, proposed)
+    written = append_constraints(accepted) if accepted else []
+
+    message = (
+        "Noted — I'll remember that: " + ", ".join(entry.get("label", "") for entry in written) + "."
+        if written
+        else "Nothing saved."
+    )
+    logger.info("graph_node_exit node=capture_gate written=%d", len(written))
+    return {
+        "understanding": understanding,
+        "task_status": "done",
+        "explanation": {"type": "captured", "message": message},
+        "event_log": [_event(state, "constraints_captured", {"ids": [e["id"] for e in written]})],
+    }
+
+
+def _capture_thought(proposed: list[dict[str, Any]]) -> str:
+    labels = [str(entry.get("label") or entry.get("kind", "")) for entry in proposed]
+    if not labels:
+        return "I didn't catch a household rule in that."
+    joined = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + f" and {labels[-1]}"
+    return f"That sounds like a standing rule — {joined}. Want me to remember it for every goal?"
+
+
+def _accepted_constraints(
+    incoming: Any,
+    proposed: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """The proposals the user actually said yes to.
+
+    Silence is a NO. An answer that confirms the goal but names no constraint ids
+    accepts no constraints — a household rule needs its own yes, not one inherited
+    from clicking Confirm on something else.
+    """
+    if not isinstance(incoming, dict) or not incoming.get("confirmed"):
+        return []
+    accepted_ids = incoming.get("accepted_constraint_ids")
+    if not isinstance(accepted_ids, list):
+        return []
+    wanted = {str(i) for i in accepted_ids}
+    return [
+        {k: v for k, v in entry.items() if k != "id" and v not in ("", None)}
+        for entry in proposed
+        if entry.get("id") in wanted
+    ]
 
 
 def present_understanding(state: GraphState) -> GraphState:
@@ -496,6 +1056,14 @@ def present_understanding(state: GraphState) -> GraphState:
         "time_window": intent.get("time_window") or {},
         "hard": hard,
         "knew": _hard_knew(hard),
+        # v6 provenance, additive: WHERE each constraint came from and why it was
+        # picked for this goal. `knew` stays exactly as it was, so no UI has to
+        # change to ship this — the chips keep working and this rides alongside.
+        "constraints": _applied_constraints(memory.get("applied")),
+        # v6-M4, additive: rules the user stated in the same breath as the goal
+        # ("plan our dinners — we've gone vegan"). Proposed here, applied only if
+        # they come back accepted.
+        "proposed_constraints": state.get("proposed_constraints") or [],
         "thought": _understanding_thought(intent, hard, domain),
     }
     incoming = interrupt(
@@ -508,10 +1076,42 @@ def present_understanding(state: GraphState) -> GraphState:
     if isinstance(incoming, dict) and "payload" in incoming:
         incoming = incoming["payload"]
     confirmed = bool(isinstance(incoming, dict) and incoming.get("confirmed"))
+
+    # A rule accepted here binds THIS goal, not just the next one. The user said it
+    # while asking for this plan; honouring it a week later would be a strange kind
+    # of remembering. Persist, then re-resolve so the dispatch carries it.
+    accepted = _accepted_constraints(incoming, understanding["proposed_constraints"])
+    if accepted:
+        # A goal-scoped rule MUST expire. "Keep the party under $150" is true of this
+        # party; left permanent it would quietly cap every birthday from now on, and
+        # nobody would remember why. The goal's own horizon is the natural end date.
+        window_end = (intent.get("time_window") or {}).get("end")
+        for entry in accepted:
+            if entry.get("scope") == "goal" and not entry.get("expires_on") and window_end:
+                entry["expires_on"] = window_end
+        written = append_constraints(accepted)
+        if written:
+            today = date.today()
+            resolved = resolve_constraints(load_family_profile(), domain, today=today)
+            memory = {
+                **memory,
+                "hard": resolved["hard"],
+                "bias": {**memory.get("bias", {}), "soft": resolved["soft"], "context": resolved["context"]},
+                "applied": resolved["applied"],
+            }
+            understanding["hard"] = resolved["hard"]
+            understanding["knew"] = _hard_knew(resolved["hard"])
+            understanding["constraints"] = _applied_constraints(resolved["applied"])
+            logger.info("captured_constraints_applied goal=%s ids=%s",
+                        state.get("goal_id"), [entry["id"] for entry in written])
     logger.info("graph_node_exit node=present_understanding confirmed=%s", confirmed)
     return {
         "understanding": understanding,
         "understanding_confirmed": confirmed,
+        # Re-resolved when a rule was captured above — build_contract reads this, so
+        # returning the local would be the difference between "we've gone vegan"
+        # binding this goal and being silently deferred to the next one.
+        "memory": memory,
         "task_status": "grounding",
         "event_log": [
             _event(
@@ -526,11 +1126,12 @@ def present_understanding(state: GraphState) -> GraphState:
 def build_contract(state: GraphState) -> GraphState:
     """Assemble + validate the generic Task Contract (models.contract.Dispatch).
 
-    TODO(v2-M1):
-    - Merge intent (LLM) with constraints.hard copied VERBATIM from memory.
-    - constraints.soft from soft prefs; scope/context stay domain-flexible.
-    - autonomy = "tiered"; mint goal_id + correlation_id.
-    - Validate via Dispatch(**frame); stash the frame in state["contract"].
+    Merges the LLM's intent with the constraints ``load_memory`` already RESOLVED
+    for this goal's domain: ``constraints.hard`` is copied straight out of
+    ``state["memory"]["hard"]`` — no edit, no paraphrase, nothing derived from the
+    model — while ``soft``/``context`` carry the picked bias. ``autonomy`` is
+    "tiered"; goal_id + correlation_id are minted here; ``Dispatch(**frame)``
+    validates before the frame leaves the cloud.
     """
     logger.info("graph_node_enter node=build_contract")
     intent = state["intent"]
@@ -909,6 +1510,8 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     graph = StateGraph(GraphState)
 
     graph.add_node("interpret_goal", interpret_goal)
+    graph.add_node("detect_constraints", detect_constraints)
+    graph.add_node("capture_gate", capture_gate)
     graph.add_node("load_memory", load_memory)
     graph.add_node("present_understanding", present_understanding)
     graph.add_node("build_contract", build_contract)
@@ -924,15 +1527,21 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     graph.add_node("finalize", finalize)
 
     graph.set_entry_point("interpret_goal")
+    # Capture runs between interpreting and routing: a message can be a pure
+    # STATEMENT ("we've gone vegan"), which is correctly un-actionable and must
+    # still be remembered rather than redirected.
+    graph.add_edge("interpret_goal", "detect_constraints")
     graph.add_conditional_edges(
-        "interpret_goal",
-        route_after_interpret,
+        "detect_constraints",
+        route_after_interpret_or_capture,
         {
             "load_memory": "load_memory",
+            "capture_gate": "capture_gate",
             "decline_out_of_scope": "decline_out_of_scope",
             "explain_block": "explain_block",
         },
     )
+    graph.add_edge("capture_gate", END)
     graph.add_edge("load_memory", "present_understanding")
     graph.add_conditional_edges(
         "present_understanding",

@@ -178,16 +178,34 @@ dispatch. The graph is paused until the UI answers with `understanding_response`
     "objective": "...",
     "domain": "meal_plan",
     "knew": { "allergens": ["peanuts"], "budget": "$120" },
+    "constraints": [
+      { "id": "c-cap-travel", "label": "travel budget", "value": "$1500",
+        "enforcement": "hard", "source": "account", "why": "domain" }
+    ],
     "thought": "I'll shape a meal plan around your constraints before planning.",
     "time_window": { "start": "<ISO>", "end": "<ISO>" }
   } }
 ```
 
+`constraints` (v6, **additive**) is the provenance list behind the `knew` chips: one
+row per applied constraint, with `source` ∈ `account | derived | chat` and `why`
+saying whether it was enforced always, picked for this domain, or captured. `knew` is
+unchanged, so a UI that ignores `constraints` keeps working.
+
+**v6-M4 — capture (additive).** When the message STATES a household rule, the payload
+also carries `proposed_constraints` — `[{id, kind, value, enforcement, label, quote,
+expires_on}]` — and the response answers with `accepted_constraint_ids`. Only the ids
+sent back are ever written: the model proposes, the user disposes, and a confirmed
+GOAL never implies a confirmed RULE. When the message is *only* a statement
+("we've gone vegan"), `capture_only: true` says there is no plan coming and the gate
+is asking about the rules alone; confirming it ends with a `notice` of kind
+`captured`, and no board card is ever created.
+
 ### `understanding_response` (ui → cloud)
 
 ```json
 { "type": "understanding_response", "goal_id": "...",
-  "payload": { "confirmed": true } }
+  "payload": { "confirmed": true, "accepted_constraint_ids": ["proposed-1"] } }
 ```
 
 If `confirmed` is `true`, the graph resumes to `dispatch`; if `false`, it ends
@@ -289,7 +307,9 @@ this frame just makes that handoff physical.
   "success_criteria": ["..."],
   "constraints": {
     "hard": { "allergens": [], "medical": [], "dietary": [],
-              "budget_cap": null, "quiet_hours": null },
+              "budget_cap": null, "quiet_hours": null,
+              "peak_hours": null, "away_window": null,
+              "budget_envelope": null },
     "soft": { }
   },
   "scope": { },
@@ -299,7 +319,22 @@ this frame just makes that handoff physical.
 ```
 
 - `constraints.hard` is a **safety policy** object (allergens, medical, dietary,
-  budget_cap, quiet_hours, ...). It is the **ONLY** thing the Safety filter enforces.
+  budget_cap, quiet_hours, peak_hours, away_window, ...). It is the **ONLY** thing the
+  Safety filter enforces. **v6:** the cloud RESOLVES it per goal from the household
+  constraint store, by code — the list kinds (allergens/dietary/medical) are unioned
+  across the whole store regardless of domain, while the cap and window kinds are
+  domain-picked, so a `vacation_prep` goal carries a travel cap and an away window
+  where a `meal_plan` goal carries the weekly grocery cap. `peak_hours` (peak
+  electricity tariff, HH:mm) and `away_window` (the house is empty, ISO **dates**) are
+  new in v6; enforcement of them lands with the device rules in v6-M2.
+- **v6-M3 — `budget_envelope`** (`{"cap": 600.0, "period": "monthly"}`) is the shared
+  pool EVERY goal draws from. Per-goal caps alone cannot stop two goals spending the
+  same money: a $200 party and a $120 grocery week each fit their own ceiling and
+  together blow a month. The **device** resolves this goal's effective ceiling as
+  `min(budget_cap, cap − spent)` when it arms the policy, and again on approval and
+  each day tick — the cap is policy from the account, the spend is world state the
+  device owns. The rules themselves still read `constraints.hard` and nothing else;
+  the arithmetic happens in a resolution step BEFORE arming.
 - `constraints.soft` holds preferences: they bias planning, never gate it.
 - `scope` is a **domain-flexible** object (whatever the domain needs — no fixed shape).
 - `time_window` is **RELATIVE to real today** (or the control-set clock) — never a

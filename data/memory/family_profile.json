@@ -1,26 +1,361 @@
 {
+  "$comment": [
+    "THE HOUSEHOLD CONSTRAINT STORE (v6). This is the ACCOUNT's copy of household policy —",
+    "the source of truth. It pushes DOWN to the device on every dispatch; the device owns",
+    "world state (what is in the fridge, what has been spent) and never sources policy.",
+    "",
+    "One entry per FACT, not per kind, so each carries its own provenance and lifetime:",
+    "  kind         which constraints.hard / soft key it resolves into",
+    "  value        list | number | string | window object",
+    "  enforcement  hard = the Safety filter blocks on it · soft = planning bias only",
+    "  source       account (a person entered it) | derived (real-world data) | chat (captured)",
+    "  scope        household | domain | goal",
+    "  applies_to   domains this entry is picked for; ['*'] = every domain",
+    "  expires_day_offset  retires itself this many days from today (omit = permanent)",
+    "",
+    "RESOLUTION (memory/store.py — deterministic, no LLM):",
+    "  - hard LIST kinds (allergens, dietary, medical) are UNIONED across every entry,",
+    "    applies_to IGNORED. The enforced set is never narrowed by relevance: a wrong",
+    "    relevance pick must cost a noisy plan, never a safety miss.",
+    "  - hard SCALAR kinds (budget_cap, quiet_hours, peak_hours, away_window) ARE",
+    "    domain-picked: most specific applies_to wins, ties go to the stricter value.",
+    "  - soft entries are picked by relevance (LLM, with applies_to as the fallback).",
+    "",
+    "Dates are DAY OFFSETS resolved against today at load — the same generic-clock rule the",
+    "device data files follow. Absolute dates go stale between demos."
+  ],
+
   "family_id": "family-hub-demo",
+
+  "$comment_members": [
+    "Who lives here. Matches the device's data/family.json roster (which holds the diets,",
+    "dislikes and ages used for menu grounding); this list is the account's copy."
+  ],
   "members": [
     { "name": "Priya", "role": "parent" },
     { "name": "Rohan", "role": "parent" },
-    { "name": "Aarav", "role": "son", "age": 12 }
+    { "name": "Aarav", "role": "son", "age": 12 },
+    { "name": "Diya", "role": "daughter", "age": 5 }
   ],
-  "hard": {
-    "allergens": ["peanuts"],
-    "medical": ["rohan_low_sodium"],
-    "dietary": ["no_pork"],
-    "budget_cap": 120.0,
-    "quiet_hours": { "start": "21:30", "end": "07:00" }
-  },
-  "soft": {
-    "dislikes": ["mushrooms"],
-    "prefer": ["more_vegetables", "more_protein", "reduce_processed_food"],
-    "habits": ["vegetarian_weekday_dinners", "grocery_run_saturday_morning"],
-    "hosting_style": "casual, kid-friendly"
-  },
-  "context": [
-    "son Aarav has football practice Wednesday 18:00",
-    "family calendar is the shared source of evening availability",
-    "robot vacuum and dishwasher run on SmartThings schedules"
+
+  "constraints": [
+    {
+      "id": "c-allergen-peanuts",
+      "kind": "allergens",
+      "value": ["peanuts"],
+      "enforcement": "hard",
+      "source": "account",
+      "scope": "household",
+      "applies_to": ["*"],
+      "label": "peanut allergy",
+      "note": "Aarav — entered in the Family Hub family profile"
+    },
+    {
+      "id": "c-medical-rohan-sodium",
+      "kind": "medical",
+      "value": ["rohan_low_sodium"],
+      "enforcement": "hard",
+      "source": "account",
+      "scope": "household",
+      "applies_to": ["*"],
+      "label": "low sodium",
+      "note": "Rohan — flagged on his health profile"
+    },
+    {
+      "id": "c-dietary-no-pork",
+      "kind": "dietary",
+      "value": ["no_pork"],
+      "enforcement": "hard",
+      "source": "account",
+      "scope": "household",
+      "applies_to": ["*"],
+      "label": "no pork",
+      "note": "household dietary rule"
+    },
+
+    {
+      "$comment": "The default household ceiling. Every domain gets it unless a more specific cap below wins — so an untagged or newly coined domain is never left uncapped.",
+      "id": "c-cap-household-weekly",
+      "kind": "budget_cap",
+      "value": 120.0,
+      "period": "weekly",
+      "enforcement": "hard",
+      "source": "derived",
+      "scope": "household",
+      "applies_to": ["*"],
+      "label": "weekly household budget",
+      "note": "derived from the last 8 weeks of grocery receipts"
+    },
+    {
+      "$comment": "A party is a one-off spend, not a grocery week. Without this the cake alone eats a quarter of the weekly cap.",
+      "id": "c-cap-party",
+      "kind": "budget_cap",
+      "value": 200.0,
+      "period": "event",
+      "enforcement": "hard",
+      "source": "account",
+      "scope": "domain",
+      "applies_to": ["birthday_party"],
+      "label": "party budget",
+      "note": "set by Priya when the party was planned"
+    },
+    {
+      "$comment": "THE v5 BUG, FIXED: a vacation goal used to be dispatched the $120 WEEKLY GROCERY cap as its trip ceiling.",
+      "id": "c-cap-travel",
+      "kind": "budget_cap",
+      "value": 1500.0,
+      "period": "trip",
+      "enforcement": "hard",
+      "source": "account",
+      "scope": "domain",
+      "applies_to": ["vacation_prep"],
+      "label": "travel budget",
+      "note": "set on the trip in the family calendar"
+    },
+
+    {
+      "$comment": [
+        "THE HOUSEHOLD ENVELOPE (v6-M3). Per-goal caps alone cannot stop two goals",
+        "spending the same money: a $200 party and a $120 grocery week each fit their own",
+        "ceiling and together blow a month. This is the shared pool they both draw from.",
+        "",
+        "The device resolves the goal's EFFECTIVE cap as min(domain cap, envelope - spent)",
+        "at arm time and again on approval and each day tick — the cap is policy from here,",
+        "the spend is world state the device owns."
+      ],
+      "id": "c-envelope-monthly",
+      "kind": "budget_envelope",
+      "value": { "cap": 600.0, "period": "monthly" },
+      "enforcement": "hard",
+      "source": "derived",
+      "scope": "household",
+      "applies_to": ["*"],
+      "label": "monthly household envelope",
+      "note": "derived from the account's spending history"
+    },
+    {
+      "id": "c-quiet-hours",
+      "kind": "quiet_hours",
+      "value": { "start": "21:30", "end": "07:00" },
+      "enforcement": "hard",
+      "source": "account",
+      "scope": "household",
+      "applies_to": ["*"],
+      "label": "quiet hours",
+      "note": "no noisy appliances — Diya is 5"
+    },
+    {
+      "$comment": [
+        "Peak tariff. Scoped to energy_saving ON PURPOSE: a peak-hour dishwasher run defeats",
+        "THAT goal's own objective, whereas blocking it household-wide would kill the guest-",
+        "dinner cleanup beat (21:00 sits inside the peak window) for no safety reason.",
+        "Enforced by the EXISTING time_window_block rule kind — no new device code (M2)."
+      ],
+      "id": "c-peak-tariff",
+      "kind": "peak_hours",
+      "value": { "start": "17:00", "end": "21:00" },
+      "enforcement": "hard",
+      "source": "derived",
+      "scope": "domain",
+      "applies_to": ["energy_saving"],
+      "label": "peak tariff window",
+      "note": "time-of-use tariff on the utility account"
+    },
+    {
+      "$comment": [
+        "The away window, derived from the trip in the shared calendar. Offsets match the",
+        "device's data/vacation.json (depart +1, return +8).",
+        "SCOPED TO vacation_prep, not ['*'], and that is a deliberate limit: the seeded world",
+        "has the family eating dinners at home on days 1-6 AND away on days 1-8, so a",
+        "household-wide away window would block the meal demo's appliance proposals. Widening",
+        "it to ['*'] — which is the more honest rule, and would catch a meal goal preheating",
+        "the oven mid-trip — requires the world data to agree on when the family is away first."
+      ],
+      "id": "c-away-window",
+      "kind": "away_window",
+      "value": { "start_day_offset": 1, "end_day_offset": 8 },
+      "enforcement": "hard",
+      "source": "derived",
+      "scope": "household",
+      "applies_to": ["vacation_prep"],
+      "expires_day_offset": 8,
+      "label": "away window",
+      "note": "trip in the shared family calendar"
+    },
+
+    {
+      "id": "s-dislikes-mushrooms",
+      "kind": "dislikes",
+      "value": ["mushrooms"],
+      "enforcement": "soft",
+      "source": "account",
+      "scope": "household",
+      "applies_to": ["meal_plan", "guest_dinner", "grocery_cost", "birthday_party"],
+      "label": "dislikes mushrooms"
+    },
+    {
+      "id": "s-prefer-healthier",
+      "kind": "prefer",
+      "value": ["more_vegetables", "more_protein", "reduce_processed_food"],
+      "enforcement": "soft",
+      "source": "account",
+      "scope": "domain",
+      "applies_to": ["meal_plan", "grocery_cost"]
+    },
+    {
+      "id": "s-habit-veg-weekdays",
+      "kind": "habits",
+      "value": ["vegetarian_weekday_dinners"],
+      "enforcement": "soft",
+      "source": "derived",
+      "scope": "domain",
+      "applies_to": ["meal_plan", "guest_dinner"],
+      "note": "observed from 6 weeks of meal history"
+    },
+    {
+      "id": "s-habit-saturday-shop",
+      "kind": "habits",
+      "value": ["grocery_run_saturday_morning"],
+      "enforcement": "soft",
+      "source": "derived",
+      "scope": "domain",
+      "applies_to": ["meal_plan", "grocery_cost"]
+    },
+    {
+      "id": "s-hosting-style",
+      "kind": "hosting_style",
+      "value": "casual, kid-friendly",
+      "enforcement": "soft",
+      "source": "account",
+      "scope": "domain",
+      "applies_to": ["guest_dinner", "birthday_party"]
+    },
+    {
+      "id": "s-prefer-away",
+      "kind": "prefer",
+      "value": [
+        "hold_deliveries_while_away",
+        "appliances_to_eco_before_departure",
+        "finish_perishables_before_departure"
+      ],
+      "enforcement": "soft",
+      "source": "account",
+      "scope": "domain",
+      "applies_to": ["vacation_prep"]
+    },
+    {
+      "id": "s-habit-departure",
+      "kind": "habits",
+      "value": ["depart_early_morning", "neighbour_waters_the_plants"],
+      "enforcement": "soft",
+      "source": "derived",
+      "scope": "domain",
+      "applies_to": ["vacation_prep"]
+    },
+    {
+      "id": "s-prefer-party",
+      "kind": "prefer",
+      "value": ["kid_friendly_menu", "homemade_cake_over_bought", "afternoon_not_evening"],
+      "enforcement": "soft",
+      "source": "account",
+      "scope": "domain",
+      "applies_to": ["birthday_party"]
+    },
+    {
+      "id": "s-prefer-energy",
+      "kind": "prefer",
+      "value": ["shift_heavy_runs_off_peak", "eco_programs", "cut_standby_waste"],
+      "enforcement": "soft",
+      "source": "account",
+      "scope": "domain",
+      "applies_to": ["energy_saving"]
+    },
+    {
+      "id": "s-prefer-thrift",
+      "kind": "prefer",
+      "value": ["bulk_staples", "store_brand_substitutes", "fewer_midweek_top_up_trips"],
+      "enforcement": "soft",
+      "source": "account",
+      "scope": "domain",
+      "applies_to": ["grocery_cost"]
+    },
+    {
+      "$comment": "Captured from chat and time-boxed — the shape M4's capture beat writes. Soft, so it can expire without anyone noticing a safety change.",
+      "id": "s-prefer-lighter-dinners",
+      "kind": "prefer",
+      "value": ["lighter_dinners"],
+      "enforcement": "soft",
+      "source": "chat",
+      "scope": "household",
+      "applies_to": ["meal_plan", "guest_dinner"],
+      "expires_day_offset": 14,
+      "note": "\"let's eat lighter for a couple of weeks\" — captured 2026-07-29"
+    },
+    {
+      "$comment": "ALREADY EXPIRED (negative offset). Kept in the file on purpose: it is the proof that expiry filters, and the fixture the resolution test asserts against.",
+      "id": "s-guest-visiting",
+      "kind": "habits",
+      "value": ["grandmother_visiting_extra_place_at_table"],
+      "enforcement": "soft",
+      "source": "chat",
+      "scope": "household",
+      "applies_to": ["meal_plan", "guest_dinner"],
+      "expires_day_offset": -3
+    },
+
+    {
+      "id": "x-context-football",
+      "kind": "context",
+      "value": "son Aarav has football practice Wednesday 18:00",
+      "enforcement": "soft",
+      "source": "derived",
+      "scope": "household",
+      "applies_to": ["meal_plan", "guest_dinner", "birthday_party"]
+    },
+    {
+      "id": "x-context-calendar",
+      "kind": "context",
+      "value": "family calendar is the shared source of evening availability",
+      "enforcement": "soft",
+      "source": "derived",
+      "scope": "household",
+      "applies_to": ["*"]
+    },
+    {
+      "id": "x-context-smartthings",
+      "kind": "context",
+      "value": "robot vacuum and dishwasher run on SmartThings schedules",
+      "enforcement": "soft",
+      "source": "derived",
+      "scope": "household",
+      "applies_to": ["*"]
+    },
+    {
+      "id": "x-context-tariff",
+      "kind": "context",
+      "value": "electricity is billed time-of-use; off-peak is 23:00-06:00",
+      "enforcement": "soft",
+      "source": "derived",
+      "scope": "domain",
+      "applies_to": ["energy_saving"]
+    },
+    {
+      "id": "x-context-porch",
+      "kind": "context",
+      "value": "parcels are left on the front porch unless someone signs for them",
+      "enforcement": "soft",
+      "source": "derived",
+      "scope": "domain",
+      "applies_to": ["vacation_prep"]
+    },
+    {
+      "id": "x-context-spare-key",
+      "kind": "context",
+      "value": "the neighbour has a spare key and checks the house while the family is away",
+      "enforcement": "soft",
+      "source": "account",
+      "scope": "domain",
+      "applies_to": ["vacation_prep"]
+    }
   ]
 }

@@ -924,21 +924,32 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
                 objective=understanding.get("objective", ""),
                 domain=understanding.get("domain", ""),
                 knew=understanding.get("knew") or graph_nodes._hard_knew(hard),
+                # v6: the provenance behind the chips, and (M4) any household rule the
+                # user stated in the same breath. Both additive — a UI that ignores
+                # them renders exactly as before.
+                constraints=understanding.get("constraints") or [],
+                proposed_constraints=understanding.get("proposed_constraints") or [],
+                capture_only=bool(understanding.get("capture_only")),
                 thought=understanding.get("thought", ""),
                 time_window=understanding.get("time_window") or None,
             ),
         )
-        logger.info("task_status status=grounding gate=understanding")
+        logger.info("task_status status=grounding gate=understanding capture_only=%s",
+                    bool(understanding.get("capture_only")))
         understanding_frame = frame.model_dump(mode="json", exclude_none=True)
         await registry.send_to_uis(device_id, understanding_frame)
         # Cache the understanding exactly as broadcast, for replay to a chat webview
         # that binds mid-create.
         registry.capture_understanding(device_id, goal_id, understanding_frame)
-        # The board gets a card NOW. This gate can hold a goal indefinitely — it is
-        # waiting on a person — so a board that only learns about goals at dispatch
-        # would show nothing at all for the whole time it matters most.
-        await push_board(device_id, board.on_understanding(
-            device_id, goal_id, understanding, user_goal.client_ref))
+        # A CAPTURE is not a goal: no plan is coming and nothing will run, so it must
+        # not put a card on the board. A board that showed "we've gone vegan" as a
+        # goal card would leave a row nothing can ever complete.
+        if not understanding.get("capture_only"):
+            # The board gets a card NOW. This gate can hold a goal indefinitely — it is
+            # waiting on a person — so a board that only learns about goals at dispatch
+            # would show nothing at all for the whole time it matters most.
+            await push_board(device_id, board.on_understanding(
+                device_id, goal_id, understanding, user_goal.client_ref))
         return
 
     frame = state.get("contract")
@@ -980,8 +991,28 @@ async def handle_understanding_response(device_id: str, response: UnderstandingR
             graph_nodes.resume_goal,
             graph,
             response.goal_id,
-            {"confirmed": confirmed},
+            # v6-M4: which household rules the user ticked. The graph persists exactly
+            # these and nothing else — an accepted GOAL never implies an accepted rule.
+            {"confirmed": confirmed, "accepted_constraint_ids": response.payload.accepted_constraint_ids},
         )
+
+    # v6-M4: a capture gate ends here — there is no contract and no card, just a
+    # household rule that is now remembered (or wasn't). Answered before the
+    # not-confirmed branch, because declining a capture is not a cancelled goal.
+    explanation = state.get("explanation")
+    if isinstance(explanation, dict) and explanation.get("type") == "captured":
+        await emit_chat_ui_close(device_id, response.goal_id)
+        await registry.send_to_uis(
+            device_id,
+            Notice(
+                goal_id=response.goal_id,
+                kind="captured",
+                message=explanation.get("message") or "Noted.",
+            ).model_dump(mode="json"),
+        )
+        logger.info("task_status status=done gate=capture")
+        return
+
     if not confirmed:
         # Create phase cancelled at the gate. Close the bracket (guarded) and, per
         # user decision Q3, ALSO speak a declined notice so the input (Bixby) surface
