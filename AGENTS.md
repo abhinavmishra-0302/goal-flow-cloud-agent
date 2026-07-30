@@ -12,11 +12,13 @@ one outbound WS to it; the UI and device NEVER talk directly. Driving use case:
 *"help my family eat healthier this week and reduce food waste"* → an adaptive,
 approval-gated weekly dinner plan (also a `guest_dinner` domain).
 
-Sibling repos (all under `~/ashu/git/`): `goal-flow-agent-chat-ui` (React UI),
-`goal-flow-device-agent-ubuntu` (.NET/SK device brain), `goal-flow-device-agent-tizen`
-(frozen port), `goal-flow-agents` (cross-cutting docs). The **canonical wire
-contract lives HERE**: `CONTRACT.md` (mirrored as `types/contract.ts` in the UI and
-`Contracts/*.cs` in the device). Change `CONTRACT.md` first when the protocol moves.
+Sibling repos (all under `~/ashu/git/`): `goal-flow-agent-bixby-ui` (where the user types),
+`goal-flow-agent-chat-ui` (the create-phase surface), `goal-flow-agent-board-ui` (home),
+`goal-flow-device-agent-ubuntu` (.NET/SK device brain — source of truth for device code),
+`goal-flow-device-agent-tizen` (the port, kept in sync), `goal-flow-agents` (docs — the system
+design is `../goal-flow-agents/docs/DESIGN.md`). The **canonical wire contract lives HERE**:
+`CONTRACT.md`, mirrored as `types/contract.ts` in three UIs and `Contracts/*.cs` in the device.
+Change `CONTRACT.md` first when the protocol moves.
 
 ## Stack & run
 
@@ -106,7 +108,7 @@ NO logic change for the event-driven meal demo — `trigger_event` control + dev
 
 - **Commit identity:** author as `ashuksingh11`
   (`31301999+ashuksingh11@users.noreply.github.com`). **Push only when explicitly asked.**
-- **Workflow (per the human):** plan=Opus · design/architecture=Fable · coding=Codex CLI
+- **Workflow (per the human):** plan=Opus · design/architecture=Fable · coding=Opus
   · browsing=Sonnet. Confirm before moving between phases.
 - LLM-only by design — do NOT add scripted/rules fallbacks.
 - There is a known benign log-noise TODO: `receive_json` on an already-closed socket

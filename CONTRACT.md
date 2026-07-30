@@ -1,4 +1,4 @@
-# GoalFlow CONTRACT v4.1 — generic goal-agent WebSocket protocol
+# GoalFlow CONTRACT — generic goal-agent WebSocket protocol
 
 **This file is the CANONICAL copy of the shared protocol (the anchor — obey exactly).**
 The mirrors are `src/goalflow_cloud/models/contract.py` (Python),
@@ -12,30 +12,21 @@ half-mirrored change breaks at runtime rather than at build time. The chat UI's
 **silently dropped**, which is the worst possible failure mode. Any change here is a
 contract version bump.
 
-## v3 additions (all additive; v2 clients keep working)
+## Version history
 
-| addition | why |
+Every change here has been **additive** — an older client keeps working, and an unknown field
+is ignored rather than fatal. That is the only property that made five surfaces and two device
+ports survivable. The frame sections below are the truth; this table is just the shape of the
+past.
+
+| Version | Added |
 |---|---|
-| `capabilities.domains[]` | the device ROUTES on `dispatch.domain`, so the interpreter must use a domain it answers to (M4) |
-| `agent_event: task_update` | the goal's task DAG lives on the device; the board's progress is derived from these (M6) |
-| `agent_event phase: "queued"` | a goal waiting for the planning slot is visible rather than stalled (M5) |
-| `plan_ready.payload.precheck` | *"not yet"* — distinct from safety's *"never"* (M3) |
-| `status.executed[].result: "deferred_precheck"` | the approval stands; the effect runs when the world recovers (M3) |
-| `board_snapshot` / `board_update` / `board_get` | Agent Board watches every goal at once (M6) |
-| `goal_state_get` | drilling into a goal after a reload (M6) |
-| `goal_accepted` + `user_goal.client_ref` | with 2 goals in flight, the UI can't otherwise tell which `goal_id` is which (M6) |
-| `suggestions` (device → cloud → ui) | the device proposes goals unprompted from local state — the one goal-less frame it sends (M8) |
-| `suggestion_action` (ui → cloud) | accept a suggestion (→ a `user_goal`) or dismiss it (M8) |
-
-## v4.1 additions (all additive; v3 clients keep working)
-
-| addition | why |
-|---|---|
-| `hello.surface: "input"\|"chat"\|"board"` (ui only, optional) | Bixby is a native app that would otherwise be fed the whole board firehose just to discard it; absent ⇒ receives everything (every v3 client is an absent-surface client) |
-| input-surface delivery fork | the ONE exception to "the cloud does not route by surface" — see *Surface-aware delivery* below |
-| `chat_ui_open { goal_id }` (cloud → ui) | the create phase has begun: Bixby opens the chat webview; the chat UI HARD-RESETS to this goal (kills the stale-previous-goal repaint) |
-| `chat_ui_close { goal_id }` (cloud → ui) | the create phase is over: Bixby closes the webview; the board owns everything after |
-| create-phase replay to a freshly-bound `chat` surface | rehydrates the ephemeral webview on (re)open — kills the connect-vs-understanding race the same way `board_snapshot`-on-bind kills the board's |
+| v2 | the base protocol: `hello`, `user_goal`, `dispatch`, `agent_event`, `plan_ready`, `present_plan`, `approval`, `proposal`, `status`, `control` |
+| v3 | `capabilities.domains[]`, `agent_event: task_update`, `phase: "queued"`, `plan_ready.precheck`, `status.executed[].result: "deferred_precheck"`, the board frames (`board_snapshot`/`board_update`/`board_get`), `goal_state_get`, `goal_accepted` + `user_goal.client_ref`, `suggestions`/`suggestion_action` |
+| v3.2 | a **goal-less** `control` = one world tick fanning out over every goal, plus `day_advanced` |
+| v4.1 | `hello.surface`, the input-surface delivery fork, `chat_ui_open`/`chat_ui_close`, create-phase replay on bind |
+| v5.1 | `agent_event: harness`, `plan_progress.total` |
+| v6 | `constraints.hard`: `peak_hours`, `away_window`, `budget_envelope`; `understanding.constraints` (provenance) and `proposed_constraints`/`capture_only`; `understanding_response.accepted_constraint_ids` |
 
 ## Transport
 

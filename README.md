@@ -25,7 +25,7 @@ UI (tablet chat)  <--WS-->  CLOUD (this repo, hub)  <--WS-->  DEVICE agent (SK p
   - **Approval gate**: the *user via the cloud* (a durable LangGraph
     `interrupt()`); *waits*.
 
-The shared protocol is **CONTRACT v3** — see [`CONTRACT.md`](CONTRACT.md) (this file
+The shared protocol is **`CONTRACT.md`** — see [`CONTRACT.md`](CONTRACT.md) (this file
 is the canonical copy; the UI and device repos mirror it as typed definitions). The
 protocol is **generic and domain-agnostic**: no meal-specific fields anywhere. A
 `domain` string (`"meal_plan"`, `"guest_dinner"`, ...) names the use case; domain
@@ -74,7 +74,7 @@ each goal's frames (`understanding` / `dispatch` / `plan_ready` / `task_update` 
 changed goal) to the Agent Board UI. The fold is **deterministic — no LLM, no I/O** —
 so every number on a board card (`state`, `progress_pct`, `alerts`, `activity`,
 `next_step`) is *derived* here from something the device actually said, never guessed.
-See `docs/ARCHITECTURE.md` for the derivation rules.
+See `CODE_GUIDE.md` § "The board fold" for the derivation rules.
 
 **LLM-only, no fallbacks.** There is no scripted/mock planner behind the LLM call.
 If the LLM fails, the goal fails loudly with a structured error surfaced to the UI —
@@ -130,25 +130,23 @@ python scripts/run_graph_demo.py "we've got 6 people over Saturday for dinner - 
 ## Repo layout
 
 ```
-CONTRACT.md                     # canonical CONTRACT v3 (generic wire protocol)
-docs/ARCHITECTURE.md            # cloud architecture: graph, board fold, memory, hub, logging
-docs/diagrams.md                # Mermaid sequence + component diagrams
+CONTRACT.md                     # canonical wire protocol (generic)
 scripts/run_graph_demo.py       # run the graph on a goal, print the contract
 scripts/verify_board.py         # gate 13: the board fold's numbers are derived and add up
 scripts/verify_mirrors.py       # gate 14: the contract mirrors have not drifted
+scripts/verify_constraints.py   # gate 15: constraints resolve per goal; the enforced set is never narrowed
+scripts/verify_capture.py       # gate 16: a household rule is captured only when the user says yes
 src/goalflow_cloud/
   config.py                     # env-backed settings (OPENROUTER_*, WS_*, LOG_LEVEL)
   server.py                     # FastAPI WS hub: multi-session registry, routing, relays, graph driving, board pushes
   board.py                      # BoardService: folds every goal's frames into one GoalSummary (deterministic, no LLM)
-  models/contract.py            # Pydantic mirror of every CONTRACT v3 message
+  models/contract.py            # Pydantic mirror of every contract message
   graph/nodes.py                # the LangGraph StateGraph: nodes, routers, interrupts
   memory/store.py               # constraint store loader + per-goal resolution
 data/memory/family_profile.json # household constraint store (sourced, scoped, expiring)
 run.sh
 ```
 
-See [`CODE_GUIDE.md`](CODE_GUIDE.md) for the code walkthrough and
-`docs/ARCHITECTURE.md` for the full design. The system-level v3 framing (the
-board-centric flow, the harness modules, demo pair, decisions) lives in
-`../goal-flow-agents/docs/V3_DESIGN_PROPOSAL.md` (the original v2 framing remains in
-`V2_DESIGN_PROPOSAL.md`).
+See [`CODE_GUIDE.md`](CODE_GUIDE.md) for the code walkthrough. The system-level design — the
+two-tier split, the harness, the constraint model, the surfaces — lives in
+`../goal-flow-agents/docs/DESIGN.md`.

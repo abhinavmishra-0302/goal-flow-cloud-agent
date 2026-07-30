@@ -1,19 +1,20 @@
-# Code Guide — goal-flow-cloud-agent (v3)
+# Code Guide — goal-flow-cloud-agent
 
-The **cloud agent** is the hub tier of GoalFlow v3, a general goal-based agent. It owns
-the conversation and family memory, LLM-interprets the user's fuzzy goal into a **generic
-Task Contract**, drives an advanced **LangGraph StateGraph** (conditional edges,
-`interrupt()`-based HITL, checkpointer), and relays every frame between the UI and the
-on-device agent. Domain-agnostic by design: meal planning and guest dinner prep are just
-`domain` strings — no meal-specific fields exist in the protocol or the code paths.
+The **cloud agent** is GoalFlow's hub tier. It owns the goal — interpreting fuzzy text into a
+generic Task Contract, resolving household policy per goal, holding the human gates — drives a
+**LangGraph StateGraph** (conditional edges, `interrupt()`-based HITL, SQLite checkpointer), and
+relays every frame between the surfaces and the on-device agent. Domain-agnostic by design:
+domains are just `domain` strings, and no meal-specific field exists in the protocol or the code
+paths.
 
 See `README.md` for run steps, `CONTRACT.md` for the canonical wire protocol, and
-`docs/ARCHITECTURE.md` for the full design (node table, Mermaid state diagram).
+`../goal-flow-agents/docs/DESIGN.md` for the system design (the graph, the constraint model, the
+surfaces, the gates).
 
 ## File map
 
 ```
-CONTRACT.md                       # canonical CONTRACT v3 (source of truth; generic)
+CONTRACT.md                       # canonical wire protocol (source of truth; generic)
 scripts/run_graph_demo.py         # run the graph on any goal text, print the contract
 scripts/verify_board.py           # gate 13: the board fold's numbers are derived and add up
 scripts/verify_mirrors.py         # gate 14: the contract mirrors have not drifted
@@ -24,10 +25,9 @@ src/goalflow_cloud/
   config.py                       # Settings dataclass from env (OPENROUTER_*, WS_*, LOG_LEVEL)
   server.py                       # FastAPI WS hub: multi-session registry, routing, relays, graph driving, board pushes  ← start here
   board.py                        # BoardService: folds a goal's frames into one GoalSummary per goal (deterministic, no LLM)
-  models/contract.py              # Pydantic mirror of every CONTRACT v3 message (lenient extras)
-  memory/store.py                 # profile loader + hard_safety_block / soft_bias_block
+  models/contract.py              # Pydantic mirror of every contract message (lenient extras)
+  memory/store.py                 # constraint store: load, resolve per goal, append captures
   graph/nodes.py                  # the StateGraph: nodes, routers, interrupts, checkpointer
-docs/ARCHITECTURE.md, docs/diagrams.md
 ```
 
 ## The LangGraph StateGraph (`graph/nodes.py`)
@@ -38,7 +38,7 @@ checkpointer** (`build_graph()`), so every `interrupt()` pause is durable and re
 
 **State** (`GraphState`, a `TypedDict`): `goal_text`, `intent`, `memory`, `understanding`,
 `understanding_confirmed`, `contract`, `plan`, `pending_approvals`, `decisions`,
-`task_status` (the CONTRACT v3 lifecycle), `event_log` (append-only,
+`task_status` (the contract lifecycle), `event_log` (append-only,
 `Annotated[..., add]` reducer), `goal_id`, `correlation_id`, `error`, plus
 `approval_frame` / `monitor_frame` / `explanation` outputs.
 
