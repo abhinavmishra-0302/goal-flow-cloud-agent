@@ -633,7 +633,21 @@ class Control(_ContractModel):
 
     type: Literal["control"] = "control"
     goal_id: str = ""
-    command: Literal["advance_day", "reset", "set_date", "trigger_event"]
+    #: A Literal here is a HARD GATE: an unlisted value fails validation and the frame is
+    #: never sent — silently, from the sender's side. v7 added `constraints_changed` to
+    #: the device and to CONTRACT.md and missed this line, and the symptom was a
+    #: cross-goal fan-out that logged a pydantic error into the void while the demo's
+    #: headline moment simply did not happen. Same lesson as AgentEventKind above: every
+    #: mirror moves in one pass.
+    command: Literal[
+        "advance_day",
+        "reset",
+        "set_date",
+        "trigger_event",
+        #: v7: the account re-resolved this goal's constraints because ANOTHER goal was
+        #: approved. The one adaptation path that does not ask.
+        "constraints_changed",
+    ]
     payload: ControlPayload = Field(default_factory=ControlPayload)
 
 

@@ -113,6 +113,25 @@ def contract_event_kinds() -> set[str]:
     return set(re.findall(r'"([a-z_]+)"', m.group(1))) if m else set()
 
 
+def contract_control_commands() -> set[str]:
+    """The documented `control.command` enumeration, from the canonical table.
+
+    Added in v7 after this exact drift shipped: `constraints_changed` reached the device,
+    CONTRACT.md and the device's ControlCommands, but not the Python model's Literal — and
+    a Literal is a HARD GATE. The frame failed validation on the SENDER's side, which
+    means the cloud logged a pydantic error to itself and the demo's headline moment
+    simply did not happen. Nothing downstream could have noticed, because nothing
+    downstream ever saw a frame.
+    """
+    text = CONTRACT.read_text()
+    # The canonical line is an ALTERNATION — `"command": "a" | "b" | "c"` — so match the
+    # whole run, the way contract_event_kinds does. A regex that stopped at the first
+    # quoted value would have "checked" this enum while only ever seeing advance_day,
+    # which is exactly what the first version of this function did.
+    m = re.search(r'"command"\s*:\s*((?:"[a-z_]+"\s*\|?\s*)+)', text)
+    return set(re.findall(r'"([a-z_]+)"', m.group(1))) if m else set()
+
+
 def contract_task_states() -> set[str]:
     """The documented `task_update.state` enumeration."""
     text = CONTRACT.read_text()
@@ -174,6 +193,11 @@ def main() -> int:
     for k in sorted(kinds):
         if f'"{k}"' not in py:
             failures.append(f"python AgentEventKind is missing {k!r} — frames WILL be dropped at validation")
+    for c in sorted(contract_control_commands()):
+        if f'"{c}"' not in py:
+            failures.append(
+                f"python Control.command Literal is missing {c!r} — the cloud cannot SEND this frame"
+            )
 
     # --- C# (device) ---
     cs = "\n".join(p.read_text() for p in CS_MIRRORS)
@@ -183,6 +207,9 @@ def main() -> int:
     for k in sorted(kinds):
         if f'"{k}"' not in cs:
             failures.append(f"C# is missing agent_event kind {k!r}")
+    for c in sorted(contract_control_commands()):
+        if f'"{c}"' not in cs:
+            failures.append(f"C# ControlCommands is missing {c!r} — the device cannot ACT on this frame")
 
     # --- TypeScript + each UI's silent dropper ---
     for ui in UIS:

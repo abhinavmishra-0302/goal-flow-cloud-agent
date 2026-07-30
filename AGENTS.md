@@ -107,6 +107,19 @@ HITL approval → monitor. Both `meal_plan` and `guest_dinner` domains. The clou
 NO logic change for the event-driven meal demo — `trigger_event` control + device
 `demo_events`/`updated_plan` flow through by pass-through.
 
+## v7 gates
+
+`verify_crossgoal.py` (gate 17) is the newest and the one to read first if you touch the
+fan-out: it pins BLAST RADIUS and IDEMPOTENCE for the only path that changes a plan
+without asking. It found a real bug on its first run — `append_constraints` was not
+idempotent for an identical entry, so a re-sent approval wrote a second away window and
+re-planned a goal the user had already watched change.
+
+`verify_mirrors.py` (gate 14) now also checks the **`control.command` enumeration**, added
+after `constraints_changed` reached the device and CONTRACT.md but not the Python Literal —
+a Literal is a hard gate, so the frame failed validation on the SENDER's side and the
+demo's headline moment silently did not happen.
+
 ## Conventions & gotchas
 
 - **Commit identity:** author as `ashuksingh11`

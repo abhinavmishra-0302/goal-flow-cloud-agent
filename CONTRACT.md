@@ -536,7 +536,7 @@ through unchanged when present.
 
 ```json
 { "type": "control", "goal_id": "...?",
-  "command": "advance_day" | "reset" | "set_date" | "trigger_event",
+  "command": "advance_day" | "reset" | "set_date" | "trigger_event" | "constraints_changed",
   "payload": { "date": "<ISO?>", "event_id": "day3-football" } }
 ```
 
@@ -549,6 +549,15 @@ through unchanged when present.
 - `trigger_event` fires one presenter demo event by `event_id` (from
   `plan_ready.demo_events`) for a specific goal — the per-goal path (retained, but the
   board no longer sends it; the world tick supersedes it).
+- **`constraints_changed` (v7, cloud → device, goal-scoped)** is the one adaptation path
+  that does **not** ask. The account re-resolved THIS goal's constraints because ANOTHER
+  goal was approved — the family said they are away, so a meal week has days it should not
+  be planning dinners for. Payload carries `hard` (the account's new
+  `constraints.hard`, verbatim — the device re-arms from it and authors nothing), `steer`
+  (how to re-plan) and `note` (one sentence for the board). The device applies the patch
+  immediately and reports it with `status.plan_changed_note`; it never opens an approval,
+  because the user already approved this when they approved the other goal, and asking
+  twice about one decision implies the first answer did not count.
 
 ### `day_advanced` (device → cloud → ui)
 

@@ -1237,12 +1237,16 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> Non
         note = (
             f"Plan changed — you're away {_window_words(window)}. Review."
         )
+        source = contract.get("title") or contract.get("objective") or "another goal"
         steer = (
             f"The family is away from {window['start']} to {window['end']} inclusive — nobody is home "
-            "on those dates. Mark every plan row that falls inside that range as skipped, with a short "
-            "title saying so and a status_reason naming this as the reason. Adjust the days immediately "
-            "before and after if it helps: use up what would spoil before leaving, and keep the first "
-            "day back light because the kitchen will be bare."
+            "on those dates.\n"
+            "For EVERY plan row whose date falls inside that range: set status to \"skipped\", set the "
+            "title to exactly \"Away — no meal planned\", and set status_reason to exactly "
+            f"\"you're away · from {source}\". Do not invent other wording for those two fields — they "
+            "are read by a person who wants to know why a day is empty, not what the system called it.\n"
+            "Then adjust the days immediately before and after if it helps: use up what would spoil "
+            "before leaving, and keep the first day back light, because the kitchen will be bare."
         )
         await registry.send_to_device(device_id, Control(
             goal_id=summary.goal_id,

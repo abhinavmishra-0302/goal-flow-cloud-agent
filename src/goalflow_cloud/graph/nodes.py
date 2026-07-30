@@ -457,10 +457,16 @@ def interpret_goal(state: GraphState) -> GraphState:
                     "system",
                     "You are the GoalFlow cloud goal interpreter. Convert the user's natural-language "
                     "goal into a generic, domain-agnostic task intent. Do not invent safety constraints. "
-                    f"Real today is {today.isoformat()}; resolve phrases like this week, today, "
-                    "tomorrow, weekend, next week into time_window.start/end ISO dates relative to it. "
-                    "For actionable goals, the start date must be real today or later; interpret "
-                    "'this week' as the remaining week starting today. "
+                    f"Real today is {today.isoformat()} ({today.strftime('%A')}); resolve phrases like "
+                    "this week, today, tomorrow, weekend, next week into time_window.start/end ISO "
+                    "dates relative to it. For actionable goals, the start date must be real today "
+                    "or later; interpret 'this week' as the remaining week starting today.\n"
+                    "COUNT THE DAYS LITERALLY. 'tomorrow' is today+1, 'the day after tomorrow' is "
+                    "today+2, 'Thursday and Friday' is exactly those two dates and nothing between "
+                    "or around them. When the user names the days they will be away, the window is "
+                    "EXACTLY those days: start on the first, end on the last, and do not pad it — "
+                    "an away window is used to empty a plan, so an extra day is a dinner someone "
+                    "loses for no reason. "
                     "Keep scope flexible and generic for the device planner.\n\n"
                     "The connected device advertises exactly these capabilities:\n"
                     f"{digest}\n\n"
@@ -708,8 +714,14 @@ def _relevant_soft_ids(
                     "and leave out the ones that would only add noise: a vacation checklist "
                     "does not need the family's dinner preferences, and a meal plan does not "
                     "need the departure routine. Household notes about who is busy when are "
-                    "usually worth keeping. Prefer a few good ones over all of them; return "
-                    "no ids at all rather than padding the list.",
+                    "usually worth keeping.\n\n"
+                    "BE SPARING. Each id you return becomes a row on the confirmation card that "
+                    "the user reads before approving, so a preference that is merely NOT WRONG "
+                    "still costs them a line. Every candidate carries `applies_to`: an entry "
+                    "tagged for this domain is the default answer, and one tagged only for "
+                    "OTHER domains needs a real reason — the household tagged it that way on "
+                    "purpose. Two or three good ids beat six plausible ones, and returning no "
+                    "ids at all is better than padding the list.",
                 ),
                 (
                     "human",
