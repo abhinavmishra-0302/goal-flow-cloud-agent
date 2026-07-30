@@ -899,9 +899,15 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
         )
         return
 
-    # Out-of-scope: the interpreter judged the goal outside what GoalFlow acts on
-    # (only meal plans + guest dinners). The graph ended before any dispatch — send
-    # a terminal notice and stop; the device is never involved.
+    # Out-of-scope: the interpreter judged the goal outside what this device can advance.
+    # The graph ended before any dispatch — the device is never involved.
+    #
+    # v7 GIVES THE REFUSAL A SURFACE. Until now this returned before opening the create
+    # bracket, so the only place a decline appeared was the input surface speaking it: on
+    # the Hub the user asked the fridge for something and the fridge's screen showed
+    # nothing at all. A refusal is an answer, and an answer deserves to be shown where
+    # every other answer is shown. The bracket opens, the notice fills it, and the cloud
+    # closes it again a few seconds later — nobody should have to dismiss a "no".
     explanation = state.get("explanation")
     if isinstance(explanation, dict) and explanation.get("type") == "out_of_scope":
         notice = Notice(
@@ -910,7 +916,9 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
             message=explanation.get("message") or "That goal is outside what I can help with.",
         )
         logger.info("task_status status=done gate=out_of_scope")
+        await emit_chat_ui_open(device_id, goal_id)
         await registry.send_to_uis(device_id, notice.model_dump(mode="json"))
+        asyncio.create_task(_close_after(device_id, goal_id, OUT_OF_SCOPE_DWELL_S))
         return
 
     # The goal WILL have a create phase (it cleared the error + out-of-scope early
@@ -1119,6 +1127,28 @@ async def handle_approval(device_id: str, approval: Approval) -> None:
     # on "still the create-phase goal", so a board adaptation approval (whose goal is
     # no longer the create-phase goal) never retriggers a close.
     await emit_chat_ui_close(device_id, approval.goal_id)
+
+
+#: How long a refusal stays on the chat surface before the cloud closes it (v7).
+#:
+#: Long enough to read a sentence and understand it was a decision rather than a glitch;
+#: short enough that nobody reaches for a dismiss button that is deliberately not there.
+#: A refusal needs no action, so asking for one would be the interface inventing work.
+OUT_OF_SCOPE_DWELL_S = 4.5
+
+
+async def _close_after(device_id: str, goal_id: str, seconds: float) -> None:
+    """Close the create-phase bracket after a dwell, without blocking the handler.
+
+    ``emit_chat_ui_close`` is already guarded on "still the session's create-phase goal",
+    so if the user says something new during the dwell this becomes a no-op rather than
+    closing the webview out from under their next goal.
+    """
+    try:
+        await asyncio.sleep(seconds)
+        await emit_chat_ui_close(device_id, goal_id)
+    except Exception:  # noqa: BLE001 - a background task must never take the process down
+        logger.exception("timed_close_failed goal=%s", goal_id)
 
 
 #: Hard kinds whose arrival changes what OTHER goals should be planning, not merely what

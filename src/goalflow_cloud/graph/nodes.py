@@ -488,7 +488,18 @@ def interpret_goal(state: GraphState) -> GraphState:
                     "goal about the grocery BILL is the grocery shape, not the meal shape. "
                     "The device ROUTES on this value, so a mismatched shape loses its "
                     "handling. Coin a new short slug only when the goal is a KIND none of "
-                    "the advertised hints covers.",
+                    "the advertised hints covers.\n\n"
+                    "THE EDGE: this product runs a HOME. It acts on the fridge, the "
+                    "shopping, the appliances, the calendar and the home's security — "
+                    "things inside the house. A goal that happens to mention the house "
+                    "while actually being about the wider world is NOT actionable here: "
+                    "booking travel, flights, hotels or an itinerary; finding somewhere to "
+                    "live; money beyond the household shopping; work, health care or "
+                    "anything requiring a service this home does not have. Read the "
+                    "advertised hints as the whole of what is possible — if advancing the "
+                    "goal would need something not in that list, say so with "
+                    "actionable=false rather than picking the closest shape. Getting the "
+                    "HOUSE ready for a trip is in scope; planning the TRIP is not.",
                 ),
                 ("human", goal_text),
             ]
@@ -501,7 +512,7 @@ def interpret_goal(state: GraphState) -> GraphState:
             return {
                 "intent": {
                     "actionable": False,
-                    "decline_reason": "not an actionable meal or guest-dinner goal",
+                    "decline_reason": "I could not make sense of that as something this home can do",
                     "domain": "",
                     "objective": goal_text,
                     "time_window": {},
