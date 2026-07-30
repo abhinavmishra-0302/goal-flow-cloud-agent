@@ -27,6 +27,7 @@ past.
 | v4.1 | `hello.surface`, the input-surface delivery fork, `chat_ui_open`/`chat_ui_close`, create-phase replay on bind |
 | v5.1 | `agent_event: harness`, `plan_progress.total` |
 | v6 | `constraints.hard`: `peak_hours`, `away_window`, `budget_envelope`; `understanding.constraints` (provenance) and `proposed_constraints`/`capture_only`; `understanding_response.accepted_constraint_ids` |
+| v7 | `understanding.preferences` (the soft half, one row per entry); `understanding.constraints[].kind`; store-side `display_to` narrows `knew`/`constraints` on both the gate and `present_plan` without touching what is dispatched or enforced |
 
 ## Transport
 
@@ -168,10 +169,16 @@ dispatch. The graph is paused until the UI answers with `understanding_response`
   "payload": {
     "objective": "...",
     "domain": "meal_plan",
-    "knew": { "allergens": ["peanuts"], "budget": "$120" },
+    "knew": { "allergens": ["peanuts"], "dietary": ["no_pork"] },
     "constraints": [
-      { "id": "c-cap-travel", "label": "travel budget", "value": "$1500",
-        "enforcement": "hard", "source": "account", "why": "domain" }
+      { "id": "c-allergen-peanuts", "kind": "allergens", "label": "peanut allergy",
+        "value": "peanuts", "enforcement": "hard", "source": "account",
+        "why": "always enforced" }
+    ],
+    "preferences": [
+      { "id": "s-prefer-white-meat", "label": "prefers white meat",
+        "value": "prefer white meat, chicken turkey fish over red meat",
+        "source": "account", "why": "tagged" }
     ],
     "thought": "I'll shape a meal plan around your constraints before planning.",
     "time_window": { "start": "<ISO>", "end": "<ISO>" }
@@ -179,9 +186,23 @@ dispatch. The graph is paused until the UI answers with `understanding_response`
 ```
 
 `constraints` (v6, **additive**) is the provenance list behind the `knew` chips: one
-row per applied constraint, with `source` ∈ `account | derived | chat` and `why`
+row per applied HARD constraint, with `source` ∈ `account | derived | chat` and `why`
 saying whether it was enforced always, picked for this domain, or captured. `knew` is
 unchanged, so a UI that ignores `constraints` keeps working.
+
+**v7 — `preferences` (additive), and display ≠ enforcement.** `preferences` carries the
+SOFT half: one row per store entry, `{id, label, value, source, why}`, with no
+`enforcement` field because there is nothing to enforce. It is a separate field rather
+than more `knew` chips because a preference shapes a plan and can never block one, and
+a UI that renders the two alike teaches the reader that a chip is just a chip.
+
+Also in v7, a store entry may carry `display_to` — the domains its chip is worth
+**showing** on. It has no bearing on resolution: the hard list kinds still union with
+`applies_to` ignored, and `dispatch.constraints.hard` still carries the full enforced
+set. It only narrows `knew` and `constraints`, so a home-prep goal shows no food chips
+while still being dispatched — and still being blocked by — every allergen the
+household holds. **Hiding a chip never hides a rule.** `present_plan.knew` applies the
+same filter, so the gate and the plan card cannot disagree.
 
 **v6-M4 — capture (additive).** When the message STATES a household rule, the payload
 also carries `proposed_constraints` — `[{id, kind, value, enforcement, label, quote,

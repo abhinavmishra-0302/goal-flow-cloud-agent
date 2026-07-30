@@ -401,10 +401,17 @@ class UnderstandingPayload(_ContractModel):
     domain: str = ""
     #: Display-ready hard-constraint chips, same shape as PlanPayload.knew.
     knew: dict[str, Any] = Field(default_factory=dict)
-    #: v6, ADDITIVE: one row per applied constraint — {id, label, value, enforcement,
-    #: source, why}. Provenance for the gate: a block the user cannot trace is a
-    #: block they will not trust. `knew` is unchanged, so a UI may ignore this.
+    #: v6, ADDITIVE: one row per applied HARD constraint — {id, kind, label, value,
+    #: enforcement, source, why}. Provenance for the gate: a block the user cannot
+    #: trace is a block they will not trust. `knew` is unchanged, so a UI may ignore
+    #: this. v7: rows this domain does not display are omitted, so these line up
+    #: one-for-one with `knew`'s chips.
     constraints: list[dict[str, Any]] = Field(default_factory=list)
+    #: v7, ADDITIVE: the SOFT half — {id, label, value, source, why}, one row per
+    #: entry. Kept out of `knew` and out of `constraints` on purpose: a preference
+    #: shapes the plan and can never block it, and a UI that renders the two alike
+    #: teaches the reader that a chip is a chip. Empty is normal.
+    preferences: list[dict[str, Any]] = Field(default_factory=list)
     #: v6-M4, ADDITIVE: household rules the user STATED in this message, awaiting a
     #: yes. Proposals only — the LLM never writes policy, so nothing here applies
     #: until it comes back in `understanding_response.accepted_constraint_ids`.

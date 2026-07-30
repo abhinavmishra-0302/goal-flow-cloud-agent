@@ -209,13 +209,22 @@ def _capability_summary(capabilities: dict[str, Any] | None) -> str:
 
 
 def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
-    """Display-ready hard-constraint chips shared by the gate and plan card."""
+    """Display-ready hard-constraint chips shared by the gate and plan card.
+
+    Feed this ``hard_display``, not ``hard`` — v7 splits the two, and passing the
+    dispatched block here would put a chip on a card for a rule the goal cannot trip.
+
+    Money and quiet hours are no longer rendered because the household no longer holds
+    them (see memory/store.py). The branches are gone rather than dormant: a chip
+    builder that formats a key nothing ever sets is a comment pretending to be code. If
+    a budget entry is ever seeded again, the chip comes back here, in four lines.
+    """
     hard = hard or {}
     knew: dict[str, Any] = {}
 
     def add(label: str, value: Any) -> None:
         # Only surface flat, display-ready values (str / list[str]); never raw
-        # nested objects except quiet_hours, which is intentionally stringified.
+        # nested objects. Windows are stringified separately, below.
         if isinstance(value, list):
             items = [str(v) for v in value if str(v).strip()]
             if items:
@@ -228,20 +237,11 @@ def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
     add("allergens", hard.get("allergens"))
     add("dietary", hard.get("dietary"))
     add("medical", hard.get("medical"))
-    if hard.get("budget_cap"):
-        # ":g" so a whole-number cap reads "$120", not "$120.0". Coerced through
-        # float() first and guarded: this value comes from an LLM, so "120" as a
-        # STRING is a real shape, and formatting a str with :g raises — which would
-        # kill the goal at the understanding gate to tidy a decimal point.
-        try:
-            knew["budget"] = f"${float(hard['budget_cap']):g}"
-        except (TypeError, ValueError):
-            knew["budget"] = f"${hard['budget_cap']}"
-    # NOT str(dict) — that renders "{'start': '21:30', 'end': '07:00'}" into a
+    # NOT str(dict) — that renders "{'start': '17:00', 'end': '21:00'}" into a
     # user-facing chip: a Python literal, quotes and braces included, on a fridge
     # door. These chips are the agent proving it listened, so they have to read
     # like a person wrote them.
-    for label, key in (("quiet hours", "quiet_hours"), ("peak tariff", "peak_hours"), ("away", "away_window")):
+    for label, key in (("peak tariff", "peak_hours"), ("away", "away_window")):
         window = hard.get(key)
         if not window:
             continue
@@ -249,18 +249,35 @@ def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
             knew[label] = f"{window.get('start', '?')}–{window.get('end', '?')}"
         elif isinstance(window, str) and window.strip():
             knew[label] = window.strip()
-
-    envelope = hard.get("budget_envelope")
-    if isinstance(envelope, dict) and envelope.get("cap"):
-        # The pool, not this goal's slice — the device narrows the goal's own cap to
-        # whatever is left of it, so the chip says what the household has, not what
-        # the goal may spend.
-        period = str(envelope.get("period") or "").strip()
-        try:
-            knew["envelope"] = f"${float(envelope['cap']):g}" + (f" {period}" if period else "")
-        except (TypeError, ValueError):
-            knew["envelope"] = f"${envelope['cap']}"
     return knew
+
+
+def _applied_preferences(applied: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Display-ready preference rows — the soft half of what was resolved.
+
+    One row per ENTRY, not per kind, which is why the store labels its soft entries:
+    grouping by kind is right for the dispatch (the planner wants one ``prefer`` list)
+    and wrong for a card (the reader wants "prefers white meat" and "workout-friendly"
+    as two things they can agree or disagree with).
+
+    ``context`` entries are excluded. They are household notes the planner reads, not
+    preferences anyone expressed, and listing "family calendar is the shared source of
+    evening availability" as something the user prefers would be a small lie.
+    """
+    rows: list[dict[str, Any]] = []
+    for entry in applied or []:
+        if entry.get("enforcement") != "soft" or entry.get("kind") == "context":
+            continue
+        rows.append(
+            {
+                "id": entry.get("id", ""),
+                "label": entry.get("label", ""),
+                "value": _constraint_display(entry.get("kind", ""), entry.get("value")),
+                "source": entry.get("source", "account"),
+                "why": entry.get("why", ""),
+            }
+        )
+    return rows
 
 
 def _applied_constraints(applied: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -268,15 +285,23 @@ def _applied_constraints(applied: list[dict[str, Any]] | None) -> list[dict[str,
 
     Values are rendered here, not in the UI, for the same reason the ``knew`` chips
     are: a raw ``{'start': ..., 'end': ...}`` on a fridge door reads like a bug.
+
+    HARD rows only, and only the ones this domain displays — these sit under the
+    constraint chips and must line up with them one-for-one. The soft rows go out
+    separately as ``preferences``; a provenance list mixing "blocks your plan" with
+    "nudges your plan" would undo the distinction the two sections exist to draw.
     """
     rows: list[dict[str, Any]] = []
     for entry in applied or []:
+        if entry.get("enforcement") != "hard" or not entry.get("display", True):
+            continue
         rows.append(
             {
                 "id": entry.get("id", ""),
+                "kind": entry.get("kind", ""),
                 "label": entry.get("label", ""),
                 "value": _constraint_display(entry.get("kind", ""), entry.get("value")),
-                "enforcement": entry.get("enforcement", "soft"),
+                "enforcement": entry.get("enforcement", "hard"),
                 "source": entry.get("source", "account"),
                 "why": entry.get("why", ""),
             }
@@ -543,6 +568,10 @@ def load_memory(state: GraphState) -> GraphState:
     memory = {
         "family_id": profile.get("family_id"),
         "hard": resolved["hard"],
+        # v7, DISPLAY ONLY and never dispatched: `hard` minus what this domain has no
+        # reason to show. The two are kept apart deliberately — see store.py. Anything
+        # that builds a contract reads `hard`; anything that builds a card reads this.
+        "hard_display": resolved["hard_display"],
         "bias": {
             "members": list(profile.get("members", [])),
             "soft": resolved["soft"],
@@ -1055,11 +1084,17 @@ def present_understanding(state: GraphState) -> GraphState:
         "domain": domain,
         "time_window": intent.get("time_window") or {},
         "hard": hard,
-        "knew": _hard_knew(hard),
+        # DISPLAY block, not the dispatched one — the card shows what this goal can
+        # actually trip; `hard` (above, and what build_contract copies) is unchanged.
+        "knew": _hard_knew(memory.get("hard_display") or hard),
         # v6 provenance, additive: WHERE each constraint came from and why it was
         # picked for this goal. `knew` stays exactly as it was, so no UI has to
         # change to ship this — the chips keep working and this rides alongside.
         "constraints": _applied_constraints(memory.get("applied")),
+        # v7, additive: the soft half, one row per entry. Preferences shape the plan
+        # and never gate it, so they are a separate field rather than more chips —
+        # the UI has to be able to render them as the lighter thing they are.
+        "preferences": _applied_preferences(memory.get("applied")),
         # v6-M4, additive: rules the user stated in the same breath as the goal
         # ("plan our dinners — we've gone vegan"). Proposed here, applied only if
         # they come back accepted.
@@ -1096,12 +1131,14 @@ def present_understanding(state: GraphState) -> GraphState:
             memory = {
                 **memory,
                 "hard": resolved["hard"],
+                "hard_display": resolved["hard_display"],
                 "bias": {**memory.get("bias", {}), "soft": resolved["soft"], "context": resolved["context"]},
                 "applied": resolved["applied"],
             }
             understanding["hard"] = resolved["hard"]
-            understanding["knew"] = _hard_knew(resolved["hard"])
+            understanding["knew"] = _hard_knew(resolved["hard_display"])
             understanding["constraints"] = _applied_constraints(resolved["applied"])
+            understanding["preferences"] = _applied_preferences(resolved["applied"])
             logger.info("captured_constraints_applied goal=%s ids=%s",
                         state.get("goal_id"), [entry["id"] for entry in written])
     logger.info("graph_node_exit node=present_understanding confirmed=%s", confirmed)

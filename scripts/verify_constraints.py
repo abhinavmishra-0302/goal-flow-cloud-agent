@@ -10,11 +10,22 @@ planned against the wrong household.
 
 So this gate asserts the two halves that are easy to get backwards:
 
-  * the DOMAIN-PICKED half really does differ per goal (travel cap and away window on
-    a vacation; peak tariff on an energy goal; the party cap on a party), and
+  * the DOMAIN-PICKED half really does differ per goal (the away window on a vacation,
+    peak tariff on an energy goal), and
   * the ENFORCED-ALWAYS half really is identical on every goal, including a domain
-    slug nobody has ever tagged. Relevance may pick a cap. It may NEVER drop an
+    slug nobody has ever tagged. Relevance may pick a window. It may NEVER drop an
     allergen — that is the one failure mode the whole design exists to prevent.
+
+v7 ADDS THE THIRD HALF, which is the one this version could plausibly get wrong.
+``display_to`` hides a chip; it must never hide a RULE. So every display assertion
+below is paired with an enforcement assertion on the same domain: vacation_prep shows
+no food chips AND still resolves all three food constraints into its dispatch. If
+those two ever agree, the feature has eaten the invariant it was built beside.
+
+v7 also emptied the store of budget_cap, budget_envelope and quiet_hours. The old
+assertions about $120 / $200 / $1500 / $600 are gone with them — but "gone" is itself
+asserted, because a cap that quietly comes back would re-introduce the v5 bug this
+gate was written for.
 """
 
 from __future__ import annotations
@@ -68,16 +79,13 @@ def main() -> int:
                 f"{kind} differs on {domain}: {r['hard'][kind]} != {baseline} — the enforced set was narrowed",
             )
 
-    # 2. The domain-picked half differs, and differs correctly.
-    check(resolved["meal_plan"]["hard"]["budget_cap"] == 120.0,
-          f"meal_plan keeps the weekly household cap, got {resolved['meal_plan']['hard'].get('budget_cap')}")
-    check(resolved["vacation_prep"]["hard"]["budget_cap"] == 1500.0,
-          f"vacation_prep must carry the TRAVEL cap, got {resolved['vacation_prep']['hard'].get('budget_cap')} "
-          "(the v5 bug: it inherited the $120 grocery cap)")
-    check(resolved["birthday_party"]["hard"]["budget_cap"] == 200.0,
-          f"birthday_party must carry the party cap, got {resolved['birthday_party']['hard'].get('budget_cap')}")
-    check(coined["hard"]["budget_cap"] == 120.0,
-          f"a coined domain falls back to the household cap, got {coined['hard'].get('budget_cap')}")
+    # 2. v7: the money and quiet-hours entries are GONE, everywhere. Asserted rather
+    #    than assumed — a re-seeded cap is exactly the v5 bug coming back, and it would
+    #    show up as a $120 chip on a vacation goal long before anyone read the store.
+    for domain, r in list(resolved.items()) + [("plant_care", coined)]:
+        for kind in ("budget_cap", "budget_envelope", "quiet_hours"):
+            check(kind not in r["hard"],
+                  f"{domain} must resolve NO {kind} — v7 emptied the store of it, got {r['hard'].get(kind)}")
 
     # 3. Windows are scoped, not universal.
     check(resolved["energy_saving"]["hard"].get("peak_hours") == {"start": "17:00", "end": "21:00"},
@@ -89,40 +97,61 @@ def main() -> int:
           f"vacation_prep away window resolves day offsets to ISO dates, got {away}")
     check(not resolved["meal_plan"]["hard"].get("away_window"),
           "meal_plan must not carry the away window while the seeded world has it eating at home those days")
-    for domain, r in resolved.items():
-        check(r["hard"].get("quiet_hours") == {"start": "21:30", "end": "07:00"},
-              f"quiet hours are household-wide, missing on {domain}")
 
-    # 4. The v5 contract is preserved where it was already right: a meal goal's hard
-    #    block must be exactly what v5 dispatched — plus the household envelope, which
-    #    every goal draws from and which the DEVICE (not this resolver) narrows the
-    #    goal's own cap against.
+    # 4. A meal goal's hard block, exactly.
     check(
         resolved["meal_plan"]["hard"] == {
             "allergens": ["peanuts"],
             "medical": ["rohan_low_sodium"],
             "dietary": ["no_pork"],
-            "budget_cap": 120.0,
-            "quiet_hours": {"start": "21:30", "end": "07:00"},
-            "budget_envelope": {"cap": 600.0, "period": "monthly"},
         },
         f"meal_plan hard block drifted: {resolved['meal_plan']['hard']}",
     )
 
-    # 4b. The envelope is household-wide: EVERY goal must carry it, or two goals can
-    #     spend the same money while each stays inside its own cap.
-    for domain, r in list(resolved.items()) + [("plant_care", coined)]:
-        check(r["hard"].get("budget_envelope") == {"cap": 600.0, "period": "monthly"},
-              f"{domain} must carry the household envelope, got {r['hard'].get('budget_envelope')}")
+    # 5. v7 DISPLAY vs ENFORCEMENT. The pairs below are the whole point: each display
+    #    assertion sits next to the enforcement assertion it must not have broken.
+    vac = resolved["vacation_prep"]
+    for kind in ("allergens", "dietary", "medical"):
+        check(kind not in vac["hard_display"],
+              f"a home-prep goal shows no {kind} chip, got {vac['hard_display'].get(kind)}")
+        check(vac["hard"][kind] == resolved["meal_plan"]["hard"][kind],
+              f"...but it is STILL ENFORCED: {kind} was {vac['hard'][kind]}, expected "
+              f"{resolved['meal_plan']['hard'][kind]} — hiding a chip must never hide a rule")
+    check(vac["hard_display"].get("away_window") == away,
+          f"the away window IS shown on a vacation goal, got {vac['hard_display'].get('away_window')}")
+    for kind in ("allergens", "dietary", "medical"):
+        check(resolved["meal_plan"]["hard_display"].get(kind) == resolved["meal_plan"]["hard"][kind],
+              f"a meal goal shows every food rule it enforces, {kind} differs")
+    check(resolved["energy_saving"]["hard_display"] == {"peak_hours": {"start": "17:00", "end": "21:00"}},
+          f"an energy goal shows only its tariff window, got {resolved['energy_saving']['hard_display']}")
+    #    Provenance rows must agree with the chips, or the caption under a chip belongs
+    #    to a different rule than the chip does.
+    shown_ids = {row["id"] for row in vac["applied"] if row["enforcement"] == "hard" and row["display"]}
+    check(shown_ids == {"c-away-window"},
+          f"vacation_prep displays exactly the away window row, got {shown_ids}")
+    applied_ids = {row["id"] for row in vac["applied"] if row["enforcement"] == "hard"}
+    check("c-allergen-peanuts" in applied_ids,
+          "the allergen row is still APPLIED on a vacation goal — undisplayed is not unapplied")
 
-    # 5. Soft bias is domain-shaped — the visible half of the fix.
-    veg_prefs = resolved["meal_plan"]["soft"].get("prefer", [])
-    check("more_vegetables" in veg_prefs, f"meal_plan keeps its meal bias, got {veg_prefs}")
-    check("mushrooms" in resolved["meal_plan"]["soft"].get("dislikes", []),
-          "meal_plan keeps the household dislike")
-    vac_soft = resolved["vacation_prep"]["soft"]
-    check("mushrooms" not in str(vac_soft),
-          f"a vacation goal must not be told about mushrooms, got {vac_soft}")
+    # 6. Soft bias is domain-shaped, and every soft entry is LABELLED (the card renders
+    #    one row per entry, so an unlabelled preference reads as its kind).
+    meal_prefs = resolved["meal_plan"]["soft"].get("prefer", [])
+    check("prefer_white_meat" in meal_prefs, f"meal_plan carries the white-meat bias, got {meal_prefs}")
+    check("match_protein_to_activity_load" in meal_prefs,
+          f"meal_plan carries the workout bias, got {meal_prefs}")
+    meal_soft_rows = [r for r in resolved["meal_plan"]["applied"]
+                      if r["enforcement"] == "soft" and r["kind"] != "context"]
+    check(len(meal_soft_rows) == 2,
+          f"the meal demo shows exactly two preferences, got {[r['id'] for r in meal_soft_rows]}")
+    vac_soft_rows = [r for r in vac["applied"] if r["enforcement"] == "soft" and r["kind"] != "context"]
+    check(len(vac_soft_rows) == 3,
+          f"the home-away demo shows exactly three preferences, got {[r['id'] for r in vac_soft_rows]}")
+    for row in meal_soft_rows + vac_soft_rows:
+        check(bool(row["label"]) and row["label"] != row["kind"].replace("_", " "),
+              f"soft entry {row['id']} needs a real label, got {row['label']!r}")
+    vac_soft = vac["soft"]
+    check("prefer_white_meat" not in str(vac_soft),
+          f"a home-prep goal must not be told about meat preferences, got {vac_soft}")
     check("hold_deliveries_while_away" in vac_soft.get("prefer", []),
           f"vacation_prep carries departure bias, got {vac_soft}")
     check(any("neighbour" in c for c in resolved["vacation_prep"]["context"]),
@@ -136,23 +165,25 @@ def main() -> int:
     check("s-guest-visiting" not in {c["id"] for c in soft_candidates(profile, TODAY)},
           "an expired entry was offered to the relevance pass")
 
-    # 7. The relevance path: ids select, and garbage falls back to tags rather than
+    # 8. The relevance path: ids select, and garbage falls back to tags rather than
     #    resolving to an empty bias.
-    picked = resolve_constraints(profile, "meal_plan", today=TODAY, soft_ids=["s-dislikes-mushrooms"])
-    check(picked["soft"].get("dislikes") == ["mushrooms"] and "prefer" not in picked["soft"],
+    picked = resolve_constraints(profile, "meal_plan", today=TODAY, soft_ids=["s-prefer-white-meat"])
+    check(picked["soft"].get("prefer") == ["prefer_white_meat", "chicken_turkey_fish_over_red_meat"],
           f"soft_ids selects exactly what it names, got {picked['soft']}")
     check(picked["hard"] == resolved["meal_plan"]["hard"],
           "the relevance pass must not change the hard block")
+    check(picked["hard_display"] == resolved["meal_plan"]["hard_display"],
+          "nor the display block — relevance picks preferences, not chips")
     junk = resolve_constraints(profile, "meal_plan", today=TODAY, soft_ids=["nope-not-a-real-id"])
     check(junk["soft"] == resolved["meal_plan"]["soft"],
           f"unknown ids fall back to tag matching, got {junk['soft']}")
 
-    # 8. Provenance rides along: every applied row can say where it came from.
+    # 9. Provenance rides along: every applied row can say where it came from.
     rows = resolved["vacation_prep"]["applied"]
     check(all(row.get("source") in {"account", "derived", "chat"} for row in rows),
           f"every applied row carries a source, got {[r.get('source') for r in rows]}")
-    check(any(row["id"] == "c-cap-travel" and row["source"] == "account" for row in rows),
-          "the travel cap is traceable to the account")
+    check(any(row["id"] == "c-away-window" and row["source"] == "derived" for row in rows),
+          "the away window is traceable to the calendar it was derived from")
 
     for f in failures:
         print(f"  FAIL {f}")

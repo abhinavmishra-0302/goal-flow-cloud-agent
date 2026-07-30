@@ -30,6 +30,7 @@ from pydantic import ValidationError
 from goalflow_cloud.board import BoardService
 from goalflow_cloud.config import get_settings
 from goalflow_cloud.graph import nodes as graph_nodes
+from goalflow_cloud.memory.store import load_family_profile, resolve_constraints
 from goalflow_cloud.models.contract import (
     AgentEvent,
     Approval,
@@ -781,7 +782,10 @@ async def handle_goal_state_get(device_id: str, request: GoalStateGet) -> None:
             payload=UnderstandingPayload(
                 objective=understanding.get("objective", ""),
                 domain=understanding.get("domain", ""),
-                knew=understanding.get("knew") or graph_nodes._hard_knew(understanding.get("hard") or {}),
+                knew=understanding.get("knew")
+                or graph_nodes._hard_knew(understanding.get("hard_display") or understanding.get("hard") or {}),
+                constraints=understanding.get("constraints") or [],
+                preferences=understanding.get("preferences") or [],
                 thought=understanding.get("thought", ""),
                 time_window=understanding.get("time_window") or None,
             ),
@@ -928,6 +932,8 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
                 # user stated in the same breath. Both additive — a UI that ignores
                 # them renders exactly as before.
                 constraints=understanding.get("constraints") or [],
+                # v7: the soft half, rendered as its own lighter section.
+                preferences=understanding.get("preferences") or [],
                 proposed_constraints=understanding.get("proposed_constraints") or [],
                 capture_only=bool(understanding.get("capture_only")),
                 thought=understanding.get("thought", ""),
@@ -1182,12 +1188,37 @@ async def handle_plan_ready(device_id: str, plan_ready: PlanReady) -> None:
         await registry.send_to_device(device_id, approval_frame)
 
 
+def _display_hard(hard: dict[str, Any], domain: str) -> dict[str, Any]:
+    """The dispatched hard block, narrowed to the keys this domain shows.
+
+    Re-resolves the store rather than threading a second block through the dispatch:
+    the contract is the device's, and adding a display-only field to it would put a UI
+    concern on the wire the device would have to be told to ignore. If the store cannot
+    be read for any reason the block is returned WHOLE — an unfiltered chip row is a
+    cosmetic problem, and a plan card that fails to render over one is not.
+    """
+    if not domain:
+        return hard
+    try:
+        allowed = resolve_constraints(load_family_profile(), domain)["hard_display"]
+    except Exception:  # noqa: BLE001 - display only; never fail a plan over a chip
+        logger.warning("knew_display_filter_failed domain=%s — showing the full block", domain)
+        return hard
+    return {key: value for key, value in hard.items() if key in allowed}
+
+
 def build_knew(contract: dict[str, Any] | None) -> dict[str, Any]:
     """The UI-facing "what it knew" summary from a dispatched contract.
 
     GENERIC: surfaces constraints.hard (safety policy), constraints.soft
     (preferences), and context — no domain-specific field names.
 
+    v7: the hard half is filtered to what this DOMAIN displays, so the plan card's
+    chips say the same thing the understanding card's did. Without this the gate would
+    show three chips and the plan four, and the reader would reasonably assume
+    something changed between them. The filter is a display concern only — the
+    contract was dispatched with the full block, and it is the full block the device
+    armed.
     """
     if not contract:
         return {}
@@ -1195,7 +1226,7 @@ def build_knew(contract: dict[str, Any] | None) -> dict[str, Any]:
     soft = (contract.get("constraints") or {}).get("soft") or {}
     context = contract.get("context") or {}
 
-    knew: dict[str, Any] = graph_nodes._hard_knew(hard)
+    knew: dict[str, Any] = graph_nodes._hard_knew(_display_hard(hard, contract.get("domain") or ""))
 
     def add(label: str, value: Any) -> None:
         # Only surface flat, display-ready values (str / list[str]); never raw

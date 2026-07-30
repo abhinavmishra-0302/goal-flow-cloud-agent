@@ -120,6 +120,16 @@ def main() -> int:
               "the applied row must say the rule came from chat, or a block cannot cite it")
 
         # 5. TIGHTEN ONLY. A cap may come down from chat; it may never go up.
+        #
+        #    v7 SEEDS ITS OWN INCUMBENT. This used to lean on the $200 party cap in the
+        #    committed store, which v7 removed along with every other money entry — and
+        #    the failure mode was quiet: with nothing to loosen, `_tightens` has nothing
+        #    to compare against and returns True, so "raising a cap must be refused"
+        #    would have gone on passing while testing nothing at all. A gate for a
+        #    ratchet has to own the thing it ratchets against.
+        standing = [{"kind": "budget_cap", "value": 200.0, "enforcement": "hard", "applies_to": ["birthday_party"]}]
+        check(len(append_constraints(standing, path=store_file, today=TODAY)) == 1,
+              "fixture: a standing cap is written when the household has none")
         loosen = [{"kind": "budget_cap", "value": 900.0, "enforcement": "hard", "applies_to": ["birthday_party"]}]
         check(append_constraints(loosen, path=store_file, today=TODAY) == [],
               "raising a $200 party cap to $900 from chat must be refused")
