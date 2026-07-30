@@ -26,10 +26,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from goalflow_cloud.memory.store import (  # noqa: E402
+    DEFAULT_PROFILE_PATH,
     load_family_profile,
     resolve_constraints,
     soft_candidates,
 )
+
+#: THE COMMITTED SEED, named explicitly — never `load_family_profile()` with no argument.
+#: That reads whatever `GOALFLOW_PROFILE_PATH` points at, and a demo run points it at a
+#: scratch copy that chat capture then WRITES to. This gate's assertions are about the
+#: seed's contents ("birthday_party carries the $200 party cap"), so reading the scratch
+#: file makes the verdict depend on whoever last rehearsed the demo — it failed here on a
+#: captured vegan rule and a tightened $150 cap, and it could just as easily have passed
+#: for an equally wrong reason.
+SEED = Path(__file__).resolve().parents[1] / DEFAULT_PROFILE_PATH
 
 TODAY = date(2026, 7, 29)
 DOMAINS = ("meal_plan", "guest_dinner", "vacation_prep", "birthday_party", "grocery_cost", "energy_saving")
@@ -42,7 +52,7 @@ def main() -> int:
         if not ok:
             failures.append(what)
 
-    profile = load_family_profile()
+    profile = load_family_profile(SEED)
     resolved = {d: resolve_constraints(profile, d, today=TODAY) for d in DOMAINS}
     # A slug the interpreter coined for a goal nobody anticipated. It is tagged
     # nowhere, so it exercises the household-default path end to end.
