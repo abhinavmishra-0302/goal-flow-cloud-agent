@@ -681,6 +681,19 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
         status = Status(**frame)
         await registry.send_to_uis(device_id, status.model_dump(mode="json"))
         await push_board(device_id, board.on_status(device_id, status.goal_id, status.model_dump(mode="json")))
+        # v7 — the board now HAS the change the chat surface promised. Released here and
+        # not on the control's send, because "we told the device" is not the thing the
+        # user was waiting to be true.
+        #
+        # The release is "the first status this goal sends after the control was armed",
+        # not "a status carrying a plan_changed_note": a constraint change that decided
+        # nothing needed to move still answers, and keying on the note would hold the
+        # webview open for the full timeout on exactly the quiet case. The looseness costs
+        # nothing — the only other thing that makes a goal speak is a world tick, and the
+        # user is in the chat, not on the board, for the whole of this window. If one did
+        # slip in, the webview closes a little early rather than not at all.
+        if (waiter := crossgoal_waiters.get(status.goal_id)) is not None:
+            waiter.set()
         await graph_resume_monitor(status.goal_id, status.model_dump(mode="json"))
     elif sender_role == "device" and frame_type == "day_advanced":
         # v3.2 world tick summary — a board surface. The per-goal status/proposal frames
@@ -1121,12 +1134,16 @@ async def handle_approval(device_id: str, approval: Approval) -> None:
     # other running goal is planning against a household that no longer exists. Done
     # BEFORE the webview closes, so the chat surface can hold its "saving, and updating
     # your other goals…" screen for exactly as long as the work takes.
-    await fan_out_household_change(device_id, approval.goal_id)
+    waiting_on = await fan_out_household_change(device_id, approval.goal_id)
     # v4.1: the initial approval ends the create phase — the user's final tap, the
     # moment the board becomes the primary surface. Close the webview bracket. GUARDED
     # on "still the create-phase goal", so a board adaptation approval (whose goal is
     # no longer the create-phase goal) never retriggers a close.
-    await emit_chat_ui_close(device_id, approval.goal_id)
+    #
+    # NOT AWAITED: this handler runs inline on the UI's receive loop, and the close can
+    # now be a minute away. Blocking here would stop that UI being heard from — the same
+    # socket the user is about to press Advance day on.
+    asyncio.create_task(_close_when_saved(device_id, approval.goal_id, waiting_on))
 
 
 #: How long a refusal stays on the chat surface before the cloud closes it (v7).
@@ -1151,13 +1168,71 @@ async def _close_after(device_id: str, goal_id: str, seconds: float) -> None:
         logger.exception("timed_close_failed goal=%s", goal_id)
 
 
+#: The floor on how long the chat's "Saving your plan…" screen is up (v7).
+#:
+#: An approval used to close the webview within a round-trip — a few tens of
+#: milliseconds — so the saving screen existed in the code and never existed on screen,
+#: and the surface the user had just tapped vanished under their finger. The dwell is not
+#: decoration: the tap moved the goal from the chat to the board, and a hand-off with no
+#: visible moment reads as a crash. Long enough to register as a transition, short enough
+#: that nobody is waiting on it.
+SAVE_DWELL_S = 1.6
+
+#: How long the webview will hold open waiting for another goal to finish re-planning
+#: after a household change (v7). The re-plan is a real LLM call on the device, so this is
+#: generous — but bounded, because a device that never answers must not strand the user in
+#: a spinner with no way out. On timeout the webview closes and the board still gets the
+#: change whenever it lands; the user simply is not watched over while it does.
+CROSS_GOAL_WAIT_S = 180.0
+
+#: goal_id -> "this goal's cross-goal re-plan has landed". Registered before the control
+#: goes down the wire (never after — the device can answer faster than we can arm) and
+#: fired by the status route when the re-planned goal reports back.
+crossgoal_waiters: dict[str, asyncio.Event] = {}
+
+
+async def _close_when_saved(device_id: str, goal_id: str, waiting_on: list[str]) -> None:
+    """Hold the create-phase webview until the save it announced is actually true.
+
+    THE SCREEN HAS TO OUTLAST THE WORK IT DESCRIBES. In Act 1 that is the dwell floor —
+    there is nothing to wait for but the hand-off itself. In Act 3 the chat says it is
+    "updating your other goals", and the honest moment to close is when the other goals
+    have actually been updated: the user watches the sentence that names the meal plan,
+    and finds the meal plan already changed when they get to the board.
+
+    The cloud owns this and not the chat UI, because the chat UI does not own its own
+    lifetime — Bixby unmounts the webview the instant `chat_ui_close` arrives, so a dwell
+    held only inside the iframe is a dwell nobody sees.
+    """
+    try:
+        started = asyncio.get_running_loop().time()
+        for other in waiting_on:
+            event = crossgoal_waiters.get(other)
+            if event is None:
+                continue
+            try:
+                await asyncio.wait_for(event.wait(), timeout=CROSS_GOAL_WAIT_S)
+            except asyncio.TimeoutError:
+                logger.warning("crossgoal_wait_timeout goal=%s waited_on=%s", goal_id, other)
+            finally:
+                crossgoal_waiters.pop(other, None)
+
+        elapsed = asyncio.get_running_loop().time() - started
+        if elapsed < SAVE_DWELL_S:
+            await asyncio.sleep(SAVE_DWELL_S - elapsed)
+        await emit_chat_ui_close(device_id, goal_id)
+    except Exception:  # noqa: BLE001 - a background task must never take the process down
+        logger.exception("deferred_close_failed goal=%s", goal_id)
+        await emit_chat_ui_close(device_id, goal_id)
+
+
 #: Hard kinds whose arrival changes what OTHER goals should be planning, not merely what
 #: they may do. An away window empties days; a peak-tariff window only reshapes when
 #: something runs, which the safety gate already handles at actuation without a re-plan.
 HOUSEHOLD_WIDE_KINDS = ("away_window",)
 
 
-async def fan_out_household_change(device_id: str, approved_goal_id: str) -> None:
+async def fan_out_household_change(device_id: str, approved_goal_id: str) -> list[str]:
     """Promote an approved goal's window to the household, and re-plan whoever it moves.
 
     THE SHAPE OF THE MOMENT. Goal 2 says "we're away Thursday and Friday". Until it is
@@ -1176,11 +1251,11 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> Non
     """
     contract = dispatched_contracts.get(approved_goal_id)
     if not contract:
-        return
+        return []
     hard = (contract.get("constraints") or {}).get("hard") or {}
     window = next((hard[kind] for kind in HOUSEHOLD_WIDE_KINDS if isinstance(hard.get(kind), dict)), None)
     if not window or not (window.get("start") and window.get("end")):
-        return
+        return []
 
     written = await asyncio.to_thread(
         append_constraints,
@@ -1201,7 +1276,7 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> Non
         # Already known — a re-sent approval, or a reconnect replaying one. The store is
         # append-only and idempotent enough to say nothing rather than write a duplicate.
         logger.info("household_window_unchanged goal=%s", approved_goal_id)
-        return
+        return []
 
     logger.info("household_window_written goal=%s start=%s end=%s",
                 approved_goal_id, window["start"], window["end"])
@@ -1210,6 +1285,8 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> Non
     today = date.today()
     _, summaries = board.snapshot(device_id)
     pushed = 0
+    #: Which goals the create-phase webview should wait for before it closes.
+    waiting_on: list[str] = []
     for summary in summaries:
         if summary.goal_id == approved_goal_id or summary.state in ("done", "declined"):
             continue
@@ -1248,6 +1325,10 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> Non
             "Then adjust the days immediately before and after if it helps: use up what would spoil "
             "before leaving, and keep the first day back light, because the kitchen will be bare."
         )
+        # ARM BEFORE SENDING. The device can answer faster than we can set this up, and a
+        # waiter registered after the fact waits for an event that already fired.
+        crossgoal_waiters[summary.goal_id] = asyncio.Event()
+        waiting_on.append(summary.goal_id)
         await registry.send_to_device(device_id, Control(
             goal_id=summary.goal_id,
             command="constraints_changed",
@@ -1257,6 +1338,8 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> Non
         # household two changes old and decides nothing moved.
         other.setdefault("constraints", {})["hard"] = after
         logger.info("household_change_pushed goal=%s domain=%s", summary.goal_id, domain)
+
+    return waiting_on
 
 
 def _window_words(window: dict[str, Any]) -> str:

@@ -115,6 +115,13 @@ without asking. It found a real bug on its first run — `append_constraints` wa
 idempotent for an identical entry, so a re-sent approval wrote a second away window and
 re-planned a goal the user had already watched change.
 
+`verify_close_hold.py` (gate 18) pins the OTHER half of that moment: the create-phase
+webview must outlast the work it claims to be doing. The dwell lives in the cloud and
+cannot live in the chat UI — Bixby unmounts the webview the instant `chat_ui_close`
+arrives, so a hold inside the iframe is a hold nobody sees. Also found in the field: the
+close followed the approval within a round-trip, and the saving screen existed only in the
+code.
+
 `verify_mirrors.py` (gate 14) now also checks the **`control.command` enumeration**, added
 after `constraints_changed` reached the device and CONTRACT.md but not the Python Literal —
 a Literal is a hard gate, so the frame failed validation on the SENDER's side and the
