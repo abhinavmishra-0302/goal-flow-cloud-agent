@@ -260,18 +260,28 @@ hosting it when a goal's create phase begins and closes it when the create phase
 These two frames are that bracket. The device never sees either.
 
 ```json
-{ "type": "chat_ui_open",  "goal_id": "..." }
+{ "type": "chat_ui_open",  "goal_id": "...", "goal_text": "Plan my weekly meal." }
 { "type": "chat_ui_close", "goal_id": "..." }
 ```
 
-**`chat_ui_open`** is emitted the moment the cloud knows the goal WILL have a create
-phase: in `handle_user_goal`, after interpretation returns and the actionability gate
-passes — and strictly BEFORE the `understanding` frame for the same goal.
+**`chat_ui_open`** is emitted the INSTANT `user_goal` arrives — **before** interpretation
+runs (v7.4), not after it. Interpretation is a 10-60s LLM round-trip, and emitting the
+open afterwards meant the whole of the slowest wait in the product happened with no
+webview on screen at all: the user spoke to the fridge, the fridge showed nothing, and
+then the understanding card appeared as though the work had been instant. Nothing about
+the open depends on interpretation — it is a RESET keyed to a `goal_id`, which is minted
+on arrival.
 
-An out-of-scope goal ALSO brackets (v7): `chat_ui_open`, then the `notice`, then a
-cloud-side `chat_ui_close` ~4.5s later. A refusal is an answer, and it is shown where
-every other answer is shown. Because Bixby is still MOUNTING the webview when the notice
-is broadcast, the notice is also cached for replay — see *Create-phase replay cache*.
+It carries **`goal_text`**, verbatim, for the same reason: during interpretation that
+frame is the only thing the chat surface knows, and a panel that cannot say what it is
+working on has nothing to show but a spinner. Optional, so a pre-v7.4 client is unaffected.
+
+Because the bracket is now open before either early exit, the **error** path closes it,
+and the **out-of-scope** path does NOT re-open it — a second open would broadcast a reset
+that wipes the panel the user has been watching. An out-of-scope goal still brackets (v7):
+the already-open webview receives the `notice`, then a cloud-side `chat_ui_close` ~4.5s
+later. A refusal is an answer, and it is shown where every other answer is shown. The
+notice is also cached for replay — see *Create-phase replay cache*.
 
 It has a DUAL role, one per surface:
 
@@ -693,7 +703,7 @@ a server-side per-type table would reintroduce the "forked to nobody = silently
 dropped" failure mode this contract warns about at the top.
 
 **Create-phase replay cache.** The cloud keeps, per session, the CURRENT create-phase
-goal's state: `{ goal_id, understanding?, present_plan?, notice? }` — the exact frames
+goal's state: `{ goal_id, goal_text, understanding?, present_plan?, notice? }` — the exact frames
 it broadcast (the `present_plan` including `payload.knew`), captured as they are sent.
 Lifecycle:
 

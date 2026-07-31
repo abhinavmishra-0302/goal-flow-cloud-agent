@@ -453,7 +453,12 @@ class ConnectionRegistry:
         present_plan = create_phase.get("present_plan")
         notice = create_phase.get("notice")
         try:
-            open_frame = ChatUiOpen(goal_id=goal_id).model_dump(mode="json")
+            # The text rides the replayed open too: a webview that binds DURING
+            # interpretation is exactly the case this whole change exists for, and it
+            # would otherwise rehydrate into the same blank panel.
+            open_frame = ChatUiOpen(
+                goal_id=goal_id, goal_text=create_phase.get("goal_text") or ""
+            ).model_dump(mode="json")
             log_frame("out", "ui", open_frame)
             await websocket.send_json(open_frame)
             if notice is not None:
@@ -470,11 +475,12 @@ class ConnectionRegistry:
             logger.debug("create_phase_replay_failed", exc_info=True)
 
     # --- create-phase replay cache (v4.1) ---
-    def open_create_phase(self, device_id: str, goal_id: str) -> None:
+    def open_create_phase(self, device_id: str, goal_id: str, goal_text: str = "") -> None:
         """A goal became the session's create-phase goal — create (or REPLACE
         wholesale, if a previous phase is still open) the replay cache."""
         self._session(device_id).create_phase = {
             "goal_id": goal_id,
+            "goal_text": goal_text,
             "understanding": None,
             "present_plan": None,
             "notice": None,
@@ -743,16 +749,20 @@ async def push_board(device_id: str, summary: Any | None) -> None:
     await registry.send_to_uis(device_id, frame)
 
 
-async def emit_chat_ui_open(device_id: str, goal_id: str) -> None:
+async def emit_chat_ui_open(device_id: str, goal_id: str, goal_text: str = "") -> None:
     """Open the create-phase bracket (v4.1): create/replace the replay cache and
     broadcast ``chat_ui_open``. A superseding open for a new goal replaces the cache
     wholesale (no intervening close — Bixby retargets rather than close/reopen).
 
     Ordering guarantee: callers invoke this BEFORE the goal's ``understanding``, so
     the reset lands first on the wire (and the bind-time replay re-sends it in order).
+
+    ``goal_text`` is what the user said, carried so the webview has something true to
+    show while the interpreter thinks (v7.4).
     """
-    registry.open_create_phase(device_id, goal_id)
-    await registry.send_to_uis(device_id, ChatUiOpen(goal_id=goal_id).model_dump(mode="json"))
+    frame = ChatUiOpen(goal_id=goal_id, goal_text=goal_text).model_dump(mode="json")
+    registry.open_create_phase(device_id, goal_id, goal_text)
+    await registry.send_to_uis(device_id, frame)
 
 
 async def emit_chat_ui_close(device_id: str, goal_id: str) -> None:
@@ -903,11 +913,30 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
     # decides what we can act on was a hardcoded list of two domains instead
     # (v3-M4). Now the answer follows the hardware that is plugged in.
     capabilities = registry.capabilities_of(device_id)
+
+    # OPEN THE BRACKET NOW — before interpretation, not after it (v7.4).
+    #
+    # `start_goal` is an LLM round-trip that takes 10-60s, and until v7.4 the open was
+    # emitted AFTERWARDS. So for the whole of the slowest, least-explicable wait in the
+    # product, Bixby had not been told to show anything: the user spoke to the fridge and
+    # the fridge's screen sat there. The understanding card then appeared all at once, as
+    # if the work had been instant and the silence had been a fault.
+    #
+    # Nothing downstream needs interpretation to have finished — the open is a RESET keyed
+    # to a goal_id, and the goal_id is minted above. Opening first costs nothing and buys
+    # the entire interpretation window as visible, honest progress. The two early exits
+    # below (error, out-of-scope) now inherit an already-open bracket, which is why the
+    # error path closes it and the refusal path no longer opens one.
+    await emit_chat_ui_open(device_id, goal_id, user_goal.text)
+
     async with goal_lock(goal_id):
         state = await asyncio.to_thread(
             graph_nodes.start_goal, graph, user_goal.text, goal_id, capabilities
         )
     if state.get("error"):
+        # The bracket is open (above), so it has to be closed or the webview dangles on a
+        # goal that ended before it began.
+        await emit_chat_ui_close(device_id, goal_id)
         await registry.send_to_uis(device_id,
             {
                 "type": "status",
@@ -936,7 +965,8 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
             message=explanation.get("message") or "That goal is outside what I can help with.",
         )
         logger.info("task_status status=done gate=out_of_scope")
-        await emit_chat_ui_open(device_id, goal_id)
+        # The bracket is ALREADY open (v7.4 opens it on arrival), and re-opening would
+        # broadcast a second reset that wipes the panel the user has been watching think.
         notice_frame = notice.model_dump(mode="json")
         await registry.send_to_uis(device_id, notice_frame)
         # ...and cache it, because the webview this refusal is FOR does not exist yet —
@@ -948,11 +978,8 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
         asyncio.create_task(_close_after(device_id, goal_id, OUT_OF_SCOPE_DWELL_S))
         return
 
-    # The goal WILL have a create phase (it cleared the error + out-of-scope early
-    # exits). Open the bracket NOW, strictly before the understanding broadcast and
-    # before the direct-dispatch fallback — the input surface opens/retargets its
-    # webview, a chat webview hard-resets to this goal.
-    await emit_chat_ui_open(device_id, goal_id)
+    # The bracket was opened on arrival (v7.4), so by here the webview has been up for
+    # the whole interpretation and simply receives the understanding next.
 
     interrupt_payload = state.get("_interrupt")
     if isinstance(interrupt_payload, dict) and interrupt_payload.get("kind") == "understanding_confirmation":

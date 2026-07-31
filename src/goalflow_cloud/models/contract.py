@@ -589,10 +589,18 @@ class ChatUiOpen(_ContractModel):
     webview; ``chat`` (the webview) HARD-RESETS keyed to ``goal_id`` and thereafter
     ignores goal-scoped frames with a different ``goal_id``. The device never sees
     it. Emitted strictly BEFORE the goal's ``understanding`` frame.
+
+    v7.4: emitted the INSTANT the goal is received, before interpretation runs — see
+    ``handle_user_goal``. It therefore carries ``goal_text``, because the frame is now
+    the only thing the chat surface knows for the 10-60s the interpreter is thinking,
+    and a panel that cannot say what it is working on has nothing to show but a spinner.
     """
 
     type: Literal["chat_ui_open"] = "chat_ui_open"
     goal_id: str
+    #: What the user actually said, verbatim. Optional: a v7.3 client that ignores it
+    #: renders exactly as before, and the bind-time replay may not have it.
+    goal_text: str = ""
 
 
 class ChatUiClose(_ContractModel):
