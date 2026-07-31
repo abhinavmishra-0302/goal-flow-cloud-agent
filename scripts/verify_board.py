@@ -215,6 +215,39 @@ def main() -> int:
     check(s6.progress_pct < 100,
           f"one advanced day must not complete a goal whose deadline is days away — got {s6.progress_pct}%")
 
+    # --- v7.5: the card's date MOVES with the world clock ---
+    #
+    # It was written once at dispatch and never again, so every Advance day left the one
+    # line naming a date saying exactly what it said before — and once the date had passed
+    # the card was indistinguishable from one that had stopped updating. Reported from the
+    # meal week ("stuck on Sun, Aug 2" while the world was on Aug 5); the home-away card
+    # looked fine beside it only because its deadline was still ahead.
+    from datetime import date as _d, timedelta as _t
+    start = _d.today()
+    end = start + _t(days=6)
+    dated = dict(CONTRACT, time_window={"start": start.isoformat(), "end": end.isoformat()},
+                 scope={"guests": 20})
+    board.on_goal_created(DEV, "g8", dated, None)
+    born = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g8")
+    check("20 Guests" in born.subtitle, f"the scope fact survives into the subtitle — got {born.subtitle!r}")
+
+    def tick(day_offset: int) -> str:
+        board.on_status(DEV, "g8", {"task_status": "monitoring", "payload": {
+            "sim_date": (start + _t(days=day_offset)).isoformat()}})
+        return next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g8").subtitle
+
+    mid, last, past = tick(2), tick(6), tick(8)
+    check("4 days left" in mid, f"mid-window the card counts down — got {mid!r}")
+    check("last day" in last, f"on the end date the card says so — got {last!r}")
+    check(past.startswith("Ended"), f"past the end it reads as ended, not as a stale date — got {past!r}")
+    check(mid != last != past, "three different days produce three different subtitles — the whole bug was that they did not")
+    check("20 Guests" in past, f"the scope fact survives every rebuild — got {past!r}")
+
+    # A tick with no sim_date must not blank a subtitle that was already right.
+    board.on_status(DEV, "g8", {"task_status": "monitoring", "payload": {}})
+    kept = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g8").subtitle
+    check(kept == past, f"a tick carrying no sim_date leaves the subtitle alone — got {kept!r}")
+
     # --- v7.1: a finished goal leaves the board on the next tick of the world ---
     #
     # The sweep keys on the DEVICE saying done, not on progress reading 100. Those are
