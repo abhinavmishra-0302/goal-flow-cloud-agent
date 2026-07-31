@@ -59,10 +59,6 @@ class BoardService:
         #: goal_id -> the dispatched time_window {start, end} — for DAY-BASED progress
         #: (v3.2): once running, progress is how far the sim date has moved through it.
         self._windows: dict[str, dict[str, Any]] = {}
-        #: device_id -> the device's current proactive suggestions (M8). NOT goals —
-        #: a list of {id, kind, title, subtitle, detail, goal_text} the board renders
-        #: as "Upcoming & Suggested", each acceptable into a real goal.
-        self._suggestions: dict[str, list[dict[str, Any]]] = {}
 
     # --- reads ---
 
@@ -84,34 +80,32 @@ class BoardService:
     def cached_understanding(self, goal_id: str) -> dict[str, Any] | None:
         return self._understandings.get(goal_id)
 
-    # --- proactive suggestions (M8) ---
-
-    def on_suggestions(self, device_id: str, items: list[dict[str, Any]]) -> None:
-        """The device re-scanned: replace the list wholesale (idempotent, like a snapshot)."""
-        self._suggestions[device_id] = list(items)
-
-    def suggestions(self, device_id: str) -> list[dict[str, Any]]:
-        return list(self._suggestions.get(device_id, []))
-
-    def take_suggestion(self, device_id: str, suggestion_id: str) -> dict[str, Any] | None:
-        """Remove and return one suggestion — accepting or dismissing consumes it.
-
-        Returning it lets the accept path read its goal_text; a dismiss ignores the
-        return. Removing on BOTH keeps the list honest: an accepted suggestion has
-        become a goal and a dismissed one is gone, so neither should linger as a card.
-        """
-        remaining = self._suggestions.get(device_id, [])
-        taken = next((s for s in remaining if s.get("id") == suggestion_id), None)
-        if taken is not None:
-            self._suggestions[device_id] = [s for s in remaining if s.get("id") != suggestion_id]
-        return taken
-
     def forget_goal(self, device_id: str, goal_id: str) -> None:
         self._goals.get(device_id, {}).pop(goal_id, None)
         self._plans.pop(goal_id, None)
         self._statuses.pop(goal_id, None)
         self._understandings.pop(goal_id, None)
         self._windows.pop(goal_id, None)
+
+    def retire_completed(self, device_id: str) -> list[str]:
+        """Drop every FINISHED goal from this session's board; return what was dropped.
+
+        Finished means the device said so — ``task_status == "done"``, which is also the
+        only thing that pins ``progress_pct`` to 100 (see ``on_status``). Day-based
+        progress can sit at 100 for a goal whose window has run out but whose tasks are
+        still monitoring, and that goal is still work: it must not be swept.
+
+        Bumps ``board_seq`` once when it removes anything, so a board holding a stale
+        card can tell it missed something. The removal itself reaches the UI as a fresh
+        ``board_snapshot`` — ``board_update`` can only replace a card, never retract one.
+        """
+        goals = self._goals.get(device_id, {})
+        retired = [gid for gid, g in goals.items() if g.task_status == "done"]
+        for goal_id in retired:
+            self.forget_goal(device_id, goal_id)
+        if retired:
+            self._seq[device_id] = self._seq.get(device_id, 0) + 1
+        return retired
 
     # --- the fold ---
 

@@ -90,11 +90,11 @@ Change `CONTRACT.md` first when the protocol moves.
 ## Contract touchpoints (what the cloud sends/receives)
 
 Receives from UI: `user_goal`, `understanding_response`, `approval`, `control`,
-`board_get`, `goal_state_get`, `select_device`, `suggestion_action`.
+`board_get`, `goal_state_get`, `select_device`.
 Receives from device: `capabilities`, `agent_event` (stream), `plan_ready`,
 `proposal`, `status`. Sends to UI: `understanding`, `present_plan` (adds `knew`,
 relays `demo_events`), `agent_event`, `proposal`, `status`, `board_snapshot`,
-`board_update`, `day_advanced`, `suggestions`. Sends to device:
+`board_update`, `day_advanced`. Sends to device:
 `dispatch` (the generic Task Contract), `approval`, `control`. See `CONTRACT.md` for
 exact shapes — it is authoritative and current (includes `understanding`,
 `trigger_event`, `demo_events`, `event_id`, `updated_plan`/`changed_ids`).
@@ -121,6 +121,12 @@ cannot live in the chat UI — Bixby unmounts the webview the instant `chat_ui_c
 arrives, so a hold inside the iframe is a hold nobody sees. Also found in the field: the
 close followed the approval within a round-trip, and the saving screen existed only in the
 code.
+
+`verify_refusal_replay.py` (gate 27) pins the THIRD failure of that same bracket, and the
+subtlest: a refusal is the only create phase with no round-trip in it, so the `notice` was
+broadcast while Bixby was still mounting the webview it was meant for. Nobody was
+connected, and the user watched a blank panel appear and close 4.5s later. Terminal
+notices now join the create-phase replay cache; `updating_goals` deliberately does not.
 
 `verify_mirrors.py` (gate 14) now also checks the **`control.command` enumeration**, added
 after `constraints_changed` reached the device and CONTRACT.md but not the Python Literal —

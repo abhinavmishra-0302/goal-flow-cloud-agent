@@ -215,6 +215,43 @@ def main() -> int:
     check(s6.progress_pct < 100,
           f"one advanced day must not complete a goal whose deadline is days away — got {s6.progress_pct}%")
 
+    # --- v7.1: a finished goal leaves the board on the next tick of the world ---
+    #
+    # The sweep keys on the DEVICE saying done, not on progress reading 100. Those are
+    # not the same claim: day-based progress hits 100 the moment the sim date clears the
+    # goal's window, and a goal whose window ran out while its tasks are still monitoring
+    # is unfinished work with a full bar. Retiring on the bar would delete a live goal off
+    # the board, which is the one failure here nobody could undo.
+    seq_before = board.seq(DEV)
+    board.on_status(DEV, "g6", {"task_status": "done", "payload": {"executed": []}})
+    s6_done = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g6")
+    check(s6_done.progress_pct == 100, "a done goal reads 100%")
+
+    # A goal at 100% by the CALENDAR but still monitoring — the trap above, on the board.
+    board.on_goal_created(DEV, "g7", live, None)
+    board.on_plan_ready(DEV, "g7", {
+        "plan": [{"id": "s1", "day": 1, "title": "Water the plants"}],
+        "proposals": [], "safety": {"gate": "passed"}, "precheck": {"ok": True},
+    })
+    board.on_status(DEV, "g7", {"task_status": "monitoring",
+                                "payload": {"sim_date": (date.today() + timedelta(days=30)).isoformat()}})
+    s7 = next(g for g in board.snapshot(DEV)[1] if g.goal_id == "g7")
+    check(s7.progress_pct == 100, f"a goal past its window reads 100% while monitoring — got {s7.progress_pct}%")
+
+    retired = board.retire_completed(DEV)
+    ids_after = {g.goal_id for g in board.snapshot(DEV)[1]}
+    check("g6" in retired and "g7" not in retired,
+          f"advance_day retires the DONE goals and only those — retired {retired!r}")
+    check("g6" not in ids_after, "the finished goal is gone from the board")
+    check("g7" in ids_after,
+          "a goal at 100% that is still MONITORING is unfinished work and must survive the sweep")
+    check(board.cached_status("g6") is None and board.cached_plan("g6") is None,
+          "retiring a goal drops its drill-in caches too — a card with no board is unreachable state")
+    check(board.seq(DEV) > seq_before,
+          "a retirement bumps board_seq, so a board holding the stale card can tell it missed something")
+    check(board.retire_completed(DEV) == [],
+          "a second sweep with nothing finished is a no-op (and sends no snapshot)")
+
     for f in failures:
         print(f"  FAIL {f}")
     print("gate 13 (board fold): " + ("PASS" if not failures else f"FAIL: {len(failures)}"))

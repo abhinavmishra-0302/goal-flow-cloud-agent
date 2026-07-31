@@ -775,49 +775,6 @@ class GoalAccepted(_ContractModel):
     client_ref: str | None = None
 
 
-class Suggestion(_ContractModel):
-    """One proactive suggestion — a goal the device thinks is worth doing, unprompted.
-
-    DERIVED FROM LOCAL STATE by the device (expiring food, low stock), because only the
-    device sees the fridge. It is NOT a goal yet: it becomes one only if a person taps
-    accept, at which point ``goal_text`` is submitted as an ordinary ``user_goal`` and
-    runs the normal understand→plan→approve flow. So a suggestion can never act on its
-    own — the same "a person decides" line the whole system holds.
-    """
-
-    id: str
-    #: "expiring" | "restock" — the scan that produced it (drives the card's glyph).
-    kind: str
-    title: str
-    subtitle: str = ""
-    detail: str = ""
-    #: The goal text submitted verbatim as a user_goal if this is accepted.
-    goal_text: str
-
-
-class Suggestions(_ContractModel):
-    """The device's current suggestion list.
-
-    Goal-LESS: this is the one frame the device sends that isn't about a goal already
-    in flight — a proactive scan, not a reaction. The cloud relays the list to the
-    boards (on change and on bind); the chat UI never sees it.
-    """
-
-    type: Literal["suggestions"] = "suggestions"
-    items: list[Suggestion] = Field(default_factory=list)
-
-
-class SuggestionAction(_ContractModel):
-    """A board acted on a suggestion: accept it (→ a real goal) or dismiss it."""
-
-    type: Literal["suggestion_action"] = "suggestion_action"
-    suggestion_id: str
-    #: "accept" | "dismiss".
-    action: str
-    #: UI-minted id echoed back in goal_accepted when an accept mints a goal.
-    client_ref: str | None = None
-
-
 ContractMessage = Annotated[
     Union[
         Hello,
@@ -843,8 +800,6 @@ ContractMessage = Annotated[
         BoardGet,
         GoalStateGet,
         GoalAccepted,
-        Suggestions,
-        SuggestionAction,
     ],
     Field(discriminator="type"),
 ]

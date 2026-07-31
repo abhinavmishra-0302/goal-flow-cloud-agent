@@ -22,7 +22,7 @@ past.
 | Version | Added |
 |---|---|
 | v2 | the base protocol: `hello`, `user_goal`, `dispatch`, `agent_event`, `plan_ready`, `present_plan`, `approval`, `proposal`, `status`, `control` |
-| v3 | `capabilities.domains[]`, `agent_event: task_update`, `phase: "queued"`, `plan_ready.precheck`, `status.executed[].result: "deferred_precheck"`, the board frames (`board_snapshot`/`board_update`/`board_get`), `goal_state_get`, `goal_accepted` + `user_goal.client_ref`, `suggestions`/`suggestion_action` |
+| v3 | `capabilities.domains[]`, `agent_event: task_update`, `phase: "queued"`, `plan_ready.precheck`, `status.executed[].result: "deferred_precheck"`, the board frames (`board_snapshot`/`board_update`/`board_get`), `goal_state_get`, `goal_accepted` + `user_goal.client_ref` |
 | v3.2 | a **goal-less** `control` = one world tick fanning out over every goal, plus `day_advanced` |
 | v4.1 | `hello.surface`, the input-surface delivery fork, `chat_ui_open`/`chat_ui_close`, create-phase replay on bind |
 | v5.1 | `agent_event: harness`, `plan_progress.total` |
@@ -266,10 +266,12 @@ These two frames are that bracket. The device never sees either.
 
 **`chat_ui_open`** is emitted the moment the cloud knows the goal WILL have a create
 phase: in `handle_user_goal`, after interpretation returns and the actionability gate
-passes — i.e. on every path that did NOT take the error / `notice out_of_scope` early
-exit — and strictly BEFORE the `understanding` frame for the same goal. (An accepted
-suggestion funnels through `user_goal`, so it brackets identically.) An out-of-scope
-goal emits `notice` and NO `chat_ui_open`: Bixby speaks the notice, no webview opens.
+passes — and strictly BEFORE the `understanding` frame for the same goal.
+
+An out-of-scope goal ALSO brackets (v7): `chat_ui_open`, then the `notice`, then a
+cloud-side `chat_ui_close` ~4.5s later. A refusal is an answer, and it is shown where
+every other answer is shown. Because Bixby is still MOUNTING the webview when the notice
+is broadcast, the notice is also cached for replay — see *Create-phase replay cache*.
 
 It has a DUAL role, one per surface:
 
@@ -653,30 +655,6 @@ submission** — it would have to adopt whichever arrives first, and mis-key the
 `client_ref` is UI-minted and echoed straight back, so an optimistic card re-keys to the
 real `goal_id`. Optional: a v2 client that omits it still works.
 
-### Proactive suggestions (v3-M8) — `suggestions` (device → cloud → ui), `suggestion_action` (ui → cloud)
-
-```json
-{ "type": "suggestions", "items": [
-    { "id": "sug-expiring", "kind": "expiring", "title": "Expiring Soon",
-      "subtitle": "5 items in 3 days", "detail": "spinach, yogurt, milk, ...",
-      "goal_text": "Plan meals that use up the food expiring this week" } ] }
-
-{ "type": "suggestion_action", "suggestion_id": "sug-expiring", "action": "accept", "client_ref": "s-3" }
-```
-
-The **`suggestions` frame is the one thing the device sends that isn't about a goal
-already in flight** — a proactive scan of local state (expiring food, low stock), not a
-reaction to a dispatch. Only the device can see the fridge, so only the device can raise
-one. The cloud holds the current list and relays it to the boards on change and on bind;
-the **chat UI never sees it** (suggestions are a board surface).
-
-A suggestion is **not a goal**. `suggestion_action{accept}` submits the suggestion's
-`goal_text` as an ordinary `user_goal` (echoing `client_ref` in the resulting
-`goal_accepted`, so the board can re-key exactly like a typed goal) — it then runs the
-normal understand → plan → approve flow. So a suggestion can never act on its own; a
-person accepting it is what turns "you could do this" into a goal. `action: "dismiss"`
-drops it from the list.
-
 **v3.1 — the board is no longer read-mostly.** Once a goal's initial plan is approved
 on the chat UI, the board becomes the goal's primary surface: it renders the raw device
 stream on a per-goal detail page (`present_plan`, `agent_event`, `status`, `proposal`)
@@ -696,7 +674,7 @@ One fork, in ONE place. Every cloud→ui frame for a session goes through a sing
 fan-out point (`ConnectionRegistry.send_to_uis`); v4.1 adds a per-surface **interest
 predicate** consulted there, in the send loop, per target socket — no per-call-site
 routing table, no new send paths. The same predicate gates the bind-time pushes
-(`capabilities` replay, `board_snapshot`, `suggestions`) in `_bind_ui`.
+(`capabilities` replay, `board_snapshot`) in `_bind_ui`.
 
 | surface (from `hello`) | receives via session fan-out |
 |---|---|
@@ -715,25 +693,32 @@ a server-side per-type table would reintroduce the "forked to nobody = silently
 dropped" failure mode this contract warns about at the top.
 
 **Create-phase replay cache.** The cloud keeps, per session, the CURRENT create-phase
-goal's state: `{ goal_id, understanding?, present_plan? }` — the exact frames it
-broadcast (the `present_plan` including `payload.knew`), captured as they are sent.
+goal's state: `{ goal_id, understanding?, present_plan?, notice? }` — the exact frames
+it broadcast (the `present_plan` including `payload.knew`), captured as they are sent.
 Lifecycle:
 
 - **created** when `chat_ui_open` is emitted (the goal becomes the session's
   create-phase goal); `understanding` is captured at emission; `present_plan` at
-  `plan_ready` handling — for the create-phase goal only;
+  `plan_ready` handling; a TERMINAL `notice` (`out_of_scope` / `declined`, never the
+  mid-save `updating_goals`) at emission — for the create-phase goal only;
 - **cleared** when `chat_ui_close` is emitted (any of its three triggers);
 - **replaced** wholesale by a superseding `chat_ui_open` for a new goal.
 
 On bind of a socket whose surface is `"chat"` (and only `"chat"` — a legacy
 absent-surface client keeps its exact v3 behaviour), after the existing bind-time
-pushes the cloud REPLAYS: `chat_ui_open { goal_id }`, then the cached `understanding`
-(if the plan hasn't arrived yet), then the cached `present_plan` (if it has). This
+pushes the cloud REPLAYS: `chat_ui_open { goal_id }`, then the cached `notice` if there
+is one (alone — it is terminal, and the chat UI clears the stage on it), else the cached
+`understanding` (if the plan hasn't arrived yet) or the cached `present_plan` (if it
+has). This
 mirrors how the board rehydrates via `board_snapshot` on bind, and it closes the race
 between the webview connecting and `understanding` being computed: connect early and
 the frames arrive by broadcast (the `chat_ui_open`-before-`understanding` ordering
 guarantees the reset lands first); connect late and the replay delivers the same
-sequence. Either way the webview paints the current goal — and ONLY the current goal,
+sequence. The `notice` half exists for the same race in its sharpest form: a REFUSAL has
+no round-trip in it at all — the cloud opens the bracket and broadcasts the notice in the
+same breath, while Bixby is still mounting the iframe off that open, so the frame reached
+a socket that had not connected. Uncached, the user watched a blank webview appear and
+close 4.5s later. Either way the webview paints the current goal — and ONLY the current goal,
 because the `chat_ui_open` reset discarded everything else. No cache (create phase
 over or never started) ⇒ no replay ⇒ the webview shows its idle state, and Bixby has
 already closed it anyway.

@@ -42,19 +42,12 @@ DEVICE_EXEMPT = {
     # the chat webview on open, closes it on close) is entirely upstream of the device;
     # it neither sends nor receives either frame.
     "chat_ui_open", "chat_ui_close",
-    # The device SENDS `suggestions` (so it is NOT exempt from that), but a
-    # `suggestion_action` is handled entirely cloud-side — an accept becomes a
-    # user_goal the device sees as an ordinary dispatch. The device never sees the
-    # action frame itself.
-    "suggestion_action",
 }
 
 #: Frames NO ui ever handles inbound (ui→cloud only, or device↔cloud only).
 UI_INBOUND_EXEMPT = {
     "hello", "user_goal", "understanding_response", "approval", "control",
     "select_device", "board_get", "goal_state_get", "dispatch", "plan_ready",
-    # ui→cloud only: the board sends it, no ui receives it.
-    "suggestion_action",
 }
 
 #: The two UIs are NOT the same shape, and the gate must not pretend they are.
@@ -75,13 +68,10 @@ UIS = [
         "name": "chat-ui",
         "contract": SIBLINGS / "goal-flow-agent-chat-ui/src/types/contract.ts",
         "ws": SIBLINGS / "goal-flow-agent-chat-ui/src/lib/ws.ts",
-        # Suggestions are a BOARD surface — the chat UI neither renders nor receives
-        # them (the cloud sends `suggestions` only to boards). So the chat mirror is
-        # exempt from both suggestion frames, and this exemption IS that decision.
-        # `day_advanced` (v3.2 world tick) is likewise a board-only surface — the chat
-        # never renders it, so the chat mirror is exempt from it too.
-        "types_exempt": {"suggestions", "suggestion_action", "day_advanced"},
-        "inbound_exempt": UI_INBOUND_EXEMPT | {"suggestions", "day_advanced"},
+        # `day_advanced` (v3.2 world tick) is a board-only surface — the chat never
+        # renders it, so the chat mirror is exempt from it.
+        "types_exempt": {"day_advanced"},
+        "inbound_exempt": UI_INBOUND_EXEMPT | {"day_advanced"},
     },
     {
         "name": "board-ui",

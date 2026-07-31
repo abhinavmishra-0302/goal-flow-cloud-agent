@@ -56,8 +56,6 @@ from goalflow_cloud.models.contract import (
     Role,
     SelectDevice,
     Status,
-    Suggestions,
-    SuggestionAction,
     Understanding,
     UnderstandingPayload,
     UnderstandingResponse,
@@ -189,13 +187,13 @@ class Session:
     uis: list[WebSocket] = field(default_factory=list)
     capabilities: Capabilities | None = None
     #: v4.1 create-phase replay cache — the CURRENT create-phase goal's state,
-    #: ``{"goal_id": str, "understanding": dict|None, "present_plan": dict|None}``
-    #: (the exact frames as broadcast, present_plan INCLUDING payload.knew). Created
-    #: at ``chat_ui_open``; understanding/present_plan captured as they are sent;
-    #: cleared at ``chat_ui_close``; replaced wholesale by a superseding open. Keyed
-    #: by SESSION (not goal) — it answers "which goal is the webview about, right
-    #: now" — so it is a tiny structure separate from the board's per-goal cache.
-    #: Replayed to a freshly-bound ``chat`` socket in ``_bind_ui``.
+    #: ``{"goal_id": str, "understanding": dict|None, "present_plan": dict|None,
+    #: "notice": dict|None}`` (the exact frames as broadcast, present_plan INCLUDING
+    #: payload.knew). Created at ``chat_ui_open``; understanding/present_plan/notice
+    #: captured as they are sent; cleared at ``chat_ui_close``; replaced wholesale by a
+    #: superseding open. Keyed by SESSION (not goal) — it answers "which goal is the
+    #: webview about, right now" — so it is a tiny structure separate from the board's
+    #: per-goal cache. Replayed to a freshly-bound ``chat`` socket in ``_bind_ui``.
     create_phase: dict[str, Any] | None = None
 
 
@@ -315,7 +313,7 @@ class ConnectionRegistry:
         # still bind via the picker.
         await self.send_devices(websocket)
         # The bind-time pushes are gated by the SAME interest predicate as the fan-out:
-        # an input surface gets none of the capabilities/board/suggestions firehose.
+        # an input surface gets none of the capabilities/board firehose.
         if session.capabilities is not None and wants(surface, "capabilities"):
             caps = session.capabilities.model_dump(mode="json")
             log_frame("out", "ui", caps)
@@ -423,19 +421,11 @@ class ConnectionRegistry:
                 await self.unregister(websocket)
 
     async def _replay_board(self, websocket: WebSocket, device_id: str) -> None:
-        """Send this session's board snapshot + suggestions to one freshly-bound socket."""
+        """Send this session's board snapshot to one freshly-bound socket."""
         seq, goals = board.snapshot(device_id)
         try:
             if goals:
                 frame = BoardSnapshot(board_seq=seq, goals=goals).model_dump(mode="json")
-                log_frame("out", "ui", frame)
-                await websocket.send_json(frame)
-            # Suggestions can exist with zero goals (a fresh session whose device has
-            # already scanned), so this is NOT gated on `goals` — a board that binds to
-            # an idle home should still see "Expiring Soon".
-            items = board.suggestions(device_id)
-            if items:
-                frame = Suggestions(items=items).model_dump(mode="json")
                 log_frame("out", "ui", frame)
                 await websocket.send_json(frame)
         except Exception:
@@ -446,14 +436,30 @@ class ConnectionRegistry:
 
         chat_ui_open (the reset), then the cached understanding (only while no plan
         yet), then the cached present_plan. Point-to-point, like _replay_board.
+
+        A cached NOTICE wins outright and is sent alone: it is terminal, and the chat
+        UI's reducer clears the stage on it anyway, so replaying an understanding
+        underneath it would only paint a screen the next frame tears down.
+
+        WHY THE NOTICE IS HERE AT ALL: a refusal is the one create phase with no
+        round-trip in it. The cloud opens the bracket and broadcasts the notice in the
+        same breath, but Bixby is only just MOUNTING the webview off that same open —
+        its socket connects some hundreds of ms later and had missed the only frame the
+        phase will ever have. What the user saw was a blank webview appear and, four
+        and a half seconds later, close. Cached, it arrives on bind like everything else.
         """
         goal_id = create_phase.get("goal_id")
         understanding = create_phase.get("understanding")
         present_plan = create_phase.get("present_plan")
+        notice = create_phase.get("notice")
         try:
             open_frame = ChatUiOpen(goal_id=goal_id).model_dump(mode="json")
             log_frame("out", "ui", open_frame)
             await websocket.send_json(open_frame)
+            if notice is not None:
+                log_frame("out", "ui", notice)
+                await websocket.send_json(notice)
+                return
             if present_plan is None and understanding is not None:
                 log_frame("out", "ui", understanding)
                 await websocket.send_json(understanding)
@@ -471,6 +477,7 @@ class ConnectionRegistry:
             "goal_id": goal_id,
             "understanding": None,
             "present_plan": None,
+            "notice": None,
         }
 
     def create_phase_goal(self, device_id: str) -> str | None:
@@ -496,6 +503,20 @@ class ConnectionRegistry:
         cp = session.create_phase if session else None
         if cp and cp.get("goal_id") == goal_id:
             cp["present_plan"] = frame
+
+    def capture_notice(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> None:
+        """Cache a TERMINAL notice as broadcast (create-phase goal only).
+
+        Only the terminal kinds are worth caching — a mid-save ``updating_goals`` is a
+        caption on a screen that is already up, and replaying it to a socket that binds
+        afterwards would caption nothing.
+        """
+        if frame.get("kind") == "updating_goals":
+            return
+        session = self._sessions.get(device_id)
+        cp = session.create_phase if session else None
+        if cp and cp.get("goal_id") == goal_id:
+            cp["notice"] = frame
 
     def clear_create_phase(self, device_id: str, goal_id: str) -> bool:
         """Clear the cache IFF ``goal_id`` is still the create-phase goal.
@@ -659,13 +680,14 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
     elif sender_role == "ui" and frame_type == "approval":
         await handle_approval(device_id, Approval(**frame))
     elif sender_role == "ui" and frame_type == "control":
-        await registry.send_to_device(device_id, Control(**frame).model_dump(mode="json"))
-    elif sender_role == "ui" and frame_type == "suggestion_action":
-        await handle_suggestion_action(device_id, SuggestionAction(**frame))
-    elif sender_role == "device" and frame_type == "suggestions":
-        suggestions = Suggestions(**frame)
-        board.on_suggestions(device_id, [s.model_dump(mode="json") for s in suggestions.items])
-        await send_suggestions(device_id)
+        control = Control(**frame)
+        # A finished goal is not work — it is a receipt. Retire it on the NEXT tick of
+        # the world, so the user still sees the run it completed on, and the board goes
+        # back to showing only what is live. Swept BEFORE the control reaches the device
+        # so the retirement lands with the tap, not a round-trip later.
+        if control.command == "advance_day" and not control.goal_id:
+            await retire_completed_goals(device_id)
+        await registry.send_to_device(device_id, control.model_dump(mode="json"))
     elif sender_role == "device" and frame_type == "capabilities":
         await handle_capabilities(device_id, Capabilities(**frame))
     elif sender_role == "device" and frame_type == "agent_event":
@@ -751,33 +773,18 @@ async def send_board_snapshot(device_id: str) -> None:
     await registry.send_to_uis(device_id, frame)
 
 
-async def send_suggestions(device_id: str) -> None:
-    """The session's current proactive suggestions — on change and on bind (M8).
+async def retire_completed_goals(device_id: str) -> None:
+    """Advance day: a goal the device already called done leaves the board.
 
-    Sent as a whole list every time, like a board_snapshot: idempotent, so a UI that
-    reconnects or misses one just re-renders the current set. Only boards act on it;
-    the chat UI ignores the frame.
+    A SNAPSHOT, not a board_update — the update frame carries one GoalSummary and can
+    only replace a card, so there is no way to say "this one is gone" except by
+    re-stating the whole board. No-ops (and stays silent) when nothing finished.
     """
-    frame = Suggestions(items=board.suggestions(device_id)).model_dump(mode="json")
-    log_frame("out", "ui", frame)
-    await registry.send_to_uis(device_id, frame)
-
-
-async def handle_suggestion_action(device_id: str, action: SuggestionAction) -> None:
-    """A board accepted or dismissed a suggestion.
-
-    Accept turns it into an ordinary goal — the suggestion's goal_text becomes a
-    user_goal, running the full understand → plan → approve flow, so a suggestion never
-    acts on its own. Either way the suggestion is consumed and the refreshed list is
-    pushed so the card disappears.
-    """
-    taken = board.take_suggestion(device_id, action.suggestion_id)
-    if taken is not None and action.action == "accept":
-        await handle_user_goal(
-            device_id,
-            UserGoal(text=taken["goal_text"], client_ref=action.client_ref),
-        )
-    await send_suggestions(device_id)
+    retired = board.retire_completed(device_id)
+    if not retired:
+        return
+    logger.info("board_retire_completed device_id=%s goals=%s", device_id, ",".join(retired))
+    await send_board_snapshot(device_id)
 
 
 async def handle_goal_state_get(device_id: str, request: GoalStateGet) -> None:
@@ -930,15 +937,21 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
         )
         logger.info("task_status status=done gate=out_of_scope")
         await emit_chat_ui_open(device_id, goal_id)
-        await registry.send_to_uis(device_id, notice.model_dump(mode="json"))
+        notice_frame = notice.model_dump(mode="json")
+        await registry.send_to_uis(device_id, notice_frame)
+        # ...and cache it, because the webview this refusal is FOR does not exist yet —
+        # Bixby is still mounting the iframe off the open we sent one line ago. Without
+        # this, the only frame the phase ever has is broadcast to a socket that has not
+        # connected, and the user watches an empty panel for the dwell. See
+        # _replay_create_phase.
+        registry.capture_notice(device_id, goal_id, notice_frame)
         asyncio.create_task(_close_after(device_id, goal_id, OUT_OF_SCOPE_DWELL_S))
         return
 
     # The goal WILL have a create phase (it cleared the error + out-of-scope early
     # exits). Open the bracket NOW, strictly before the understanding broadcast and
     # before the direct-dispatch fallback — the input surface opens/retargets its
-    # webview, a chat webview hard-resets to this goal. (An accepted suggestion
-    # funnels through here too, so it brackets identically.)
+    # webview, a chat webview hard-resets to this goal.
     await emit_chat_ui_open(device_id, goal_id)
 
     interrupt_payload = state.get("_interrupt")
