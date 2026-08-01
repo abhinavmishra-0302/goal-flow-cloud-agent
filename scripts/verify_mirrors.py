@@ -42,19 +42,12 @@ DEVICE_EXEMPT = {
     # the chat webview on open, closes it on close) is entirely upstream of the device;
     # it neither sends nor receives either frame.
     "chat_ui_open", "chat_ui_close",
-    # The device SENDS `suggestions` (so it is NOT exempt from that), but a
-    # `suggestion_action` is handled entirely cloud-side — an accept becomes a
-    # user_goal the device sees as an ordinary dispatch. The device never sees the
-    # action frame itself.
-    "suggestion_action",
 }
 
 #: Frames NO ui ever handles inbound (ui→cloud only, or device↔cloud only).
 UI_INBOUND_EXEMPT = {
     "hello", "user_goal", "understanding_response", "approval", "control",
     "select_device", "board_get", "goal_state_get", "dispatch", "plan_ready",
-    # ui→cloud only: the board sends it, no ui receives it.
-    "suggestion_action",
 }
 
 #: The two UIs are NOT the same shape, and the gate must not pretend they are.
@@ -75,13 +68,10 @@ UIS = [
         "name": "chat-ui",
         "contract": SIBLINGS / "goal-flow-agent-chat-ui/src/types/contract.ts",
         "ws": SIBLINGS / "goal-flow-agent-chat-ui/src/lib/ws.ts",
-        # Suggestions are a BOARD surface — the chat UI neither renders nor receives
-        # them (the cloud sends `suggestions` only to boards). So the chat mirror is
-        # exempt from both suggestion frames, and this exemption IS that decision.
-        # `day_advanced` (v3.2 world tick) is likewise a board-only surface — the chat
-        # never renders it, so the chat mirror is exempt from it too.
-        "types_exempt": {"suggestions", "suggestion_action", "day_advanced"},
-        "inbound_exempt": UI_INBOUND_EXEMPT | {"suggestions", "day_advanced"},
+        # `day_advanced` (v3.2 world tick) is a board-only surface — the chat never
+        # renders it, so the chat mirror is exempt from it.
+        "types_exempt": {"day_advanced"},
+        "inbound_exempt": UI_INBOUND_EXEMPT | {"day_advanced"},
     },
     {
         "name": "board-ui",
@@ -110,6 +100,25 @@ def contract_event_kinds() -> set[str]:
     """agent_event kinds, from the canonical `"event": a | b | c` line."""
     text = CONTRACT.read_text()
     m = re.search(r'"event"\s*:\s*((?:"[a-z_]+"\s*\|?\s*)+)', text)
+    return set(re.findall(r'"([a-z_]+)"', m.group(1))) if m else set()
+
+
+def contract_control_commands() -> set[str]:
+    """The documented `control.command` enumeration, from the canonical table.
+
+    Added in v7 after this exact drift shipped: `constraints_changed` reached the device,
+    CONTRACT.md and the device's ControlCommands, but not the Python model's Literal — and
+    a Literal is a HARD GATE. The frame failed validation on the SENDER's side, which
+    means the cloud logged a pydantic error to itself and the demo's headline moment
+    simply did not happen. Nothing downstream could have noticed, because nothing
+    downstream ever saw a frame.
+    """
+    text = CONTRACT.read_text()
+    # The canonical line is an ALTERNATION — `"command": "a" | "b" | "c"` — so match the
+    # whole run, the way contract_event_kinds does. A regex that stopped at the first
+    # quoted value would have "checked" this enum while only ever seeing advance_day,
+    # which is exactly what the first version of this function did.
+    m = re.search(r'"command"\s*:\s*((?:"[a-z_]+"\s*\|?\s*)+)', text)
     return set(re.findall(r'"([a-z_]+)"', m.group(1))) if m else set()
 
 
@@ -174,6 +183,11 @@ def main() -> int:
     for k in sorted(kinds):
         if f'"{k}"' not in py:
             failures.append(f"python AgentEventKind is missing {k!r} — frames WILL be dropped at validation")
+    for c in sorted(contract_control_commands()):
+        if f'"{c}"' not in py:
+            failures.append(
+                f"python Control.command Literal is missing {c!r} — the cloud cannot SEND this frame"
+            )
 
     # --- C# (device) ---
     cs = "\n".join(p.read_text() for p in CS_MIRRORS)
@@ -183,6 +197,9 @@ def main() -> int:
     for k in sorted(kinds):
         if f'"{k}"' not in cs:
             failures.append(f"C# is missing agent_event kind {k!r}")
+    for c in sorted(contract_control_commands()):
+        if f'"{c}"' not in cs:
+            failures.append(f"C# ControlCommands is missing {c!r} — the device cannot ACT on this frame")
 
     # --- TypeScript + each UI's silent dropper ---
     for ui in UIS:

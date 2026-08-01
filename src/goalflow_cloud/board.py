@@ -59,10 +59,9 @@ class BoardService:
         #: goal_id -> the dispatched time_window {start, end} — for DAY-BASED progress
         #: (v3.2): once running, progress is how far the sim date has moved through it.
         self._windows: dict[str, dict[str, Any]] = {}
-        #: device_id -> the device's current proactive suggestions (M8). NOT goals —
-        #: a list of {id, kind, title, subtitle, detail, goal_text} the board renders
-        #: as "Upcoming & Suggested", each acceptable into a real goal.
-        self._suggestions: dict[str, list[dict[str, Any]]] = {}
+        #: goal_id -> the subtitle's scope half ("20 Guests"), kept because the date half
+        #: is now rebuilt on every tick and the contract is long gone by then.
+        self._scope_notes: dict[str, str] = {}
 
     # --- reads ---
 
@@ -84,34 +83,33 @@ class BoardService:
     def cached_understanding(self, goal_id: str) -> dict[str, Any] | None:
         return self._understandings.get(goal_id)
 
-    # --- proactive suggestions (M8) ---
-
-    def on_suggestions(self, device_id: str, items: list[dict[str, Any]]) -> None:
-        """The device re-scanned: replace the list wholesale (idempotent, like a snapshot)."""
-        self._suggestions[device_id] = list(items)
-
-    def suggestions(self, device_id: str) -> list[dict[str, Any]]:
-        return list(self._suggestions.get(device_id, []))
-
-    def take_suggestion(self, device_id: str, suggestion_id: str) -> dict[str, Any] | None:
-        """Remove and return one suggestion — accepting or dismissing consumes it.
-
-        Returning it lets the accept path read its goal_text; a dismiss ignores the
-        return. Removing on BOTH keeps the list honest: an accepted suggestion has
-        become a goal and a dismissed one is gone, so neither should linger as a card.
-        """
-        remaining = self._suggestions.get(device_id, [])
-        taken = next((s for s in remaining if s.get("id") == suggestion_id), None)
-        if taken is not None:
-            self._suggestions[device_id] = [s for s in remaining if s.get("id") != suggestion_id]
-        return taken
-
     def forget_goal(self, device_id: str, goal_id: str) -> None:
         self._goals.get(device_id, {}).pop(goal_id, None)
         self._plans.pop(goal_id, None)
         self._statuses.pop(goal_id, None)
         self._understandings.pop(goal_id, None)
         self._windows.pop(goal_id, None)
+        self._scope_notes.pop(goal_id, None)
+
+    def retire_completed(self, device_id: str) -> list[str]:
+        """Drop every FINISHED goal from this session's board; return what was dropped.
+
+        Finished means the device said so — ``task_status == "done"``, which is also the
+        only thing that pins ``progress_pct`` to 100 (see ``on_status``). Day-based
+        progress can sit at 100 for a goal whose window has run out but whose tasks are
+        still monitoring, and that goal is still work: it must not be swept.
+
+        Bumps ``board_seq`` once when it removes anything, so a board holding a stale
+        card can tell it missed something. The removal itself reaches the UI as a fresh
+        ``board_snapshot`` — ``board_update`` can only replace a card, never retract one.
+        """
+        goals = self._goals.get(device_id, {})
+        retired = [gid for gid, g in goals.items() if g.task_status == "done"]
+        for goal_id in retired:
+            self.forget_goal(device_id, goal_id)
+        if retired:
+            self._seq[device_id] = self._seq.get(device_id, 0) + 1
+        return retired
 
     # --- the fold ---
 
@@ -160,6 +158,7 @@ class BoardService:
         existing = self._get(device_id, goal_id)
         window = contract.get("time_window") or {}
         self._windows[goal_id] = window
+        self._scope_notes[goal_id] = _scope_note(contract)
         summary = GoalSummary(
             goal_id=goal_id,
             # The post-confirmation dispatch path has no client_ref to hand us; keep
@@ -364,14 +363,49 @@ class BoardService:
         # back to the task-DAG progress when there's no usable window/sim_date.
         day_prog = self._day_progress(self._windows.get(goal_id) or {}, payload.get("sim_date"))
         progress = 100 if done else (day_prog if day_prog is not None else summary.progress_pct)
+
+        # ...and the SUBTITLE moves with the same clock. It was written once at dispatch
+        # and never again, so on a board built around a day the user advances, the one
+        # line naming a date sat frozen — most visibly once the date had passed, which is
+        # where this was reported: a meal week still saying "Sun, Aug 2" on Aug 5, looking
+        # for all the world like a card that had stopped receiving updates. Rebuilt from
+        # the SAME window and sim_date that already move the progress bar, so the two can
+        # never disagree.
+        sim_date = payload.get("sim_date")
+        subtitle = summary.subtitle
+        if sim_date:
+            parts = [part for part in (
+                _date_note(self._windows.get(goal_id) or {}, sim_date),
+                self._scope_notes.get(goal_id, ""),
+            ) if part]
+            if parts:
+                subtitle = " • ".join(parts)
+
+        # v7 — THE PLAN CHANGED WITHOUT BEING ASKED. Another goal the user already
+        # approved moved the household under this one. It is NOT an alert: an alert means
+        # "you still have to decide", and there is nothing left to decide. It is a line
+        # saying it is already done. Sticky until the user dismisses it, so it survives
+        # the day ticks between the change and their next look at the board.
+        changed_note = payload.get("plan_changed_note") or summary.plan_changed_note
+
+        # The cached plan must move with it, or opening the goal after a restart (or from
+        # a second tab) shows the plan the device replaced.
+        if payload.get("updated_plan") and goal_id in self._plans:
+            self._plans[goal_id] = {
+                **self._plans[goal_id],
+                "plan": payload["updated_plan"],
+            }
+
         return self._put(device_id, summary.model_copy(update={
             "task_status": task_status,
             "state": state,
+            "subtitle": subtitle,
             "progress_pct": progress,
             "pending_tasks": 0 if done else summary.pending_tasks,
             "next_step": None if done else summary.next_step,
             "alerts": alerts,
             "activity": _push(summary.activity, payload.get("note")),
+            "plan_changed_note": None if done else changed_note,
             "updated_at": _now(),
         }))
 
@@ -476,23 +510,60 @@ def _title(text: str) -> str:
     return text if len(text) <= 42 else text[:41].rstrip() + "…"
 
 
-def _subtitle(contract: dict[str, Any]) -> str:
-    """"Sun, Jun 22 • 20 Guests" — the date it's aiming at, plus a notable scope fact.
+def _scope_note(contract: dict[str, Any]) -> str:
+    """A notable scope fact ("20 Guests"), read rather than known.
 
-    Assembled from the contract rather than hardcoded per domain: scope is
-    domain-flexible by design, so the board reads whatever numeric fact is there
-    instead of knowing what a guest is.
+    Scope is domain-flexible by design, so the board takes whatever numeric fact is
+    there instead of learning what a guest is.
     """
-    parts: list[str] = []
-    end = (contract.get("time_window") or {}).get("end")
-    if end:
-        try:
-            parts.append(datetime.fromisoformat(end).strftime("%a, %b %-d"))
-        except ValueError:
-            parts.append(end)
     scope = contract.get("scope") or {}
     for key, value in scope.items():
         if isinstance(value, int) and value > 1:
-            parts.append(f"{value} {key.replace('_', ' ').title()}")
-            break
+            return f"{value} {key.replace('_', ' ').title()}"
+    return ""
+
+
+def _date_note(window: dict[str, Any], sim_date: str | None) -> str:
+    """The goal's deadline, said RELATIVE TO THE WORLD'S TODAY.
+
+    WHY NOT JUST THE DATE. The subtitle used to be the bare end date, written once at
+    dispatch and never touched again. That is a defensible thing to show — a deadline
+    does not move — but on a board whose whole point is a clock the user advances, it
+    reads as broken: press Advance day three times and every card says exactly what it
+    said before. The failure is loudest once the date has PASSED, which is where it was
+    reported from — a meal week showing "Sun, Aug 2" on Aug 5, indistinguishable from a
+    card that had stopped receiving updates. The home-away card looked fine next to it
+    for no better reason than that its deadline was still in the future.
+
+    So the date stays (it is the fact) and gains its relation to now (that is what
+    moves). Falls back to the bare label when there is no sim date to relate it to.
+    """
+    end = window.get("end")
+    if not end:
+        return ""
+    try:
+        end_day = date.fromisoformat(str(end)[:10])
+    except ValueError:
+        return str(end)
+    label = end_day.strftime("%a, %b %-d")
+    if not sim_date:
+        return label
+    try:
+        today = date.fromisoformat(str(sim_date)[:10])
+    except ValueError:
+        return label
+    days = (end_day - today).days
+    if days > 1:
+        return f"{label} · {days} days left"
+    if days == 1:
+        return f"{label} · 1 day left"
+    if days == 0:
+        return f"{label} · last day"
+    return f"Ended {label}"
+
+
+def _subtitle(contract: dict[str, Any], sim_date: str | None = None) -> str:
+    """"Sun, Jun 22 · 4 days left • 20 Guests" — where this goal is in time, plus scope."""
+    parts = [part for part in (_date_note(contract.get("time_window") or {}, sim_date),
+                               _scope_note(contract)) if part]
     return " • ".join(parts)

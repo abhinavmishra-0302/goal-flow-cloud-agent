@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import date, timedelta
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,6 +31,7 @@ from pydantic import ValidationError
 from goalflow_cloud.board import BoardService
 from goalflow_cloud.config import get_settings
 from goalflow_cloud.graph import nodes as graph_nodes
+from goalflow_cloud.memory.store import append_constraints, load_family_profile, resolve_constraints
 from goalflow_cloud.models.contract import (
     AgentEvent,
     Approval,
@@ -42,6 +44,7 @@ from goalflow_cloud.models.contract import (
     GoalStateGet,
     Capabilities,
     Control,
+    ControlPayload,
     DayAdvanced,
     Devices,
     Hello,
@@ -53,8 +56,6 @@ from goalflow_cloud.models.contract import (
     Role,
     SelectDevice,
     Status,
-    Suggestions,
-    SuggestionAction,
     Understanding,
     UnderstandingPayload,
     UnderstandingResponse,
@@ -186,13 +187,13 @@ class Session:
     uis: list[WebSocket] = field(default_factory=list)
     capabilities: Capabilities | None = None
     #: v4.1 create-phase replay cache — the CURRENT create-phase goal's state,
-    #: ``{"goal_id": str, "understanding": dict|None, "present_plan": dict|None}``
-    #: (the exact frames as broadcast, present_plan INCLUDING payload.knew). Created
-    #: at ``chat_ui_open``; understanding/present_plan captured as they are sent;
-    #: cleared at ``chat_ui_close``; replaced wholesale by a superseding open. Keyed
-    #: by SESSION (not goal) — it answers "which goal is the webview about, right
-    #: now" — so it is a tiny structure separate from the board's per-goal cache.
-    #: Replayed to a freshly-bound ``chat`` socket in ``_bind_ui``.
+    #: ``{"goal_id": str, "understanding": dict|None, "present_plan": dict|None,
+    #: "notice": dict|None}`` (the exact frames as broadcast, present_plan INCLUDING
+    #: payload.knew). Created at ``chat_ui_open``; understanding/present_plan/notice
+    #: captured as they are sent; cleared at ``chat_ui_close``; replaced wholesale by a
+    #: superseding open. Keyed by SESSION (not goal) — it answers "which goal is the
+    #: webview about, right now" — so it is a tiny structure separate from the board's
+    #: per-goal cache. Replayed to a freshly-bound ``chat`` socket in ``_bind_ui``.
     create_phase: dict[str, Any] | None = None
 
 
@@ -312,7 +313,7 @@ class ConnectionRegistry:
         # still bind via the picker.
         await self.send_devices(websocket)
         # The bind-time pushes are gated by the SAME interest predicate as the fan-out:
-        # an input surface gets none of the capabilities/board/suggestions firehose.
+        # an input surface gets none of the capabilities/board firehose.
         if session.capabilities is not None and wants(surface, "capabilities"):
             caps = session.capabilities.model_dump(mode="json")
             log_frame("out", "ui", caps)
@@ -420,19 +421,11 @@ class ConnectionRegistry:
                 await self.unregister(websocket)
 
     async def _replay_board(self, websocket: WebSocket, device_id: str) -> None:
-        """Send this session's board snapshot + suggestions to one freshly-bound socket."""
+        """Send this session's board snapshot to one freshly-bound socket."""
         seq, goals = board.snapshot(device_id)
         try:
             if goals:
                 frame = BoardSnapshot(board_seq=seq, goals=goals).model_dump(mode="json")
-                log_frame("out", "ui", frame)
-                await websocket.send_json(frame)
-            # Suggestions can exist with zero goals (a fresh session whose device has
-            # already scanned), so this is NOT gated on `goals` — a board that binds to
-            # an idle home should still see "Expiring Soon".
-            items = board.suggestions(device_id)
-            if items:
-                frame = Suggestions(items=items).model_dump(mode="json")
                 log_frame("out", "ui", frame)
                 await websocket.send_json(frame)
         except Exception:
@@ -443,14 +436,35 @@ class ConnectionRegistry:
 
         chat_ui_open (the reset), then the cached understanding (only while no plan
         yet), then the cached present_plan. Point-to-point, like _replay_board.
+
+        A cached NOTICE wins outright and is sent alone: it is terminal, and the chat
+        UI's reducer clears the stage on it anyway, so replaying an understanding
+        underneath it would only paint a screen the next frame tears down.
+
+        WHY THE NOTICE IS HERE AT ALL: a refusal is the one create phase with no
+        round-trip in it. The cloud opens the bracket and broadcasts the notice in the
+        same breath, but Bixby is only just MOUNTING the webview off that same open —
+        its socket connects some hundreds of ms later and had missed the only frame the
+        phase will ever have. What the user saw was a blank webview appear and, four
+        and a half seconds later, close. Cached, it arrives on bind like everything else.
         """
         goal_id = create_phase.get("goal_id")
         understanding = create_phase.get("understanding")
         present_plan = create_phase.get("present_plan")
+        notice = create_phase.get("notice")
         try:
-            open_frame = ChatUiOpen(goal_id=goal_id).model_dump(mode="json")
+            # The text rides the replayed open too: a webview that binds DURING
+            # interpretation is exactly the case this whole change exists for, and it
+            # would otherwise rehydrate into the same blank panel.
+            open_frame = ChatUiOpen(
+                goal_id=goal_id, goal_text=create_phase.get("goal_text") or ""
+            ).model_dump(mode="json")
             log_frame("out", "ui", open_frame)
             await websocket.send_json(open_frame)
+            if notice is not None:
+                log_frame("out", "ui", notice)
+                await websocket.send_json(notice)
+                return
             if present_plan is None and understanding is not None:
                 log_frame("out", "ui", understanding)
                 await websocket.send_json(understanding)
@@ -461,13 +475,15 @@ class ConnectionRegistry:
             logger.debug("create_phase_replay_failed", exc_info=True)
 
     # --- create-phase replay cache (v4.1) ---
-    def open_create_phase(self, device_id: str, goal_id: str) -> None:
+    def open_create_phase(self, device_id: str, goal_id: str, goal_text: str = "") -> None:
         """A goal became the session's create-phase goal — create (or REPLACE
         wholesale, if a previous phase is still open) the replay cache."""
         self._session(device_id).create_phase = {
             "goal_id": goal_id,
+            "goal_text": goal_text,
             "understanding": None,
             "present_plan": None,
+            "notice": None,
         }
 
     def create_phase_goal(self, device_id: str) -> str | None:
@@ -487,12 +503,47 @@ class ConnectionRegistry:
         if cp and cp.get("goal_id") == goal_id:
             cp["understanding"] = frame
 
+    def resolve_understanding(self, device_id: str, goal_id: str) -> None:
+        """The gate has been ANSWERED — stop replaying it.
+
+        WHY THIS EXISTS. The cache held the understanding from the moment it was sent
+        until a plan replaced it, and a confirmed gate did not count as replacing it. So
+        for the whole of planning — 60-180s, the longest stretch of the run — any chat
+        socket that reconnected was replayed the confirmation card the user had already
+        answered, and the webview jumped back to a gate that was settled. Reported from a
+        Tizen Hub, where the webview and the network drop far more readily than on a dev
+        box and planning takes longer; the same code did it everywhere, the dev box just
+        never gave it the reconnect it needed.
+
+        Clearing it (rather than marking it) is deliberate: a reconnect during planning
+        should rejoin the WORK, and ``chat_ui_open`` alone puts the surface exactly there,
+        with the live agent_event stream filling the engines back in within a beat.
+        """
+        session = self._sessions.get(device_id)
+        cp = session.create_phase if session else None
+        if cp and cp.get("goal_id") == goal_id:
+            cp["understanding"] = None
+
     def capture_present_plan(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> None:
         """Cache the present_plan frame as broadcast (create-phase goal only)."""
         session = self._sessions.get(device_id)
         cp = session.create_phase if session else None
         if cp and cp.get("goal_id") == goal_id:
             cp["present_plan"] = frame
+
+    def capture_notice(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> None:
+        """Cache a TERMINAL notice as broadcast (create-phase goal only).
+
+        Only the terminal kinds are worth caching — a mid-save ``updating_goals`` is a
+        caption on a screen that is already up, and replaying it to a socket that binds
+        afterwards would caption nothing.
+        """
+        if frame.get("kind") == "updating_goals":
+            return
+        session = self._sessions.get(device_id)
+        cp = session.create_phase if session else None
+        if cp and cp.get("goal_id") == goal_id:
+            cp["notice"] = frame
 
     def clear_create_phase(self, device_id: str, goal_id: str) -> bool:
         """Clear the cache IFF ``goal_id`` is still the create-phase goal.
@@ -656,13 +707,14 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
     elif sender_role == "ui" and frame_type == "approval":
         await handle_approval(device_id, Approval(**frame))
     elif sender_role == "ui" and frame_type == "control":
-        await registry.send_to_device(device_id, Control(**frame).model_dump(mode="json"))
-    elif sender_role == "ui" and frame_type == "suggestion_action":
-        await handle_suggestion_action(device_id, SuggestionAction(**frame))
-    elif sender_role == "device" and frame_type == "suggestions":
-        suggestions = Suggestions(**frame)
-        board.on_suggestions(device_id, [s.model_dump(mode="json") for s in suggestions.items])
-        await send_suggestions(device_id)
+        control = Control(**frame)
+        # A finished goal is not work — it is a receipt. Retire it on the NEXT tick of
+        # the world, so the user still sees the run it completed on, and the board goes
+        # back to showing only what is live. Swept BEFORE the control reaches the device
+        # so the retirement lands with the tap, not a round-trip later.
+        if control.command == "advance_day" and not control.goal_id:
+            await retire_completed_goals(device_id)
+        await registry.send_to_device(device_id, control.model_dump(mode="json"))
     elif sender_role == "device" and frame_type == "capabilities":
         await handle_capabilities(device_id, Capabilities(**frame))
     elif sender_role == "device" and frame_type == "agent_event":
@@ -678,6 +730,19 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
         status = Status(**frame)
         await registry.send_to_uis(device_id, status.model_dump(mode="json"))
         await push_board(device_id, board.on_status(device_id, status.goal_id, status.model_dump(mode="json")))
+        # v7 — the board now HAS the change the chat surface promised. Released here and
+        # not on the control's send, because "we told the device" is not the thing the
+        # user was waiting to be true.
+        #
+        # The release is "the first status this goal sends after the control was armed",
+        # not "a status carrying a plan_changed_note": a constraint change that decided
+        # nothing needed to move still answers, and keying on the note would hold the
+        # webview open for the full timeout on exactly the quiet case. The looseness costs
+        # nothing — the only other thing that makes a goal speak is a world tick, and the
+        # user is in the chat, not on the board, for the whole of this window. If one did
+        # slip in, the webview closes a little early rather than not at all.
+        if (waiter := crossgoal_waiters.get(status.goal_id)) is not None:
+            waiter.set()
         await graph_resume_monitor(status.goal_id, status.model_dump(mode="json"))
     elif sender_role == "device" and frame_type == "day_advanced":
         # v3.2 world tick summary — a board surface. The per-goal status/proposal frames
@@ -705,16 +770,20 @@ async def push_board(device_id: str, summary: Any | None) -> None:
     await registry.send_to_uis(device_id, frame)
 
 
-async def emit_chat_ui_open(device_id: str, goal_id: str) -> None:
+async def emit_chat_ui_open(device_id: str, goal_id: str, goal_text: str = "") -> None:
     """Open the create-phase bracket (v4.1): create/replace the replay cache and
     broadcast ``chat_ui_open``. A superseding open for a new goal replaces the cache
     wholesale (no intervening close — Bixby retargets rather than close/reopen).
 
     Ordering guarantee: callers invoke this BEFORE the goal's ``understanding``, so
     the reset lands first on the wire (and the bind-time replay re-sends it in order).
+
+    ``goal_text`` is what the user said, carried so the webview has something true to
+    show while the interpreter thinks (v7.4).
     """
-    registry.open_create_phase(device_id, goal_id)
-    await registry.send_to_uis(device_id, ChatUiOpen(goal_id=goal_id).model_dump(mode="json"))
+    frame = ChatUiOpen(goal_id=goal_id, goal_text=goal_text).model_dump(mode="json")
+    registry.open_create_phase(device_id, goal_id, goal_text)
+    await registry.send_to_uis(device_id, frame)
 
 
 async def emit_chat_ui_close(device_id: str, goal_id: str) -> None:
@@ -735,33 +804,18 @@ async def send_board_snapshot(device_id: str) -> None:
     await registry.send_to_uis(device_id, frame)
 
 
-async def send_suggestions(device_id: str) -> None:
-    """The session's current proactive suggestions — on change and on bind (M8).
+async def retire_completed_goals(device_id: str) -> None:
+    """Advance day: a goal the device already called done leaves the board.
 
-    Sent as a whole list every time, like a board_snapshot: idempotent, so a UI that
-    reconnects or misses one just re-renders the current set. Only boards act on it;
-    the chat UI ignores the frame.
+    A SNAPSHOT, not a board_update — the update frame carries one GoalSummary and can
+    only replace a card, so there is no way to say "this one is gone" except by
+    re-stating the whole board. No-ops (and stays silent) when nothing finished.
     """
-    frame = Suggestions(items=board.suggestions(device_id)).model_dump(mode="json")
-    log_frame("out", "ui", frame)
-    await registry.send_to_uis(device_id, frame)
-
-
-async def handle_suggestion_action(device_id: str, action: SuggestionAction) -> None:
-    """A board accepted or dismissed a suggestion.
-
-    Accept turns it into an ordinary goal — the suggestion's goal_text becomes a
-    user_goal, running the full understand → plan → approve flow, so a suggestion never
-    acts on its own. Either way the suggestion is consumed and the refreshed list is
-    pushed so the card disappears.
-    """
-    taken = board.take_suggestion(device_id, action.suggestion_id)
-    if taken is not None and action.action == "accept":
-        await handle_user_goal(
-            device_id,
-            UserGoal(text=taken["goal_text"], client_ref=action.client_ref),
-        )
-    await send_suggestions(device_id)
+    retired = board.retire_completed(device_id)
+    if not retired:
+        return
+    logger.info("board_retire_completed device_id=%s goals=%s", device_id, ",".join(retired))
+    await send_board_snapshot(device_id)
 
 
 async def handle_goal_state_get(device_id: str, request: GoalStateGet) -> None:
@@ -781,7 +835,10 @@ async def handle_goal_state_get(device_id: str, request: GoalStateGet) -> None:
             payload=UnderstandingPayload(
                 objective=understanding.get("objective", ""),
                 domain=understanding.get("domain", ""),
-                knew=understanding.get("knew") or graph_nodes._hard_knew(understanding.get("hard") or {}),
+                knew=understanding.get("knew")
+                or graph_nodes._hard_knew(understanding.get("hard_display") or understanding.get("hard") or {}),
+                constraints=understanding.get("constraints") or [],
+                preferences=understanding.get("preferences") or [],
                 thought=understanding.get("thought", ""),
                 time_window=understanding.get("time_window") or None,
             ),
@@ -877,11 +934,30 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
     # decides what we can act on was a hardcoded list of two domains instead
     # (v3-M4). Now the answer follows the hardware that is plugged in.
     capabilities = registry.capabilities_of(device_id)
+
+    # OPEN THE BRACKET NOW — before interpretation, not after it (v7.4).
+    #
+    # `start_goal` is an LLM round-trip that takes 10-60s, and until v7.4 the open was
+    # emitted AFTERWARDS. So for the whole of the slowest, least-explicable wait in the
+    # product, Bixby had not been told to show anything: the user spoke to the fridge and
+    # the fridge's screen sat there. The understanding card then appeared all at once, as
+    # if the work had been instant and the silence had been a fault.
+    #
+    # Nothing downstream needs interpretation to have finished — the open is a RESET keyed
+    # to a goal_id, and the goal_id is minted above. Opening first costs nothing and buys
+    # the entire interpretation window as visible, honest progress. The two early exits
+    # below (error, out-of-scope) now inherit an already-open bracket, which is why the
+    # error path closes it and the refusal path no longer opens one.
+    await emit_chat_ui_open(device_id, goal_id, user_goal.text)
+
     async with goal_lock(goal_id):
         state = await asyncio.to_thread(
             graph_nodes.start_goal, graph, user_goal.text, goal_id, capabilities
         )
     if state.get("error"):
+        # The bracket is open (above), so it has to be closed or the webview dangles on a
+        # goal that ended before it began.
+        await emit_chat_ui_close(device_id, goal_id)
         await registry.send_to_uis(device_id,
             {
                 "type": "status",
@@ -893,9 +969,15 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
         )
         return
 
-    # Out-of-scope: the interpreter judged the goal outside what GoalFlow acts on
-    # (only meal plans + guest dinners). The graph ended before any dispatch — send
-    # a terminal notice and stop; the device is never involved.
+    # Out-of-scope: the interpreter judged the goal outside what this device can advance.
+    # The graph ended before any dispatch — the device is never involved.
+    #
+    # v7 GIVES THE REFUSAL A SURFACE. Until now this returned before opening the create
+    # bracket, so the only place a decline appeared was the input surface speaking it: on
+    # the Hub the user asked the fridge for something and the fridge's screen showed
+    # nothing at all. A refusal is an answer, and an answer deserves to be shown where
+    # every other answer is shown. The bracket opens, the notice fills it, and the cloud
+    # closes it again a few seconds later — nobody should have to dismiss a "no".
     explanation = state.get("explanation")
     if isinstance(explanation, dict) and explanation.get("type") == "out_of_scope":
         notice = Notice(
@@ -904,15 +986,21 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
             message=explanation.get("message") or "That goal is outside what I can help with.",
         )
         logger.info("task_status status=done gate=out_of_scope")
-        await registry.send_to_uis(device_id, notice.model_dump(mode="json"))
+        # The bracket is ALREADY open (v7.4 opens it on arrival), and re-opening would
+        # broadcast a second reset that wipes the panel the user has been watching think.
+        notice_frame = notice.model_dump(mode="json")
+        await registry.send_to_uis(device_id, notice_frame)
+        # ...and cache it, because the webview this refusal is FOR does not exist yet —
+        # Bixby is still mounting the iframe off the open we sent one line ago. Without
+        # this, the only frame the phase ever has is broadcast to a socket that has not
+        # connected, and the user watches an empty panel for the dwell. See
+        # _replay_create_phase.
+        registry.capture_notice(device_id, goal_id, notice_frame)
+        asyncio.create_task(_close_after(device_id, goal_id, OUT_OF_SCOPE_DWELL_S))
         return
 
-    # The goal WILL have a create phase (it cleared the error + out-of-scope early
-    # exits). Open the bracket NOW, strictly before the understanding broadcast and
-    # before the direct-dispatch fallback — the input surface opens/retargets its
-    # webview, a chat webview hard-resets to this goal. (An accepted suggestion
-    # funnels through here too, so it brackets identically.)
-    await emit_chat_ui_open(device_id, goal_id)
+    # The bracket was opened on arrival (v7.4), so by here the webview has been up for
+    # the whole interpretation and simply receives the understanding next.
 
     interrupt_payload = state.get("_interrupt")
     if isinstance(interrupt_payload, dict) and interrupt_payload.get("kind") == "understanding_confirmation":
@@ -928,6 +1016,8 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
                 # user stated in the same breath. Both additive — a UI that ignores
                 # them renders exactly as before.
                 constraints=understanding.get("constraints") or [],
+                # v7: the soft half, rendered as its own lighter section.
+                preferences=understanding.get("preferences") or [],
                 proposed_constraints=understanding.get("proposed_constraints") or [],
                 capture_only=bool(understanding.get("capture_only")),
                 thought=understanding.get("thought", ""),
@@ -984,6 +1074,10 @@ async def handle_understanding_response(device_id: str, response: UnderstandingR
         logger.info("understanding_response_dedupe_drop goal_id=%s", response.goal_id)
         return
     resolved_understandings.add(response.goal_id)
+    # ...and the REPLAY cache has to learn it too, or a webview that reconnects during
+    # planning is handed back the gate it just answered. Done here, before the graph is
+    # resumed, because the reconnect can happen at any point from now on.
+    registry.resolve_understanding(device_id, response.goal_id)
 
     confirmed = response.payload.confirmed
     async with goal_lock(response.goal_id):
@@ -1101,11 +1195,231 @@ async def handle_approval(device_id: str, approval: Approval) -> None:
     async with goal_lock(approval.goal_id):
         await asyncio.to_thread(graph_nodes.resume_goal, graph, approval.goal_id, decisions)
     await registry.send_to_device(device_id, approval.model_dump(mode="json"))
+    # v7 — THE CROSS-GOAL MOMENT. Approving a goal can change the HOUSEHOLD, and every
+    # other running goal is planning against a household that no longer exists. Done
+    # BEFORE the webview closes, so the chat surface can hold its "saving, and updating
+    # your other goals…" screen for exactly as long as the work takes.
+    waiting_on = await fan_out_household_change(device_id, approval.goal_id)
     # v4.1: the initial approval ends the create phase — the user's final tap, the
     # moment the board becomes the primary surface. Close the webview bracket. GUARDED
     # on "still the create-phase goal", so a board adaptation approval (whose goal is
     # no longer the create-phase goal) never retriggers a close.
-    await emit_chat_ui_close(device_id, approval.goal_id)
+    #
+    # NOT AWAITED: this handler runs inline on the UI's receive loop, and the close can
+    # now be a minute away. Blocking here would stop that UI being heard from — the same
+    # socket the user is about to press Advance day on.
+    asyncio.create_task(_close_when_saved(device_id, approval.goal_id, waiting_on))
+
+
+#: How long a refusal stays on the chat surface before the cloud closes it (v7).
+#:
+#: Long enough to read a sentence and understand it was a decision rather than a glitch;
+#: short enough that nobody reaches for a dismiss button that is deliberately not there.
+#: A refusal needs no action, so asking for one would be the interface inventing work.
+OUT_OF_SCOPE_DWELL_S = 4.5
+
+
+async def _close_after(device_id: str, goal_id: str, seconds: float) -> None:
+    """Close the create-phase bracket after a dwell, without blocking the handler.
+
+    ``emit_chat_ui_close`` is already guarded on "still the session's create-phase goal",
+    so if the user says something new during the dwell this becomes a no-op rather than
+    closing the webview out from under their next goal.
+    """
+    try:
+        await asyncio.sleep(seconds)
+        await emit_chat_ui_close(device_id, goal_id)
+    except Exception:  # noqa: BLE001 - a background task must never take the process down
+        logger.exception("timed_close_failed goal=%s", goal_id)
+
+
+#: The floor on how long the chat's "Saving your plan…" screen is up (v7).
+#:
+#: An approval used to close the webview within a round-trip — a few tens of
+#: milliseconds — so the saving screen existed in the code and never existed on screen,
+#: and the surface the user had just tapped vanished under their finger. The dwell is not
+#: decoration: the tap moved the goal from the chat to the board, and a hand-off with no
+#: visible moment reads as a crash. Long enough to register as a transition, short enough
+#: that nobody is waiting on it.
+SAVE_DWELL_S = 1.6
+
+#: How long the webview will hold open waiting for another goal to finish re-planning
+#: after a household change (v7). The re-plan is a real LLM call on the device, so this is
+#: generous — but bounded, because a device that never answers must not strand the user in
+#: a spinner with no way out. On timeout the webview closes and the board still gets the
+#: change whenever it lands; the user simply is not watched over while it does.
+CROSS_GOAL_WAIT_S = 180.0
+
+#: goal_id -> "this goal's cross-goal re-plan has landed". Registered before the control
+#: goes down the wire (never after — the device can answer faster than we can arm) and
+#: fired by the status route when the re-planned goal reports back.
+crossgoal_waiters: dict[str, asyncio.Event] = {}
+
+
+async def _close_when_saved(device_id: str, goal_id: str, waiting_on: list[str]) -> None:
+    """Hold the create-phase webview until the save it announced is actually true.
+
+    THE SCREEN HAS TO OUTLAST THE WORK IT DESCRIBES. In Act 1 that is the dwell floor —
+    there is nothing to wait for but the hand-off itself. In Act 3 the chat says it is
+    "updating your other goals", and the honest moment to close is when the other goals
+    have actually been updated: the user watches the sentence that names the meal plan,
+    and finds the meal plan already changed when they get to the board.
+
+    The cloud owns this and not the chat UI, because the chat UI does not own its own
+    lifetime — Bixby unmounts the webview the instant `chat_ui_close` arrives, so a dwell
+    held only inside the iframe is a dwell nobody sees.
+    """
+    try:
+        started = asyncio.get_running_loop().time()
+        for other in waiting_on:
+            event = crossgoal_waiters.get(other)
+            if event is None:
+                continue
+            try:
+                await asyncio.wait_for(event.wait(), timeout=CROSS_GOAL_WAIT_S)
+            except asyncio.TimeoutError:
+                logger.warning("crossgoal_wait_timeout goal=%s waited_on=%s", goal_id, other)
+            finally:
+                crossgoal_waiters.pop(other, None)
+
+        elapsed = asyncio.get_running_loop().time() - started
+        if elapsed < SAVE_DWELL_S:
+            await asyncio.sleep(SAVE_DWELL_S - elapsed)
+        await emit_chat_ui_close(device_id, goal_id)
+    except Exception:  # noqa: BLE001 - a background task must never take the process down
+        logger.exception("deferred_close_failed goal=%s", goal_id)
+        await emit_chat_ui_close(device_id, goal_id)
+
+
+#: Hard kinds whose arrival changes what OTHER goals should be planning, not merely what
+#: they may do. An away window empties days; a peak-tariff window only reshapes when
+#: something runs, which the safety gate already handles at actuation without a re-plan.
+HOUSEHOLD_WIDE_KINDS = ("away_window",)
+
+
+async def fan_out_household_change(device_id: str, approved_goal_id: str) -> list[str]:
+    """Promote an approved goal's window to the household, and re-plan whoever it moves.
+
+    THE SHAPE OF THE MOMENT. Goal 2 says "we're away Thursday and Friday". Until it is
+    approved that is a proposal, so it binds only itself; approving it makes it a fact
+    about the household, and a meal week that is still planning dinners for Thursday is
+    now planning against a household that does not exist.
+
+    Two halves, and the order matters. First the window is WRITTEN to the store as a
+    household-scoped, chat-sourced, self-expiring entry — so it survives a restart, shows
+    its provenance, and retires itself rather than shadowing every future trip. Then every
+    OTHER active goal is re-resolved against the new store and, where its enforced set
+    actually moved, sent down to re-plan.
+
+    NOT AN APPROVAL. The user approved this when they approved goal 2; asking again would
+    be asking the same question twice. See ControlCommands.ConstraintsChanged.
+    """
+    contract = dispatched_contracts.get(approved_goal_id)
+    if not contract:
+        return []
+    hard = (contract.get("constraints") or {}).get("hard") or {}
+    window = next((hard[kind] for kind in HOUSEHOLD_WIDE_KINDS if isinstance(hard.get(kind), dict)), None)
+    if not window or not (window.get("start") and window.get("end")):
+        return []
+
+    written = await asyncio.to_thread(
+        append_constraints,
+        [{
+            "kind": "away_window",
+            "value": {"start": window["start"], "end": window["end"]},
+            "enforcement": "hard",
+            "scope": "household",
+            "applies_to": ["*"],
+            "label": "away window",
+            "note": f"you approved “{contract.get('title') or contract.get('objective', 'a goal')}”",
+            # Retires itself the day the family is back. A permanent away window would
+            # quietly empty every future meal week for the same two dates.
+            "expires_on": window["end"],
+        }],
+    )
+    if not written:
+        # Already known — a re-sent approval, or a reconnect replaying one. The store is
+        # append-only and idempotent enough to say nothing rather than write a duplicate.
+        logger.info("household_window_unchanged goal=%s", approved_goal_id)
+        return []
+
+    logger.info("household_window_written goal=%s start=%s end=%s",
+                approved_goal_id, window["start"], window["end"])
+
+    profile = await asyncio.to_thread(load_family_profile)
+    today = date.today()
+    _, summaries = board.snapshot(device_id)
+    pushed = 0
+    #: Which goals the create-phase webview should wait for before it closes.
+    waiting_on: list[str] = []
+    for summary in summaries:
+        if summary.goal_id == approved_goal_id or summary.state in ("done", "declined"):
+            continue
+        other = dispatched_contracts.get(summary.goal_id)
+        if not other:
+            continue
+        domain = other.get("domain") or ""
+        resolved = resolve_constraints(profile, domain, today=today)
+        before = (other.get("constraints") or {}).get("hard") or {}
+        after = resolved["hard"]
+        if after == before:
+            continue
+
+        # Say it before doing it, so the chat's saving screen can caption itself with
+        # what is actually happening rather than a generic spinner. Sent once, on the
+        # first goal that moves — the user does not need a running commentary.
+        if pushed == 0:
+            await registry.send_to_uis(device_id, Notice(
+                goal_id=approved_goal_id,
+                kind="updating_goals",
+                message=f"Updating {summary.title} — you're away {_window_words(window)}.",
+            ).model_dump(mode="json"))
+        pushed += 1
+
+        note = (
+            f"Plan changed — you're away {_window_words(window)}. Review."
+        )
+        source = contract.get("title") or contract.get("objective") or "another goal"
+        steer = (
+            f"The family is away from {window['start']} to {window['end']} inclusive — nobody is home "
+            "on those dates.\n"
+            "For EVERY plan row whose date falls inside that range: set status to \"skipped\", set the "
+            "title to exactly \"Away — no meal planned\", and set status_reason to exactly "
+            f"\"you're away · from {source}\". Do not invent other wording for those two fields — they "
+            "are read by a person who wants to know why a day is empty, not what the system called it.\n"
+            "Then adjust the days immediately before and after if it helps: use up what would spoil "
+            "before leaving, and keep the first day back light, because the kitchen will be bare."
+        )
+        # ARM BEFORE SENDING. The device can answer faster than we can set this up, and a
+        # waiter registered after the fact waits for an event that already fired.
+        crossgoal_waiters[summary.goal_id] = asyncio.Event()
+        waiting_on.append(summary.goal_id)
+        await registry.send_to_device(device_id, Control(
+            goal_id=summary.goal_id,
+            command="constraints_changed",
+            payload=ControlPayload(hard=after, steer=steer, note=note),
+        ).model_dump(mode="json"))
+        # Keep the cached contract in step, or the next fan-out compares against a
+        # household two changes old and decides nothing moved.
+        other.setdefault("constraints", {})["hard"] = after
+        logger.info("household_change_pushed goal=%s domain=%s", summary.goal_id, domain)
+
+    return waiting_on
+
+
+def _window_words(window: dict[str, Any]) -> str:
+    """"2026-07-30".."2026-07-31" -> "Thu & Fri" — the card has one line, not a date range."""
+    try:
+        start = date.fromisoformat(window["start"])
+        end = date.fromisoformat(window["end"])
+    except (KeyError, TypeError, ValueError):
+        return "while you're away"
+    days = [(start + timedelta(days=i)).strftime("%a") for i in range((end - start).days + 1)]
+    if len(days) == 1:
+        return days[0]
+    if len(days) == 2:
+        return f"{days[0]} & {days[1]}"
+    return f"{days[0]}–{days[-1]}"
 
 
 # --- device -> cloud -> ui ---------------------------------------------------
@@ -1182,12 +1496,37 @@ async def handle_plan_ready(device_id: str, plan_ready: PlanReady) -> None:
         await registry.send_to_device(device_id, approval_frame)
 
 
+def _display_hard(hard: dict[str, Any], domain: str) -> dict[str, Any]:
+    """The dispatched hard block, narrowed to the keys this domain shows.
+
+    Re-resolves the store rather than threading a second block through the dispatch:
+    the contract is the device's, and adding a display-only field to it would put a UI
+    concern on the wire the device would have to be told to ignore. If the store cannot
+    be read for any reason the block is returned WHOLE — an unfiltered chip row is a
+    cosmetic problem, and a plan card that fails to render over one is not.
+    """
+    if not domain:
+        return hard
+    try:
+        allowed = resolve_constraints(load_family_profile(), domain)["hard_display"]
+    except Exception:  # noqa: BLE001 - display only; never fail a plan over a chip
+        logger.warning("knew_display_filter_failed domain=%s — showing the full block", domain)
+        return hard
+    return {key: value for key, value in hard.items() if key in allowed}
+
+
 def build_knew(contract: dict[str, Any] | None) -> dict[str, Any]:
     """The UI-facing "what it knew" summary from a dispatched contract.
 
     GENERIC: surfaces constraints.hard (safety policy), constraints.soft
     (preferences), and context — no domain-specific field names.
 
+    v7: the hard half is filtered to what this DOMAIN displays, so the plan card's
+    chips say the same thing the understanding card's did. Without this the gate would
+    show three chips and the plan four, and the reader would reasonably assume
+    something changed between them. The filter is a display concern only — the
+    contract was dispatched with the full block, and it is the full block the device
+    armed.
     """
     if not contract:
         return {}
@@ -1195,7 +1534,7 @@ def build_knew(contract: dict[str, Any] | None) -> dict[str, Any]:
     soft = (contract.get("constraints") or {}).get("soft") or {}
     context = contract.get("context") or {}
 
-    knew: dict[str, Any] = graph_nodes._hard_knew(hard)
+    knew: dict[str, Any] = graph_nodes._hard_knew(_display_hard(hard, contract.get("domain") or ""))
 
     def add(label: str, value: Any) -> None:
         # Only surface flat, display-ready values (str / list[str]); never raw

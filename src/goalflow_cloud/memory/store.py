@@ -31,6 +31,22 @@ the hard block:
   graph's small LLM relevance pass); with none, tag matching is the fallback. Soft
   can be wrong for free, which is exactly why only soft goes near the model.
 
+v7 SPLIT ENFORCEMENT FROM DISPLAY. An entry may carry ``display_to`` — the domains its
+chip is worth SHOWING on. It changes nothing about resolution: the list kinds still
+union with ``applies_to`` ignored, and ``hard`` is still what gets dispatched. It only
+produces a second block, ``hard_display``, for the cards. The reason is that a home-prep
+goal enforcing "peanuts · no pork · low sodium" is telling the truth and saying nothing:
+three chips that cannot bite on any step of that plan teach the reader to skip the chip
+row, and the row is where a chip that DOES bite has to be noticed. Hiding a chip must
+never hide a rule, which is why these are two separate blocks rather than one filtered
+one.
+
+v7 ALSO EMPTIED THE SEED OF MONEY AND QUIET HOURS. ``budget_cap``, ``budget_envelope``
+and ``quiet_hours`` remain first-class kinds here and remain enforced by the device's
+rule instances — the mechanism is intact and gated. There is simply no entry of those
+kinds in the household any more, so nothing resolves and nothing is dispatched. A kind
+with no entry is not dead code; it is an unused capability.
+
 Dates are DAY OFFSETS resolved against today at load — the same generic-clock rule
 the device's data files follow, so a seeded world never goes stale between demos.
 Chat-captured constraints (M4) write an absolute ``expires_on`` instead.
@@ -68,6 +84,15 @@ HARD_SCALAR_KINDS: tuple[str, ...] = (
 
 #: The soft kind whose entries are free-text household notes, not a preference list.
 CONTEXT_KIND = "context"
+
+#: v7: an OPTIONAL per-entry list of domains the entry is worth SHOWING on. It has no
+#: bearing whatsoever on enforcement — `applies_to` is still ignored for the list kinds,
+#: so the enforced set is never narrowed (R7). This exists because a vacation goal that
+#: displays "peanuts · no pork · low sodium" is telling the truth about what is enforced
+#: while saying nothing about what is being planned, and three irrelevant safety chips
+#: teach the reader to stop reading them. Absent means "show everywhere", so every entry
+#: that does not opt in behaves exactly as it did before.
+DISPLAY_TO_KEY = "display_to"
 
 
 def profile_path(path: Path | None = None) -> Path:
@@ -130,14 +155,17 @@ def resolve_constraints(
 ) -> dict[str, Any]:
     """Resolve the store for ONE goal.
 
-    Returns ``{"hard", "soft", "context", "applied"}``:
+    Returns ``{"hard", "hard_display", "soft", "context", "applied"}``:
 
     - ``hard``  — the safety policy for ``dispatch.constraints.hard``. Assembled by
       code from store data only; no LLM output reaches it.
+    - ``hard_display`` — v7: the same block minus whatever this domain should not be
+      SHOWN (``display_to``). Display only. ``hard`` is what is dispatched and enforced,
+      and the two must never be confused: hiding a chip must never hide a rule.
     - ``soft``  — preference bias, grouped by kind, for ``dispatch.constraints.soft``.
     - ``context`` — free-text household notes for ``dispatch.context``.
-    - ``applied`` — provenance records (id / kind / label / source / scope) for the
-      understanding card and the logs: what was picked, and where it came from.
+    - ``applied`` — provenance records (id / kind / label / source / scope / display)
+      for the understanding card and the logs: what was picked, and where it came from.
 
     ``soft_ids`` selects soft entries by id (the graph's relevance pass). When it is
     None or selects nothing, tag matching on ``applies_to`` is the fallback — the
@@ -147,6 +175,7 @@ def resolve_constraints(
     entries = active_constraints(profile, today)
 
     hard: dict[str, Any] = {kind: [] for kind in HARD_LIST_KINDS}
+    hard_display: dict[str, Any] = {kind: [] for kind in HARD_LIST_KINDS}
     applied: list[dict[str, Any]] = []
     scalar_best: dict[str, tuple[int, dict[str, Any]]] = {}
 
@@ -156,10 +185,13 @@ def resolve_constraints(
         kind = entry["kind"]
         if kind in HARD_LIST_KINDS:
             # UNIONED regardless of domain — the enforced set is never narrowed.
+            shown = _displays(entry, domain)
             for item in _as_list(entry.get("value")):
                 if item not in hard[kind]:
                     hard[kind].append(item)
-            applied.append(_provenance(entry, why="always enforced"))
+                if shown and item not in hard_display[kind]:
+                    hard_display[kind].append(item)
+            applied.append(_provenance(entry, why="always enforced", display=shown))
         elif kind in HARD_SCALAR_KINDS:
             specificity = _specificity(entry, domain)
             if specificity < 0:
@@ -178,12 +210,27 @@ def resolve_constraints(
 
     for kind, (specificity, entry) in scalar_best.items():
         hard[kind] = entry["value"]
-        applied.append(_provenance(entry, why="domain" if specificity else "household default"))
+        shown = _displays(entry, domain)
+        if shown:
+            hard_display[kind] = entry["value"]
+        applied.append(
+            _provenance(entry, why="domain" if specificity else "household default", display=shown)
+        )
+
+    # An empty list kind is dropped from the display block entirely, so the chip row
+    # simply is not rendered rather than rendering an empty chip.
+    hard_display = {kind: value for kind, value in hard_display.items() if value}
 
     soft, context, soft_applied = _resolve_soft(entries, domain, soft_ids)
     applied.extend(soft_applied)
 
-    return {"hard": hard, "soft": soft, "context": context, "applied": applied}
+    return {
+        "hard": hard,
+        "hard_display": hard_display,
+        "soft": soft,
+        "context": context,
+        "applied": applied,
+    }
 
 
 def append_constraints(
@@ -204,8 +251,15 @@ def append_constraints(
       happens. Anything looser is dropped and logged.
     - **Nothing is removed.** Entries are appended. Relaxing a household rule is a
       deliberate act somewhere with more ceremony than a sentence typed at a fridge.
+    - **Saying the same thing twice writes once** (v7). An entry that is ALREADY live,
+      identical in kind, value and reach, is skipped rather than appended with a suffixed
+      id. This was found by the cross-goal gate on its first run: a re-sent approval, or a
+      reconnect replaying one, wrote a second identical away window — and since the
+      caller re-plans every goal whose constraints moved, a duplicate write meant a
+      duplicate re-plan of a plan the user had already watched change. Append-only is
+      about never REMOVING; it was never a reason to write the same fact twice.
 
-    Ids are stamped here so two captures of the same thing cannot collide.
+    Ids are stamped here so two captures of DIFFERENT things cannot collide.
     """
     today = today or date.today()
     target = profile_path(path)
@@ -222,6 +276,14 @@ def append_constraints(
         candidate.setdefault("applies_to", ["*"])
         candidate.setdefault("enforcement", "soft")
         candidate["captured_on"] = today.isoformat()
+
+        if _already_live(profile, candidate, today):
+            logger.info(
+                "constraint_capture_duplicate kind=%s value=%s — already in force, not written again",
+                candidate.get("kind"),
+                candidate.get("value"),
+            )
+            continue
 
         if not _tightens(profile, candidate, today):
             logger.warning(
@@ -242,6 +304,26 @@ def append_constraints(
             profile_file.write("\n")
         logger.info("constraints_captured path=%s ids=%s", target, [entry["id"] for entry in written])
     return written
+
+
+def _already_live(profile: dict[str, Any], candidate: dict[str, Any], today: date) -> bool:
+    """True when an identical, non-expired entry is already in force.
+
+    Compared on what the entry MEANS — kind, value and reach — not on its id or the day
+    it was captured, because the point is that re-stating a rule that is already true
+    changes nothing and should therefore write nothing.
+    """
+    def identity(entry: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            entry.get("kind"),
+            json.dumps(entry.get("value"), sort_keys=True, default=str),
+            entry.get("scope", "household"),
+            tuple(sorted(entry.get("applies_to") or ["*"])),
+            entry.get("enforcement", "soft"),
+        )
+
+    want = identity(candidate)
+    return any(identity(entry) == want for entry in active_constraints(profile, today))
 
 
 def _tightens(profile: dict[str, Any], candidate: dict[str, Any], today: date) -> bool:
@@ -332,11 +414,29 @@ def _resolve_soft(
                     bucket.append(item)
         else:
             soft.setdefault(kind, value)
-        applied.append(_provenance(entry, why=why))
+        applied.append(_provenance(entry, why=why, display=_displays(entry, domain)))
     return soft, context, applied
 
 
-def _provenance(entry: dict[str, Any], why: str) -> dict[str, Any]:
+def _displays(entry: dict[str, Any], domain: str) -> bool:
+    """Whether this entry is worth SHOWING on this domain's card. Never about enforcement.
+
+    Three cases, and the difference between the first two is the point:
+
+    - **absent** — show everywhere. An entry that does not opt in behaves as it always
+      did, which is what makes this additive.
+    - **``[]``** — show NOWHERE. Explicitly empty is a decision, not a default, so it
+      is honoured rather than falling through to "absent". This is how a rule that is
+      enforced on every goal can be kept off every card.
+    - **a list** — show on these domains (``"*"`` for all).
+    """
+    if DISPLAY_TO_KEY not in entry:
+        return True
+    display_to = entry.get(DISPLAY_TO_KEY) or []
+    return "*" in display_to or (bool(domain) and domain in display_to)
+
+
+def _provenance(entry: dict[str, Any], why: str, display: bool = True) -> dict[str, Any]:
     """One "where did this come from" record, for the gate card and the logs."""
     return {
         "id": entry.get("id", ""),
@@ -347,6 +447,9 @@ def _provenance(entry: dict[str, Any], why: str) -> dict[str, Any]:
         "source": entry.get("source", "account"),
         "scope": entry.get("scope", "household"),
         "why": why,
+        #: v7, display only: this row is still APPLIED and still enforced when it is
+        #: hard — it is simply not worth a chip on this domain's card.
+        "display": display,
     }
 
 

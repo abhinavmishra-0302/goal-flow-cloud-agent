@@ -282,7 +282,7 @@ class AgentEvent(_ContractModel):
 
     Payload shape depends on ``event``:
       phase:         {"phase": "grounding"|"planning"|"checking"|"awaiting_approval"}
-      thinking:      {"text": "..."}
+      thinking:      {"text": "...", "kind"?, "step"?, "detail"?}   # v7
       tool_call:     {"module": "...", "function": "...", "args": {...}}
       tool_result:   {"module": "...", "function": "...", "summary": "..."}
       plan_progress: {"item": {...}, "total": 7}   # total optional (v5.1)
@@ -297,6 +297,13 @@ class AgentEvent(_ContractModel):
     ``task_update`` (v3) is how the cloud learns a goal's shape and progress: the task
     DAG lives on the DEVICE (only it can ground a decomposition), so Agent Board's
     numbers are folded from these rather than guessed from the clock.
+
+    ``thinking.kind`` (v7, optional) is ``narration`` | ``step`` | ``notice``; absent
+    means ``narration``, which is every thinking event emitted before v7. A ``step``
+    carries ``step`` (headline) and ``detail`` (sub-line) and is WHOLE on arrival, never
+    fragmented — so a client renders it immediately instead of accumulating chunks and
+    guessing where one thought ends. ``text`` still holds "step — detail", so a client
+    that ignores the new fields is unaffected.
     """
 
     type: Literal["agent_event"] = "agent_event"
@@ -323,6 +330,11 @@ class PlanItem(_ContractModel):
     when: str | None = None
     why: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    #: v7: absent or "planned" is a normal row; "skipped" is a day deliberately left
+    #: empty — still rendered, styled down, carrying its reason. Deleting the row was
+    #: the alternative and it is worse: a shorter plan says nothing about WHY.
+    status: str | None = None
+    status_reason: str | None = None
 
 
 class PlanProposal(_ContractModel):
@@ -357,6 +369,13 @@ class ImpactItem(_ContractModel):
     value: str
 
 
+class RejectedOption(_ContractModel):
+    """One option the planner considered and did not take, and why (v7)."""
+
+    option: str
+    reason: str
+
+
 class PlanPayload(_ContractModel):
     """The plan_ready payload: plan + tiered proposals + safety + impact."""
 
@@ -365,6 +384,12 @@ class PlanPayload(_ContractModel):
     safety: SafetyResult
     impact: list[ImpactItem] = Field(default_factory=list)
     explanation: str = ""
+    #: v7, model-authored and DISPLAY ONLY: how many options were weighed, and which
+    #: were discarded with the reason each time. Nothing downstream reads them — a
+    #: lookup table cannot reject, so this is the clearest evidence a person can be
+    #: given that something reasoned. Absent is normal.
+    considered: int | None = None
+    rejected: list[RejectedOption] | None = None
     #: Cloud-added on present_plan only: the personalization "what it knew".
     knew: dict[str, Any] | None = None
 
@@ -401,10 +426,17 @@ class UnderstandingPayload(_ContractModel):
     domain: str = ""
     #: Display-ready hard-constraint chips, same shape as PlanPayload.knew.
     knew: dict[str, Any] = Field(default_factory=dict)
-    #: v6, ADDITIVE: one row per applied constraint — {id, label, value, enforcement,
-    #: source, why}. Provenance for the gate: a block the user cannot trace is a
-    #: block they will not trust. `knew` is unchanged, so a UI may ignore this.
+    #: v6, ADDITIVE: one row per applied HARD constraint — {id, kind, label, value,
+    #: enforcement, source, why}. Provenance for the gate: a block the user cannot
+    #: trace is a block they will not trust. `knew` is unchanged, so a UI may ignore
+    #: this. v7: rows this domain does not display are omitted, so these line up
+    #: one-for-one with `knew`'s chips.
     constraints: list[dict[str, Any]] = Field(default_factory=list)
+    #: v7, ADDITIVE: the SOFT half — {id, label, value, source, why}, one row per
+    #: entry. Kept out of `knew` and out of `constraints` on purpose: a preference
+    #: shapes the plan and can never block it, and a UI that renders the two alike
+    #: teaches the reader that a chip is a chip. Empty is normal.
+    preferences: list[dict[str, Any]] = Field(default_factory=list)
     #: v6-M4, ADDITIVE: household rules the user STATED in this message, awaiting a
     #: yes. Proposals only — the LLM never writes policy, so nothing here applies
     #: until it comes back in `understanding_response.accepted_constraint_ids`.
@@ -538,7 +570,10 @@ class Notice(_ContractModel):
     #: input (Bixby) surface can SPEAK the cancellation.
     #: "captured" (v6-M4) = the message stated a household rule rather than a goal;
     #: the rule was confirmed and remembered, and no plan was ever coming.
-    kind: Literal["out_of_scope", "declined", "captured"] = "out_of_scope"
+    #: v7: "updating_goals" is NOT terminal — it captions the chat's saving screen while
+    #: the cloud pushes a household change to the user's other goals. Kept a plain str so
+    #: a new kind never fails validation and vanishes.
+    kind: str
     message: str
 
 
@@ -554,10 +589,18 @@ class ChatUiOpen(_ContractModel):
     webview; ``chat`` (the webview) HARD-RESETS keyed to ``goal_id`` and thereafter
     ignores goal-scoped frames with a different ``goal_id``. The device never sees
     it. Emitted strictly BEFORE the goal's ``understanding`` frame.
+
+    v7.4: emitted the INSTANT the goal is received, before interpretation runs — see
+    ``handle_user_goal``. It therefore carries ``goal_text``, because the frame is now
+    the only thing the chat surface knows for the 10-60s the interpreter is thinking,
+    and a panel that cannot say what it is working on has nothing to show but a spinner.
     """
 
     type: Literal["chat_ui_open"] = "chat_ui_open"
     goal_id: str
+    #: What the user actually said, verbatim. Optional: a v7.3 client that ignores it
+    #: renders exactly as before, and the bind-time replay may not have it.
+    goal_text: str = ""
 
 
 class ChatUiClose(_ContractModel):
@@ -598,7 +641,21 @@ class Control(_ContractModel):
 
     type: Literal["control"] = "control"
     goal_id: str = ""
-    command: Literal["advance_day", "reset", "set_date", "trigger_event"]
+    #: A Literal here is a HARD GATE: an unlisted value fails validation and the frame is
+    #: never sent — silently, from the sender's side. v7 added `constraints_changed` to
+    #: the device and to CONTRACT.md and missed this line, and the symptom was a
+    #: cross-goal fan-out that logged a pydantic error into the void while the demo's
+    #: headline moment simply did not happen. Same lesson as AgentEventKind above: every
+    #: mirror moves in one pass.
+    command: Literal[
+        "advance_day",
+        "reset",
+        "set_date",
+        "trigger_event",
+        #: v7: the account re-resolved this goal's constraints because ANOTHER goal was
+        #: approved. The one adaptation path that does not ask.
+        "constraints_changed",
+    ]
     payload: ControlPayload = Field(default_factory=ControlPayload)
 
 
@@ -671,6 +728,11 @@ class GoalSummary(_ContractModel):
     alerts: GoalAlerts = Field(default_factory=GoalAlerts)
     #: The last couple of human-readable things that happened.
     activity: list[str] = Field(default_factory=list)
+    #: v7: this plan changed WITHOUT an approval, because another goal the user already
+    #: approved changed the household. Rendered as one informational line on the card and
+    #: a dismissible notice on the detail page — deliberately NOT an alert, which means
+    #: "you still have to decide". Here there is nothing left to decide.
+    plan_changed_note: str | None = None
     updated_at: str = ""
 
 
@@ -721,49 +783,6 @@ class GoalAccepted(_ContractModel):
     client_ref: str | None = None
 
 
-class Suggestion(_ContractModel):
-    """One proactive suggestion — a goal the device thinks is worth doing, unprompted.
-
-    DERIVED FROM LOCAL STATE by the device (expiring food, low stock), because only the
-    device sees the fridge. It is NOT a goal yet: it becomes one only if a person taps
-    accept, at which point ``goal_text`` is submitted as an ordinary ``user_goal`` and
-    runs the normal understand→plan→approve flow. So a suggestion can never act on its
-    own — the same "a person decides" line the whole system holds.
-    """
-
-    id: str
-    #: "expiring" | "restock" — the scan that produced it (drives the card's glyph).
-    kind: str
-    title: str
-    subtitle: str = ""
-    detail: str = ""
-    #: The goal text submitted verbatim as a user_goal if this is accepted.
-    goal_text: str
-
-
-class Suggestions(_ContractModel):
-    """The device's current suggestion list.
-
-    Goal-LESS: this is the one frame the device sends that isn't about a goal already
-    in flight — a proactive scan, not a reaction. The cloud relays the list to the
-    boards (on change and on bind); the chat UI never sees it.
-    """
-
-    type: Literal["suggestions"] = "suggestions"
-    items: list[Suggestion] = Field(default_factory=list)
-
-
-class SuggestionAction(_ContractModel):
-    """A board acted on a suggestion: accept it (→ a real goal) or dismiss it."""
-
-    type: Literal["suggestion_action"] = "suggestion_action"
-    suggestion_id: str
-    #: "accept" | "dismiss".
-    action: str
-    #: UI-minted id echoed back in goal_accepted when an accept mints a goal.
-    client_ref: str | None = None
-
-
 ContractMessage = Annotated[
     Union[
         Hello,
@@ -789,8 +808,6 @@ ContractMessage = Annotated[
         BoardGet,
         GoalStateGet,
         GoalAccepted,
-        Suggestions,
-        SuggestionAction,
     ],
     Field(discriminator="type"),
 ]

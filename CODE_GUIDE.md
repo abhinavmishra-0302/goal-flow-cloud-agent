@@ -137,15 +137,13 @@ on **`type` + sender role, within the sender's session** (`route_message` derive
 | `user_goal`     | ui     | `start_goal` runs the graph (in a thread) to the `present_understanding` gate → send the `understanding` frame to the UI; also folds the goal onto the board (`board.on_understanding`); on graph `error`, send a terminal `status` frame to the UI instead. |
 | `understanding_response` | ui | `resume_goal` resumes `present_understanding` with `{"confirmed": bool}`; confirmed sends the `dispatch` contract to the device and folds the goal (`board.on_goal_created`), declined ends the goal (`goal_declined`) and re-snapshots the board so the card drops. |
 | `approval`      | ui     | `resume_goal` resumes the `hitl_approval` interrupt with the decisions; forward the frame to the device. |
-| `control`       | ui     | Forward to the device (generic clock: `advance_day` / `reset` / `set_date`; plus `trigger_event` for the event-driven demo — cloud makes no logic changes, pure passthrough). |
+| `control`       | ui     | Forward to the device (generic clock: `advance_day` — which first retires this session's finished goals — / `reset` / `set_date`; plus `trigger_event` for the event-driven demo — cloud makes no logic changes, pure passthrough). |
 | `board_get`     | ui     | Send this session's `board_snapshot` (every goal, folded) — first paint, or to heal a `board_seq` gap. |
 | `goal_state_get`| ui     | Reply from the board's cache with the goal's last `present_plan` / `status` / pending `understanding` (drill-in after a reload); a miss is logged. |
-| `suggestion_action` | ui | Accept or dismiss one proactive suggestion (`BoardService.take_suggestion`); an accept starts a real goal, then re-send `suggestions`. |
 | `capabilities`  | device | Cache the module registry **per session**; relay to the UI (also replayed to a UI when it binds into the session). |
 | `agent_event`   | device | **Passthrough relay** to the UI; best-effort append into the graph's `event_log` via `graph.update_state`. The stream never blocks the graph — streaming lives at the hub layer while the graph waits at its interrupts. A `task_update` event also folds onto the board (`board.on_task_update`). |
 | `plan_ready`    | device | `resume_goal` (resumes `collect_plan`); re-wrap as `present_plan` with `payload.knew` added; send to UI; fold onto the board (`board.on_plan_ready`). If the run auto-advanced past approval (auto-tier only), forward the resulting `approval_frame` to the device. |
 | `proposal` / `status` | device | Relay to the UI, feed the graph's `monitor` interrupt (best-effort), and fold onto the board (`board.on_proposal` / `board.on_status`). |
-| `suggestions`   | device | Replace this session's proactive-suggestion list (`board.on_suggestions`); re-broadcast `suggestions` to the boards. |
 | `day_advanced`  | device | Relay the global world-tick summary (v3.2) straight through to the boards; the per-goal `status`/`proposal` frames that ride alongside it already moved the cards. |
 
 Device frames are **deduped** per goal on `correlation_id` (plus `seq` for
@@ -198,9 +196,11 @@ cloud-internal, *not* wire-contract semantics):
   happens on one evening has span 1, and without the `eta` floor a single Advance-day
   would drive that card to 100% with the deadline still days out.
 
-`goal_state_get` (drill-in) and the proactive **suggestions** list (M8:
-`on_suggestions` / `take_suggestion`) are also served from here; a device going offline
-marks every unfinished card at-risk (`on_device_offline`).
+`goal_state_get` (drill-in) is also served from here; a device going offline marks
+every unfinished card at-risk (`on_device_offline`). `retire_completed` drops every
+`task_status: "done"` goal on the next `advance_day` — a finished goal is a receipt, not
+work, and the removal reaches the UI as a fresh `board_snapshot` because a `board_update`
+can only replace a card, never retract one.
 
 ## Memory: the household constraint store (`memory/store.py`) — v6
 

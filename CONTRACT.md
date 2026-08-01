@@ -22,11 +22,12 @@ past.
 | Version | Added |
 |---|---|
 | v2 | the base protocol: `hello`, `user_goal`, `dispatch`, `agent_event`, `plan_ready`, `present_plan`, `approval`, `proposal`, `status`, `control` |
-| v3 | `capabilities.domains[]`, `agent_event: task_update`, `phase: "queued"`, `plan_ready.precheck`, `status.executed[].result: "deferred_precheck"`, the board frames (`board_snapshot`/`board_update`/`board_get`), `goal_state_get`, `goal_accepted` + `user_goal.client_ref`, `suggestions`/`suggestion_action` |
+| v3 | `capabilities.domains[]`, `agent_event: task_update`, `phase: "queued"`, `plan_ready.precheck`, `status.executed[].result: "deferred_precheck"`, the board frames (`board_snapshot`/`board_update`/`board_get`), `goal_state_get`, `goal_accepted` + `user_goal.client_ref` |
 | v3.2 | a **goal-less** `control` = one world tick fanning out over every goal, plus `day_advanced` |
 | v4.1 | `hello.surface`, the input-surface delivery fork, `chat_ui_open`/`chat_ui_close`, create-phase replay on bind |
 | v5.1 | `agent_event: harness`, `plan_progress.total` |
 | v6 | `constraints.hard`: `peak_hours`, `away_window`, `budget_envelope`; `understanding.constraints` (provenance) and `proposed_constraints`/`capture_only`; `understanding_response.accepted_constraint_ids` |
+| v7 | `control: constraints_changed` (+ `payload.hard`/`steer`/`note`) — the one adaptation path that does not ask; `status.plan_changed_note`; `GoalSummary.plan_changed_note`; `plan[].status`/`status_reason`; `notice.kind: updating_goals` (non-terminal); `understanding.preferences` (the soft half, one row per entry); `understanding.constraints[].kind`; store-side `display_to` narrows `knew`/`constraints` on both the gate and `present_plan` without touching what is dispatched or enforced; `agent_event: thinking` gains `kind`/`step`/`detail`; `plan_ready.payload` gains `considered`/`rejected` |
 
 ## Transport
 
@@ -168,10 +169,16 @@ dispatch. The graph is paused until the UI answers with `understanding_response`
   "payload": {
     "objective": "...",
     "domain": "meal_plan",
-    "knew": { "allergens": ["peanuts"], "budget": "$120" },
+    "knew": { "allergens": ["peanuts"], "dietary": ["no_pork"] },
     "constraints": [
-      { "id": "c-cap-travel", "label": "travel budget", "value": "$1500",
-        "enforcement": "hard", "source": "account", "why": "domain" }
+      { "id": "c-allergen-peanuts", "kind": "allergens", "label": "peanut allergy",
+        "value": "peanuts", "enforcement": "hard", "source": "account",
+        "why": "always enforced" }
+    ],
+    "preferences": [
+      { "id": "s-prefer-white-meat", "label": "prefers white meat",
+        "value": "prefer white meat, chicken turkey fish over red meat",
+        "source": "account", "why": "tagged" }
     ],
     "thought": "I'll shape a meal plan around your constraints before planning.",
     "time_window": { "start": "<ISO>", "end": "<ISO>" }
@@ -179,9 +186,23 @@ dispatch. The graph is paused until the UI answers with `understanding_response`
 ```
 
 `constraints` (v6, **additive**) is the provenance list behind the `knew` chips: one
-row per applied constraint, with `source` ∈ `account | derived | chat` and `why`
+row per applied HARD constraint, with `source` ∈ `account | derived | chat` and `why`
 saying whether it was enforced always, picked for this domain, or captured. `knew` is
 unchanged, so a UI that ignores `constraints` keeps working.
+
+**v7 — `preferences` (additive), and display ≠ enforcement.** `preferences` carries the
+SOFT half: one row per store entry, `{id, label, value, source, why}`, with no
+`enforcement` field because there is nothing to enforce. It is a separate field rather
+than more `knew` chips because a preference shapes a plan and can never block one, and
+a UI that renders the two alike teaches the reader that a chip is just a chip.
+
+Also in v7, a store entry may carry `display_to` — the domains its chip is worth
+**showing** on. It has no bearing on resolution: the hard list kinds still union with
+`applies_to` ignored, and `dispatch.constraints.hard` still carries the full enforced
+set. It only narrows `knew` and `constraints`, so a home-prep goal shows no food chips
+while still being dispatched — and still being blocked by — every allergen the
+household holds. **Hiding a chip never hides a rule.** `present_plan.knew` applies the
+same filter, so the gate and the plan card cannot disagree.
 
 **v6-M4 — capture (additive).** When the message STATES a household rule, the payload
 also carries `proposed_constraints` — `[{id, kind, value, enforcement, label, quote,
@@ -239,16 +260,28 @@ hosting it when a goal's create phase begins and closes it when the create phase
 These two frames are that bracket. The device never sees either.
 
 ```json
-{ "type": "chat_ui_open",  "goal_id": "..." }
+{ "type": "chat_ui_open",  "goal_id": "...", "goal_text": "Plan my weekly meal." }
 { "type": "chat_ui_close", "goal_id": "..." }
 ```
 
-**`chat_ui_open`** is emitted the moment the cloud knows the goal WILL have a create
-phase: in `handle_user_goal`, after interpretation returns and the actionability gate
-passes — i.e. on every path that did NOT take the error / `notice out_of_scope` early
-exit — and strictly BEFORE the `understanding` frame for the same goal. (An accepted
-suggestion funnels through `user_goal`, so it brackets identically.) An out-of-scope
-goal emits `notice` and NO `chat_ui_open`: Bixby speaks the notice, no webview opens.
+**`chat_ui_open`** is emitted the INSTANT `user_goal` arrives — **before** interpretation
+runs (v7.4), not after it. Interpretation is a 10-60s LLM round-trip, and emitting the
+open afterwards meant the whole of the slowest wait in the product happened with no
+webview on screen at all: the user spoke to the fridge, the fridge showed nothing, and
+then the understanding card appeared as though the work had been instant. Nothing about
+the open depends on interpretation — it is a RESET keyed to a `goal_id`, which is minted
+on arrival.
+
+It carries **`goal_text`**, verbatim, for the same reason: during interpretation that
+frame is the only thing the chat surface knows, and a panel that cannot say what it is
+working on has nothing to show but a spinner. Optional, so a pre-v7.4 client is unaffected.
+
+Because the bracket is now open before either early exit, the **error** path closes it,
+and the **out-of-scope** path does NOT re-open it — a second open would broadcast a reset
+that wipes the panel the user has been watching. An out-of-scope goal still brackets (v7):
+the already-open webview receives the `notice`, then a cloud-side `chat_ui_close` ~4.5s
+later. A refusal is an answer, and it is shown where every other answer is shown. The
+notice is also cached for replay — see *Create-phase replay cache*.
 
 It has a DUAL role, one per surface:
 
@@ -353,12 +386,21 @@ Payload shapes by `event`:
 | `event`         | `payload`                                                 |
 |-----------------|-----------------------------------------------------------|
 | `phase`         | `{ "phase": "queued" \| "grounding" \| "planning" \| "checking" \| "awaiting_approval" \| "executing" \| "monitoring" \| "adapting" }` |
-| `thinking`      | `{ "text": "..." }`                                       |
+| `thinking`      | `{ "text": "...", "kind"?: "narration" \| "step" \| "notice", "step"?: "...", "detail"?: "..." }` |
 | `tool_call`     | `{ "module": "...", "function": "...", "args": { } }`     |
 | `tool_result`   | `{ "module": "...", "function": "...", "summary": "..." }`|
 | `plan_progress` | `{ "item": { }, "total": 7 }`                             |
 | `task_update`   | `{ "task_id": "t2", "title": "find recipes", "state": "monitoring", "depends_on": ["t1"], "progress_pct": 43, "pending_tasks": 4, "next_step": "build the shopping list", "retry_count": 0, "failure_reason": null }` |
 | `harness`       | `{ "module": "safety", "status": "block", "note": "blocks \"peanut sauce\"", "verdict": "1 blocked", "grade": "A1" }` |
+
+**`thinking.kind`** (v7, optional) — `narration` | `step` | `notice`; absent means
+`narration`, which is every thinking event emitted before v7. A **`step`** carries `step`
+(headline) and `detail` (sub-line) and is **whole on arrival, never fragmented**, so a
+client renders it immediately instead of accumulating chunks and guessing where one
+thought ends. `text` still holds `"step — detail"`, so a client that ignores the new
+fields is unaffected. This exists because the compose call is not streamed and keeps its
+plan JSON off this channel deliberately: through v6 the planner emitted **nothing** on a
+healthy run, and a silent engine is indistinguishable from a broken one.
 
 **`plan_progress.total`** (v5.1, optional) — how many items the finished plan has. The
 device composes a plan in ONE non-streaming call and then emits every item in a single
@@ -425,10 +467,17 @@ next. It exists so a waiting goal is visible rather than appearing stalled.
       { "id": "day3-football", "day": 3, "label": "Thu",
         "title": "Football practice", "kind": "calendar.event_overlap", "order": 3 }
     ],
+    "considered": 17,
+    "rejected": [ { "option": "pork belly stir-fry", "reason": "no pork" } ],
     "explanation": "..."
   } }
 ```
 
+- `considered` / `rejected` (v7, optional) are **model-authored and display-only**.
+  Nothing downstream reads them: a wrong rejection reason costs a wrong sentence, which
+  is the right price for the clearest evidence a person can be given that something
+  reasoned rather than looked up — a lookup table cannot reject. Absent is normal, and a
+  model that weighed nothing is told to omit them rather than invent a number.
 - `plan[].day` is the **1-based plan-day index** — the source of truth for
   meal-week ordering (the UI renders "Day N"; events target a plan item by `day`).
 - `demo_events` (optional) is a display catalog of **presenter-fired** demo events.
@@ -499,7 +548,7 @@ through unchanged when present.
 
 ```json
 { "type": "control", "goal_id": "...?",
-  "command": "advance_day" | "reset" | "set_date" | "trigger_event",
+  "command": "advance_day" | "reset" | "set_date" | "trigger_event" | "constraints_changed",
   "payload": { "date": "<ISO?>", "event_id": "day3-football" } }
 ```
 
@@ -512,6 +561,15 @@ through unchanged when present.
 - `trigger_event` fires one presenter demo event by `event_id` (from
   `plan_ready.demo_events`) for a specific goal — the per-goal path (retained, but the
   board no longer sends it; the world tick supersedes it).
+- **`constraints_changed` (v7, cloud → device, goal-scoped)** is the one adaptation path
+  that does **not** ask. The account re-resolved THIS goal's constraints because ANOTHER
+  goal was approved — the family said they are away, so a meal week has days it should not
+  be planning dinners for. Payload carries `hard` (the account's new
+  `constraints.hard`, verbatim — the device re-arms from it and authors nothing), `steer`
+  (how to re-plan) and `note` (one sentence for the board). The device applies the patch
+  immediately and reports it with `status.plan_changed_note`; it never opens an approval,
+  because the user already approved this when they approved the other goal, and asking
+  twice about one decision implies the first answer did not count.
 
 ### `day_advanced` (device → cloud → ui)
 
@@ -607,30 +665,6 @@ submission** — it would have to adopt whichever arrives first, and mis-key the
 `client_ref` is UI-minted and echoed straight back, so an optimistic card re-keys to the
 real `goal_id`. Optional: a v2 client that omits it still works.
 
-### Proactive suggestions (v3-M8) — `suggestions` (device → cloud → ui), `suggestion_action` (ui → cloud)
-
-```json
-{ "type": "suggestions", "items": [
-    { "id": "sug-expiring", "kind": "expiring", "title": "Expiring Soon",
-      "subtitle": "5 items in 3 days", "detail": "spinach, yogurt, milk, ...",
-      "goal_text": "Plan meals that use up the food expiring this week" } ] }
-
-{ "type": "suggestion_action", "suggestion_id": "sug-expiring", "action": "accept", "client_ref": "s-3" }
-```
-
-The **`suggestions` frame is the one thing the device sends that isn't about a goal
-already in flight** — a proactive scan of local state (expiring food, low stock), not a
-reaction to a dispatch. Only the device can see the fridge, so only the device can raise
-one. The cloud holds the current list and relays it to the boards on change and on bind;
-the **chat UI never sees it** (suggestions are a board surface).
-
-A suggestion is **not a goal**. `suggestion_action{accept}` submits the suggestion's
-`goal_text` as an ordinary `user_goal` (echoing `client_ref` in the resulting
-`goal_accepted`, so the board can re-key exactly like a typed goal) — it then runs the
-normal understand → plan → approve flow. So a suggestion can never act on its own; a
-person accepting it is what turns "you could do this" into a goal. `action: "dismiss"`
-drops it from the list.
-
 **v3.1 — the board is no longer read-mostly.** Once a goal's initial plan is approved
 on the chat UI, the board becomes the goal's primary surface: it renders the raw device
 stream on a per-goal detail page (`present_plan`, `agent_event`, `status`, `proposal`)
@@ -650,7 +684,7 @@ One fork, in ONE place. Every cloud→ui frame for a session goes through a sing
 fan-out point (`ConnectionRegistry.send_to_uis`); v4.1 adds a per-surface **interest
 predicate** consulted there, in the send loop, per target socket — no per-call-site
 routing table, no new send paths. The same predicate gates the bind-time pushes
-(`capabilities` replay, `board_snapshot`, `suggestions`) in `_bind_ui`.
+(`capabilities` replay, `board_snapshot`) in `_bind_ui`.
 
 | surface (from `hello`) | receives via session fan-out |
 |---|---|
@@ -669,25 +703,32 @@ a server-side per-type table would reintroduce the "forked to nobody = silently
 dropped" failure mode this contract warns about at the top.
 
 **Create-phase replay cache.** The cloud keeps, per session, the CURRENT create-phase
-goal's state: `{ goal_id, understanding?, present_plan? }` — the exact frames it
-broadcast (the `present_plan` including `payload.knew`), captured as they are sent.
+goal's state: `{ goal_id, goal_text, understanding?, present_plan?, notice? }` — the exact frames
+it broadcast (the `present_plan` including `payload.knew`), captured as they are sent.
 Lifecycle:
 
 - **created** when `chat_ui_open` is emitted (the goal becomes the session's
   create-phase goal); `understanding` is captured at emission; `present_plan` at
-  `plan_ready` handling — for the create-phase goal only;
+  `plan_ready` handling; a TERMINAL `notice` (`out_of_scope` / `declined`, never the
+  mid-save `updating_goals`) at emission — for the create-phase goal only;
 - **cleared** when `chat_ui_close` is emitted (any of its three triggers);
 - **replaced** wholesale by a superseding `chat_ui_open` for a new goal.
 
 On bind of a socket whose surface is `"chat"` (and only `"chat"` — a legacy
 absent-surface client keeps its exact v3 behaviour), after the existing bind-time
-pushes the cloud REPLAYS: `chat_ui_open { goal_id }`, then the cached `understanding`
-(if the plan hasn't arrived yet), then the cached `present_plan` (if it has). This
+pushes the cloud REPLAYS: `chat_ui_open { goal_id }`, then the cached `notice` if there
+is one (alone — it is terminal, and the chat UI clears the stage on it), else the cached
+`understanding` (if the plan hasn't arrived yet) or the cached `present_plan` (if it
+has). This
 mirrors how the board rehydrates via `board_snapshot` on bind, and it closes the race
 between the webview connecting and `understanding` being computed: connect early and
 the frames arrive by broadcast (the `chat_ui_open`-before-`understanding` ordering
 guarantees the reset lands first); connect late and the replay delivers the same
-sequence. Either way the webview paints the current goal — and ONLY the current goal,
+sequence. The `notice` half exists for the same race in its sharpest form: a REFUSAL has
+no round-trip in it at all — the cloud opens the bracket and broadcasts the notice in the
+same breath, while Bixby is still mounting the iframe off that open, so the frame reached
+a socket that had not connected. Uncached, the user watched a blank webview appear and
+close 4.5s later. Either way the webview paints the current goal — and ONLY the current goal,
 because the `chat_ui_open` reset discarded everything else. No cache (create phase
 over or never started) ⇒ no replay ⇒ the webview shows its idle state, and Bixby has
 already closed it anyway.

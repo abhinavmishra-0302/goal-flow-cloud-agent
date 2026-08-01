@@ -209,13 +209,22 @@ def _capability_summary(capabilities: dict[str, Any] | None) -> str:
 
 
 def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
-    """Display-ready hard-constraint chips shared by the gate and plan card."""
+    """Display-ready hard-constraint chips shared by the gate and plan card.
+
+    Feed this ``hard_display``, not ``hard`` — v7 splits the two, and passing the
+    dispatched block here would put a chip on a card for a rule the goal cannot trip.
+
+    Money and quiet hours are no longer rendered because the household no longer holds
+    them (see memory/store.py). The branches are gone rather than dormant: a chip
+    builder that formats a key nothing ever sets is a comment pretending to be code. If
+    a budget entry is ever seeded again, the chip comes back here, in four lines.
+    """
     hard = hard or {}
     knew: dict[str, Any] = {}
 
     def add(label: str, value: Any) -> None:
         # Only surface flat, display-ready values (str / list[str]); never raw
-        # nested objects except quiet_hours, which is intentionally stringified.
+        # nested objects. Windows are stringified separately, below.
         if isinstance(value, list):
             items = [str(v) for v in value if str(v).strip()]
             if items:
@@ -228,20 +237,11 @@ def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
     add("allergens", hard.get("allergens"))
     add("dietary", hard.get("dietary"))
     add("medical", hard.get("medical"))
-    if hard.get("budget_cap"):
-        # ":g" so a whole-number cap reads "$120", not "$120.0". Coerced through
-        # float() first and guarded: this value comes from an LLM, so "120" as a
-        # STRING is a real shape, and formatting a str with :g raises — which would
-        # kill the goal at the understanding gate to tidy a decimal point.
-        try:
-            knew["budget"] = f"${float(hard['budget_cap']):g}"
-        except (TypeError, ValueError):
-            knew["budget"] = f"${hard['budget_cap']}"
-    # NOT str(dict) — that renders "{'start': '21:30', 'end': '07:00'}" into a
+    # NOT str(dict) — that renders "{'start': '17:00', 'end': '21:00'}" into a
     # user-facing chip: a Python literal, quotes and braces included, on a fridge
     # door. These chips are the agent proving it listened, so they have to read
     # like a person wrote them.
-    for label, key in (("quiet hours", "quiet_hours"), ("peak tariff", "peak_hours"), ("away", "away_window")):
+    for label, key in (("peak tariff", "peak_hours"), ("away", "away_window")):
         window = hard.get(key)
         if not window:
             continue
@@ -249,18 +249,35 @@ def _hard_knew(hard: dict[str, Any] | None) -> dict[str, Any]:
             knew[label] = f"{window.get('start', '?')}–{window.get('end', '?')}"
         elif isinstance(window, str) and window.strip():
             knew[label] = window.strip()
-
-    envelope = hard.get("budget_envelope")
-    if isinstance(envelope, dict) and envelope.get("cap"):
-        # The pool, not this goal's slice — the device narrows the goal's own cap to
-        # whatever is left of it, so the chip says what the household has, not what
-        # the goal may spend.
-        period = str(envelope.get("period") or "").strip()
-        try:
-            knew["envelope"] = f"${float(envelope['cap']):g}" + (f" {period}" if period else "")
-        except (TypeError, ValueError):
-            knew["envelope"] = f"${envelope['cap']}"
     return knew
+
+
+def _applied_preferences(applied: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Display-ready preference rows — the soft half of what was resolved.
+
+    One row per ENTRY, not per kind, which is why the store labels its soft entries:
+    grouping by kind is right for the dispatch (the planner wants one ``prefer`` list)
+    and wrong for a card (the reader wants "prefers white meat" and "workout-friendly"
+    as two things they can agree or disagree with).
+
+    ``context`` entries are excluded. They are household notes the planner reads, not
+    preferences anyone expressed, and listing "family calendar is the shared source of
+    evening availability" as something the user prefers would be a small lie.
+    """
+    rows: list[dict[str, Any]] = []
+    for entry in applied or []:
+        if entry.get("enforcement") != "soft" or entry.get("kind") == "context":
+            continue
+        rows.append(
+            {
+                "id": entry.get("id", ""),
+                "label": entry.get("label", ""),
+                "value": _constraint_display(entry.get("kind", ""), entry.get("value")),
+                "source": entry.get("source", "account"),
+                "why": entry.get("why", ""),
+            }
+        )
+    return rows
 
 
 def _applied_constraints(applied: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -268,15 +285,23 @@ def _applied_constraints(applied: list[dict[str, Any]] | None) -> list[dict[str,
 
     Values are rendered here, not in the UI, for the same reason the ``knew`` chips
     are: a raw ``{'start': ..., 'end': ...}`` on a fridge door reads like a bug.
+
+    HARD rows only, and only the ones this domain displays — these sit under the
+    constraint chips and must line up with them one-for-one. The soft rows go out
+    separately as ``preferences``; a provenance list mixing "blocks your plan" with
+    "nudges your plan" would undo the distinction the two sections exist to draw.
     """
     rows: list[dict[str, Any]] = []
     for entry in applied or []:
+        if entry.get("enforcement") != "hard" or not entry.get("display", True):
+            continue
         rows.append(
             {
                 "id": entry.get("id", ""),
+                "kind": entry.get("kind", ""),
                 "label": entry.get("label", ""),
                 "value": _constraint_display(entry.get("kind", ""), entry.get("value")),
-                "enforcement": entry.get("enforcement", "soft"),
+                "enforcement": entry.get("enforcement", "hard"),
                 "source": entry.get("source", "account"),
                 "why": entry.get("why", ""),
             }
@@ -432,10 +457,16 @@ def interpret_goal(state: GraphState) -> GraphState:
                     "system",
                     "You are the GoalFlow cloud goal interpreter. Convert the user's natural-language "
                     "goal into a generic, domain-agnostic task intent. Do not invent safety constraints. "
-                    f"Real today is {today.isoformat()}; resolve phrases like this week, today, "
-                    "tomorrow, weekend, next week into time_window.start/end ISO dates relative to it. "
-                    "For actionable goals, the start date must be real today or later; interpret "
-                    "'this week' as the remaining week starting today. "
+                    f"Real today is {today.isoformat()} ({today.strftime('%A')}); resolve phrases like "
+                    "this week, today, tomorrow, weekend, next week into time_window.start/end ISO "
+                    "dates relative to it. For actionable goals, the start date must be real today "
+                    "or later; interpret 'this week' as the remaining week starting today.\n"
+                    "COUNT THE DAYS LITERALLY. 'tomorrow' is today+1, 'the day after tomorrow' is "
+                    "today+2, 'Thursday and Friday' is exactly those two dates and nothing between "
+                    "or around them. When the user names the days they will be away, the window is "
+                    "EXACTLY those days: start on the first, end on the last, and do not pad it — "
+                    "an away window is used to empty a plan, so an extra day is a dinner someone "
+                    "loses for no reason. "
                     "Keep scope flexible and generic for the device planner.\n\n"
                     "The connected device advertises exactly these capabilities:\n"
                     f"{digest}\n\n"
@@ -463,7 +494,18 @@ def interpret_goal(state: GraphState) -> GraphState:
                     "goal about the grocery BILL is the grocery shape, not the meal shape. "
                     "The device ROUTES on this value, so a mismatched shape loses its "
                     "handling. Coin a new short slug only when the goal is a KIND none of "
-                    "the advertised hints covers.",
+                    "the advertised hints covers.\n\n"
+                    "THE EDGE: this product runs a HOME. It acts on the fridge, the "
+                    "shopping, the appliances, the calendar and the home's security — "
+                    "things inside the house. A goal that happens to mention the house "
+                    "while actually being about the wider world is NOT actionable here: "
+                    "booking travel, flights, hotels or an itinerary; finding somewhere to "
+                    "live; money beyond the household shopping; work, health care or "
+                    "anything requiring a service this home does not have. Read the "
+                    "advertised hints as the whole of what is possible — if advancing the "
+                    "goal would need something not in that list, say so with "
+                    "actionable=false rather than picking the closest shape. Getting the "
+                    "HOUSE ready for a trip is in scope; planning the TRIP is not.",
                 ),
                 ("human", goal_text),
             ]
@@ -476,7 +518,7 @@ def interpret_goal(state: GraphState) -> GraphState:
             return {
                 "intent": {
                     "actionable": False,
-                    "decline_reason": "not an actionable meal or guest-dinner goal",
+                    "decline_reason": "I could not make sense of that as something this home can do",
                     "domain": "",
                     "objective": goal_text,
                     "time_window": {},
@@ -519,6 +561,35 @@ def interpret_goal(state: GraphState) -> GraphState:
         }
 
 
+def _align_away_window(resolved: dict[str, Any], intent: dict[str, Any]) -> None:
+    """Make the away window mean the days the user actually SAID (v7). In place.
+
+    THE STORE SAYS THERE IS ONE; THE GOAL SAYS WHEN. The seeded entry is what declares
+    that this kind of goal has an away window at all and where the fact comes from — the
+    same R3 split as everywhere else, with policy naming the kind and the world supplying
+    the value. Its seeded offsets are a placeholder, and using them would put the demo in
+    the position of saying "Thursday and Friday" while the system quietly held a
+    different week.
+
+    Only ever narrows what already resolved: a domain with no away window does not gain
+    one here, so this cannot invent a household-wide block out of a goal's phrasing.
+    """
+    window = (resolved.get("hard") or {}).get("away_window")
+    if not isinstance(window, dict):
+        return
+    stated = intent.get("time_window") or {}
+    start, end = stated.get("start"), stated.get("end")
+    if not (start and end):
+        return
+    resolved["hard"]["away_window"] = {"start": start, "end": end}
+    if isinstance(resolved.get("hard_display"), dict) and "away_window" in resolved["hard_display"]:
+        resolved["hard_display"]["away_window"] = {"start": start, "end": end}
+    for row in resolved.get("applied") or []:
+        if row.get("kind") == "away_window":
+            row["value"] = {"start": start, "end": end}
+    logger.info("away_window_aligned start=%s end=%s", start, end)
+
+
 def load_memory(state: GraphState) -> GraphState:
     """Memory & Constraints: resolve the household constraint store FOR THIS GOAL.
 
@@ -539,10 +610,15 @@ def load_memory(state: GraphState) -> GraphState:
 
     soft_ids = _relevant_soft_ids(state, profile, domain, today)
     resolved = resolve_constraints(profile, domain, today=today, soft_ids=soft_ids)
+    _align_away_window(resolved, state.get("intent") or {})
 
     memory = {
         "family_id": profile.get("family_id"),
         "hard": resolved["hard"],
+        # v7, DISPLAY ONLY and never dispatched: `hard` minus what this domain has no
+        # reason to show. The two are kept apart deliberately — see store.py. Anything
+        # that builds a contract reads `hard`; anything that builds a card reads this.
+        "hard_display": resolved["hard_display"],
         "bias": {
             "members": list(profile.get("members", [])),
             "soft": resolved["soft"],
@@ -638,8 +714,14 @@ def _relevant_soft_ids(
                     "and leave out the ones that would only add noise: a vacation checklist "
                     "does not need the family's dinner preferences, and a meal plan does not "
                     "need the departure routine. Household notes about who is busy when are "
-                    "usually worth keeping. Prefer a few good ones over all of them; return "
-                    "no ids at all rather than padding the list.",
+                    "usually worth keeping.\n\n"
+                    "BE SPARING. Each id you return becomes a row on the confirmation card that "
+                    "the user reads before approving, so a preference that is merely NOT WRONG "
+                    "still costs them a line. Every candidate carries `applies_to`: an entry "
+                    "tagged for this domain is the default answer, and one tagged only for "
+                    "OTHER domains needs a real reason — the household tagged it that way on "
+                    "purpose. Two or three good ids beat six plausible ones, and returning no "
+                    "ids at all is better than padding the list.",
                 ),
                 (
                     "human",
@@ -1055,11 +1137,17 @@ def present_understanding(state: GraphState) -> GraphState:
         "domain": domain,
         "time_window": intent.get("time_window") or {},
         "hard": hard,
-        "knew": _hard_knew(hard),
+        # DISPLAY block, not the dispatched one — the card shows what this goal can
+        # actually trip; `hard` (above, and what build_contract copies) is unchanged.
+        "knew": _hard_knew(memory.get("hard_display") or hard),
         # v6 provenance, additive: WHERE each constraint came from and why it was
         # picked for this goal. `knew` stays exactly as it was, so no UI has to
         # change to ship this — the chips keep working and this rides alongside.
         "constraints": _applied_constraints(memory.get("applied")),
+        # v7, additive: the soft half, one row per entry. Preferences shape the plan
+        # and never gate it, so they are a separate field rather than more chips —
+        # the UI has to be able to render them as the lighter thing they are.
+        "preferences": _applied_preferences(memory.get("applied")),
         # v6-M4, additive: rules the user stated in the same breath as the goal
         # ("plan our dinners — we've gone vegan"). Proposed here, applied only if
         # they come back accepted.
@@ -1096,12 +1184,14 @@ def present_understanding(state: GraphState) -> GraphState:
             memory = {
                 **memory,
                 "hard": resolved["hard"],
+                "hard_display": resolved["hard_display"],
                 "bias": {**memory.get("bias", {}), "soft": resolved["soft"], "context": resolved["context"]},
                 "applied": resolved["applied"],
             }
             understanding["hard"] = resolved["hard"]
-            understanding["knew"] = _hard_knew(resolved["hard"])
+            understanding["knew"] = _hard_knew(resolved["hard_display"])
             understanding["constraints"] = _applied_constraints(resolved["applied"])
+            understanding["preferences"] = _applied_preferences(resolved["applied"])
             logger.info("captured_constraints_applied goal=%s ids=%s",
                         state.get("goal_id"), [entry["id"] for entry in written])
     logger.info("graph_node_exit node=present_understanding confirmed=%s", confirmed)
