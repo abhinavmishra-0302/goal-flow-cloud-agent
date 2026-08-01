@@ -503,6 +503,27 @@ class ConnectionRegistry:
         if cp and cp.get("goal_id") == goal_id:
             cp["understanding"] = frame
 
+    def resolve_understanding(self, device_id: str, goal_id: str) -> None:
+        """The gate has been ANSWERED — stop replaying it.
+
+        WHY THIS EXISTS. The cache held the understanding from the moment it was sent
+        until a plan replaced it, and a confirmed gate did not count as replacing it. So
+        for the whole of planning — 60-180s, the longest stretch of the run — any chat
+        socket that reconnected was replayed the confirmation card the user had already
+        answered, and the webview jumped back to a gate that was settled. Reported from a
+        Tizen Hub, where the webview and the network drop far more readily than on a dev
+        box and planning takes longer; the same code did it everywhere, the dev box just
+        never gave it the reconnect it needed.
+
+        Clearing it (rather than marking it) is deliberate: a reconnect during planning
+        should rejoin the WORK, and ``chat_ui_open`` alone puts the surface exactly there,
+        with the live agent_event stream filling the engines back in within a beat.
+        """
+        session = self._sessions.get(device_id)
+        cp = session.create_phase if session else None
+        if cp and cp.get("goal_id") == goal_id:
+            cp["understanding"] = None
+
     def capture_present_plan(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> None:
         """Cache the present_plan frame as broadcast (create-phase goal only)."""
         session = self._sessions.get(device_id)
@@ -1053,6 +1074,10 @@ async def handle_understanding_response(device_id: str, response: UnderstandingR
         logger.info("understanding_response_dedupe_drop goal_id=%s", response.goal_id)
         return
     resolved_understandings.add(response.goal_id)
+    # ...and the REPLAY cache has to learn it too, or a webview that reconnects during
+    # planning is handed back the gate it just answered. Done here, before the graph is
+    # resumed, because the reconnect can happen at any point from now on.
+    registry.resolve_understanding(device_id, response.goal_id)
 
     confirmed = response.payload.confirmed
     async with goal_lock(response.goal_id):

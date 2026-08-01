@@ -111,6 +111,47 @@ async def run() -> None:
     check(registry._session(dev).create_phase.get("notice") is None,
           "a notice for a superseded goal does not land in the current phase's cache")
 
+    # --- 4b. AN ANSWERED GATE IS NEVER REPLAYED. ---
+    #
+    # The bug this pins: the understanding stayed cached from the moment it was sent
+    # until a plan replaced it, and confirming the gate did not count as replacing it.
+    # Planning is the longest stretch of the run, so any webview that reconnected during
+    # it was handed back the confirmation card the user had already answered — the
+    # surface jumping from "working" to a settled gate. Seen on a Tizen Hub, where the
+    # webview drops far more readily than on a dev box; the code did it everywhere.
+    registry.open_create_phase(dev, "g-meal", "Plan my weekly meal.")
+    understanding = {"type": "understanding", "goal_id": "g-meal", "payload": {"objective": "…"}}
+    registry.capture_understanding(dev, "g-meal", understanding)
+
+    before = FakeSocket()
+    await registry._replay_create_phase(before, registry._session(dev).create_phase)
+    check("understanding" in before.types(),
+          f"BEFORE the gate is answered, a reconnect still gets it — got {before.types()}")
+
+    registry.resolve_understanding(dev, "g-meal")
+    during = FakeSocket()
+    await registry._replay_create_phase(during, registry._session(dev).create_phase)
+    check("understanding" not in during.types(),
+          f"once ANSWERED it is never replayed — got {during.types()}")
+    check(during.types() == ["chat_ui_open"],
+          f"a mid-planning reconnect rejoins the WORK, nothing else — got {during.types()}")
+
+    # ...and the plan still reaches a socket that binds later, or the fix would have
+    # traded a stale gate for a webview that never catches up at all.
+    plan = {"type": "present_plan", "goal_id": "g-meal", "payload": {"plan": []}}
+    registry.capture_present_plan(dev, "g-meal", plan)
+    after = FakeSocket()
+    await registry._replay_create_phase(after, registry._session(dev).create_phase)
+    check(after.types() == ["chat_ui_open", "present_plan"],
+          f"the finished plan is still replayed — got {after.types()}")
+
+    # Resolving a goal that is NOT the create-phase goal must not blank the live one.
+    registry.open_create_phase(dev, "g-other", "Something else.")
+    registry.capture_understanding(dev, "g-other", {"type": "understanding", "goal_id": "g-other"})
+    registry.resolve_understanding(dev, "g-meal")
+    check(registry._session(dev).create_phase.get("understanding") is not None,
+          "resolving a superseded goal's gate leaves the CURRENT goal's gate cached")
+
     # --- 5. CLOSING THE BRACKET DROPS IT. ---
     #
     # Otherwise a webview that binds later — for any reason — is shown a refusal to a
