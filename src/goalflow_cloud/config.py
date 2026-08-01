@@ -39,7 +39,7 @@ class Settings:
     openrouter_max_tokens: int = field(
         default_factory=lambda: int(os.getenv("OPENROUTER_MAX_TOKENS", "2500"))
     )
-    #: v8 — ordered OpenRouter provider preference, e.g. "cerebras,groq". Empty = send no
+    #: v8 — ordered OpenRouter provider preference, e.g. "cerebras". Empty = send no
     #: `provider` field at all, which is what every offline gate assumes.
     #:
     #: WHY THIS EXISTS (measured, v8-M0): with no `provider` field OpenRouter load-balances
@@ -50,9 +50,11 @@ class Settings:
     openrouter_provider_order: str = field(
         default_factory=lambda: os.getenv("OPENROUTER_PROVIDER_ORDER", "")
     )
-    #: Only read when the order is set. Defaults TRUE deliberately: `false` turns "prefer
-    #: these providers" into "these providers or a 404", and a goal interpreted by Groq
-    #: instead of Cerebras is a demo that ran.
+    #: Only read when the order is set. The MECHANISM defaults true, but the demo ships it
+    #: FALSE, and the measurement is why: on the real pipeline Cerebras plans a goal in
+    #: 8-10s and the next-best provider takes 203-234s — slower than sending no preference
+    #: at all. A fallback here is not graceful degradation, it is a silent four-minute
+    #: stall, so a run that cannot have Cerebras should fail visibly and be re-run.
     openrouter_provider_allow_fallbacks: bool = field(
         default_factory=lambda: os.getenv("OPENROUTER_PROVIDER_ALLOW_FALLBACKS", "").strip().lower()
         != "false"
