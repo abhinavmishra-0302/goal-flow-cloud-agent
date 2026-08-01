@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from operator import add
@@ -118,6 +120,26 @@ def build_chat(*, max_tokens: int, timeout: int, max_retries: int, temperature: 
         kwargs["reasoning_effort"] = effort
 
     return ChatOpenAI(**kwargs)
+
+
+@contextmanager
+def timed_llm(site: str):
+    """Time one cloud LLM call and say so.
+
+    The cloud had NO duration instrumentation of any kind: the only way to tell which of the
+    four interpretation-window calls was the slow one was to subtract ``ts=`` between
+    ``graph_node_enter``/``graph_node_exit`` lines — and ``present_understanding`` has no exit
+    line until the human answers the gate, so its call was invisible entirely. That is a poor
+    position to profile from, and it is how a routing default went unnoticed for eight
+    versions.
+
+    Logged even when the call raises, because a call that fails slowly is the interesting one.
+    """
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.info("llm_call site=%s elapsed_ms=%d", site, (time.perf_counter() - started) * 1000)
 
 
 def describe_routing() -> str:
@@ -434,25 +456,26 @@ def _understanding_thought(intent: dict[str, Any], hard: dict[str, Any], domain:
     thought_tokens = min(max_tokens, 60) if isinstance(max_tokens, int) and max_tokens > 0 else 60
     try:
         llm = build_chat(max_tokens=thought_tokens, timeout=15, max_retries=0, temperature=0.2)
-        response = llm.invoke(
-            [
-                (
-                    "system",
-                    "Write one short sentence describing how GoalFlow will approach the user's goal. "
-                    "Keep it under 22 words. Do not mention internal systems or uncertainty.",
-                ),
-                (
-                    "human",
-                    "Objective: {objective}\nDomain: {domain}\nTime window: {time_window}\n"
-                    "Hard constraints: {hard}".format(
-                        objective=intent.get("objective", ""),
-                        domain=domain,
-                        time_window=intent.get("time_window") or {},
-                        hard=hard,
+        with timed_llm("thought"):
+            response = llm.invoke(
+                [
+                    (
+                        "system",
+                        "Write one short sentence describing how GoalFlow will approach the user's goal. "
+                        "Keep it under 22 words. Do not mention internal systems or uncertainty.",
                     ),
-                ),
-            ]
-        )
+                    (
+                        "human",
+                        "Objective: {objective}\nDomain: {domain}\nTime window: {time_window}\n"
+                        "Hard constraints: {hard}".format(
+                            objective=intent.get("objective", ""),
+                            domain=domain,
+                            time_window=intent.get("time_window") or {},
+                            hard=hard,
+                        ),
+                    ),
+                ]
+            )
         thought = " ".join(str(getattr(response, "content", "") or "").split())
         if len(thought) > 180:
             thought = thought[:177].rstrip() + "..."
@@ -513,65 +536,66 @@ def interpret_goal(state: GraphState) -> GraphState:
             max_tokens=settings.openrouter_max_tokens, timeout=45, max_retries=1, temperature=0
         )
         structured_llm = llm.with_structured_output(InterpretedIntent, method="function_calling")
-        intent = structured_llm.invoke(
-            [
-                (
-                    "system",
-                    "You are the GoalFlow cloud goal interpreter. Convert the user's natural-language "
-                    "goal into a generic, domain-agnostic task intent. Do not invent safety constraints. "
-                    f"Real today is {today.isoformat()} ({today.strftime('%A')}); resolve phrases like "
-                    "this week, today, tomorrow, weekend, next week into time_window.start/end ISO "
-                    "dates relative to it. For actionable goals, the start date must be real today "
-                    "or later; interpret 'this week' as the remaining week starting today.\n"
-                    "COUNT THE DAYS LITERALLY. 'tomorrow' is today+1, 'the day after tomorrow' is "
-                    "today+2, 'Thursday and Friday' is exactly those two dates and nothing between "
-                    "or around them. When the user names the days they will be away, the window is "
-                    "EXACTLY those days: start on the first, end on the last, and do not pad it — "
-                    "an away window is used to empty a plan, so an extra day is a dinner someone "
-                    "loses for no reason. "
-                    "Keep scope flexible and generic for the device planner.\n\n"
-                    "The connected device advertises exactly these capabilities:\n"
-                    f"{digest}\n\n"
-                    "Set actionable=true if the goal can plausibly be ADVANCED using them, "
-                    "and fill time_window. Judge the goal against the capability list, not "
-                    "against any fixed list of topics. Whether an action is PERMITTED is not "
-                    "your call — the device decides that and gives a better answer than you "
-                    "could; your question is only whether this is the kind of thing this "
-                    "product is for. If nothing it can do relates to the goal — general "
-                    "questions, trivia, facts, chit-chat, unrelated tasks — set "
-                    "actionable=false, put one short reason in decline_reason, and you may "
-                    "leave time_window empty.\n\n"
-                    "ALWAYS respond by calling the structured "
-                    "function — never answer the user's question directly in prose, even "
-                    "for out-of-scope goals (call it with actionable=false instead).\n\n"
-                    "DOMAIN: set `domain` to the advertised goal-shape id whose HINT best "
-                    "matches the KIND of goal — read what the goal is ABOUT, not which id "
-                    "is listed first. E.g. a birthday/party → the party shape; a trip or "
-                    "being away from home → the vacation/away shape; hosting guests for a "
-                    "dinner → the guest-dinner shape; planning the week's dinners → the "
-                    "meal shape; cutting the electricity/power bill or shifting appliance "
-                    "usage → the energy shape; keeping the kitchen stocked or spending less "
-                    "on groceries → the grocery shape. Do NOT default to meal planning — use "
-                    "the meal shape ONLY when the goal is genuinely about planning meals; a "
-                    "goal about the grocery BILL is the grocery shape, not the meal shape. "
-                    "The device ROUTES on this value, so a mismatched shape loses its "
-                    "handling. Coin a new short slug only when the goal is a KIND none of "
-                    "the advertised hints covers.\n\n"
-                    "THE EDGE: this product runs a HOME. It acts on the fridge, the "
-                    "shopping, the appliances, the calendar and the home's security — "
-                    "things inside the house. A goal that happens to mention the house "
-                    "while actually being about the wider world is NOT actionable here: "
-                    "booking travel, flights, hotels or an itinerary; finding somewhere to "
-                    "live; money beyond the household shopping; work, health care or "
-                    "anything requiring a service this home does not have. Read the "
-                    "advertised hints as the whole of what is possible — if advancing the "
-                    "goal would need something not in that list, say so with "
-                    "actionable=false rather than picking the closest shape. Getting the "
-                    "HOUSE ready for a trip is in scope; planning the TRIP is not.",
-                ),
-                ("human", goal_text),
-            ]
-        )
+        with timed_llm("interpret"):
+            intent = structured_llm.invoke(
+                [
+                    (
+                        "system",
+                        "You are the GoalFlow cloud goal interpreter. Convert the user's natural-language "
+                        "goal into a generic, domain-agnostic task intent. Do not invent safety constraints. "
+                        f"Real today is {today.isoformat()} ({today.strftime('%A')}); resolve phrases like "
+                        "this week, today, tomorrow, weekend, next week into time_window.start/end ISO "
+                        "dates relative to it. For actionable goals, the start date must be real today "
+                        "or later; interpret 'this week' as the remaining week starting today.\n"
+                        "COUNT THE DAYS LITERALLY. 'tomorrow' is today+1, 'the day after tomorrow' is "
+                        "today+2, 'Thursday and Friday' is exactly those two dates and nothing between "
+                        "or around them. When the user names the days they will be away, the window is "
+                        "EXACTLY those days: start on the first, end on the last, and do not pad it — "
+                        "an away window is used to empty a plan, so an extra day is a dinner someone "
+                        "loses for no reason. "
+                        "Keep scope flexible and generic for the device planner.\n\n"
+                        "The connected device advertises exactly these capabilities:\n"
+                        f"{digest}\n\n"
+                        "Set actionable=true if the goal can plausibly be ADVANCED using them, "
+                        "and fill time_window. Judge the goal against the capability list, not "
+                        "against any fixed list of topics. Whether an action is PERMITTED is not "
+                        "your call — the device decides that and gives a better answer than you "
+                        "could; your question is only whether this is the kind of thing this "
+                        "product is for. If nothing it can do relates to the goal — general "
+                        "questions, trivia, facts, chit-chat, unrelated tasks — set "
+                        "actionable=false, put one short reason in decline_reason, and you may "
+                        "leave time_window empty.\n\n"
+                        "ALWAYS respond by calling the structured "
+                        "function — never answer the user's question directly in prose, even "
+                        "for out-of-scope goals (call it with actionable=false instead).\n\n"
+                        "DOMAIN: set `domain` to the advertised goal-shape id whose HINT best "
+                        "matches the KIND of goal — read what the goal is ABOUT, not which id "
+                        "is listed first. E.g. a birthday/party → the party shape; a trip or "
+                        "being away from home → the vacation/away shape; hosting guests for a "
+                        "dinner → the guest-dinner shape; planning the week's dinners → the "
+                        "meal shape; cutting the electricity/power bill or shifting appliance "
+                        "usage → the energy shape; keeping the kitchen stocked or spending less "
+                        "on groceries → the grocery shape. Do NOT default to meal planning — use "
+                        "the meal shape ONLY when the goal is genuinely about planning meals; a "
+                        "goal about the grocery BILL is the grocery shape, not the meal shape. "
+                        "The device ROUTES on this value, so a mismatched shape loses its "
+                        "handling. Coin a new short slug only when the goal is a KIND none of "
+                        "the advertised hints covers.\n\n"
+                        "THE EDGE: this product runs a HOME. It acts on the fridge, the "
+                        "shopping, the appliances, the calendar and the home's security — "
+                        "things inside the house. A goal that happens to mention the house "
+                        "while actually being about the wider world is NOT actionable here: "
+                        "booking travel, flights, hotels or an itinerary; finding somewhere to "
+                        "live; money beyond the household shopping; work, health care or "
+                        "anything requiring a service this home does not have. Read the "
+                        "advertised hints as the whole of what is possible — if advancing the "
+                        "goal would need something not in that list, say so with "
+                        "actionable=false rather than picking the closest shape. Getting the "
+                        "HOUSE ready for a trip is in scope; planning the TRIP is not.",
+                    ),
+                    ("human", goal_text),
+                ]
+            )
         if intent is None:
             # The model replied in free text instead of returning structured intent —
             # it treated the input as a question/chit-chat, not an actionable goal.
@@ -757,36 +781,37 @@ def _relevant_soft_ids(
     try:
         llm = build_chat(max_tokens=selection_tokens, timeout=20, max_retries=0, temperature=0)
         structured_llm = llm.with_structured_output(_SoftSelection, method="function_calling")
-        selection = structured_llm.invoke(
-            [
-                (
-                    "system",
-                    "You pick which household PREFERENCES are worth sending with a goal. "
-                    "These are soft biases, never safety rules — you are not deciding what is "
-                    "allowed, only what is relevant.\n\n"
-                    "Return the ids that would make a planner's output better for THIS goal, "
-                    "and leave out the ones that would only add noise: a vacation checklist "
-                    "does not need the family's dinner preferences, and a meal plan does not "
-                    "need the departure routine. Household notes about who is busy when are "
-                    "usually worth keeping.\n\n"
-                    "BE SPARING. Each id you return becomes a row on the confirmation card that "
-                    "the user reads before approving, so a preference that is merely NOT WRONG "
-                    "still costs them a line. Every candidate carries `applies_to`: an entry "
-                    "tagged for this domain is the default answer, and one tagged only for "
-                    "OTHER domains needs a real reason — the household tagged it that way on "
-                    "purpose. Two or three good ids beat six plausible ones, and returning no "
-                    "ids at all is better than padding the list.",
-                ),
-                (
-                    "human",
-                    "Goal: {objective}\nDomain: {domain}\n\nCandidates (JSON):\n{candidates}".format(
-                        objective=intent.get("objective") or state.get("goal_text", ""),
-                        domain=domain or "(none)",
-                        candidates=candidates,
+        with timed_llm("soft_select"):
+            selection = structured_llm.invoke(
+                [
+                    (
+                        "system",
+                        "You pick which household PREFERENCES are worth sending with a goal. "
+                        "These are soft biases, never safety rules — you are not deciding what is "
+                        "allowed, only what is relevant.\n\n"
+                        "Return the ids that would make a planner's output better for THIS goal, "
+                        "and leave out the ones that would only add noise: a vacation checklist "
+                        "does not need the family's dinner preferences, and a meal plan does not "
+                        "need the departure routine. Household notes about who is busy when are "
+                        "usually worth keeping.\n\n"
+                        "BE SPARING. Each id you return becomes a row on the confirmation card that "
+                        "the user reads before approving, so a preference that is merely NOT WRONG "
+                        "still costs them a line. Every candidate carries `applies_to`: an entry "
+                        "tagged for this domain is the default answer, and one tagged only for "
+                        "OTHER domains needs a real reason — the household tagged it that way on "
+                        "purpose. Two or three good ids beat six plausible ones, and returning no "
+                        "ids at all is better than padding the list.",
                     ),
-                ),
-            ]
-        )
+                    (
+                        "human",
+                        "Goal: {objective}\nDomain: {domain}\n\nCandidates (JSON):\n{candidates}".format(
+                            objective=intent.get("objective") or state.get("goal_text", ""),
+                            domain=domain or "(none)",
+                            candidates=candidates,
+                        ),
+                    ),
+                ]
+            )
         ids = [str(i) for i in (getattr(selection, "ids", None) or []) if str(i).strip()]
         known = {entry["id"] for entry in candidates}
         # Drop hallucinated ids rather than letting them silently select nothing —
@@ -889,38 +914,39 @@ def detect_constraints(state: GraphState) -> GraphState:
     try:
         llm = build_chat(max_tokens=capture_tokens, timeout=20, max_retries=0, temperature=0)
         structured_llm = llm.with_structured_output(_CaptureResult, method="function_calling")
-        result = structured_llm.invoke(
-            [
-                (
-                    "system",
-                    "You spot HOUSEHOLD RULES a person states in passing, so a home assistant can "
-                    "remember them instead of asking again next week.\n\n"
-                    "FIRST answer statement_only: does this message ask for ANYTHING to be done, "
-                    "arranged or got ready? If it asks for nothing and merely states a fact about "
-                    "the household, statement_only is TRUE — \"we've gone vegan\", \"Aarav is "
-                    "allergic to peanuts\", \"no dairy for two weeks\" are all statement_only. If "
-                    "it asks for something, even indirectly (\"plan our dinners\", \"get the house "
-                    "ready, we're away next week\"), statement_only is FALSE — the facts in it are "
-                    "context for a job that was requested.\n\n"
-                    f"Real today is {today.isoformat()}.\n\n"
-                    "Return a constraint ONLY for a standing fact or rule about the household: a diet "
-                    "('we've gone vegan', 'no dairy for a month'), an allergy, a medical restriction, a "
-                    "spending limit ('keep the party under $150'), a strong preference or routine.\n\n"
-                    "Return NOTHING for an ordinary goal or request. 'Plan our dinners this week' states "
-                    "no rule — it is just the job. Most messages produce no constraints, and that is the "
-                    "correct answer; inventing one puts words in the family's mouth.\n\n"
-                    "NEVER propose removing, relaxing or raising an existing rule. 'We can eat pork "
-                    "again' and 'raise the budget to $900' are not constraints — return nothing for "
-                    "them. You may only ever propose something MORE restrictive.\n\n"
-                    "enforcement='hard' only for allergens, dietary, medical and budget_cap — things a "
-                    "plan must be BLOCKED for violating. Preferences, dislikes and routines are 'soft'.\n"
-                    "Set expires_on only when the user time-boxed it, resolved to an ISO date.\n"
-                    "quote must be the user's own words, short and verbatim.\n\n"
-                    f"{scope_hint}{statement_hint}",
-                ),
-                ("human", goal_text),
-            ]
-        )
+        with timed_llm("detect_constraints"):
+            result = structured_llm.invoke(
+                [
+                    (
+                        "system",
+                        "You spot HOUSEHOLD RULES a person states in passing, so a home assistant can "
+                        "remember them instead of asking again next week.\n\n"
+                        "FIRST answer statement_only: does this message ask for ANYTHING to be done, "
+                        "arranged or got ready? If it asks for nothing and merely states a fact about "
+                        "the household, statement_only is TRUE — \"we've gone vegan\", \"Aarav is "
+                        "allergic to peanuts\", \"no dairy for two weeks\" are all statement_only. If "
+                        "it asks for something, even indirectly (\"plan our dinners\", \"get the house "
+                        "ready, we're away next week\"), statement_only is FALSE — the facts in it are "
+                        "context for a job that was requested.\n\n"
+                        f"Real today is {today.isoformat()}.\n\n"
+                        "Return a constraint ONLY for a standing fact or rule about the household: a diet "
+                        "('we've gone vegan', 'no dairy for a month'), an allergy, a medical restriction, a "
+                        "spending limit ('keep the party under $150'), a strong preference or routine.\n\n"
+                        "Return NOTHING for an ordinary goal or request. 'Plan our dinners this week' states "
+                        "no rule — it is just the job. Most messages produce no constraints, and that is the "
+                        "correct answer; inventing one puts words in the family's mouth.\n\n"
+                        "NEVER propose removing, relaxing or raising an existing rule. 'We can eat pork "
+                        "again' and 'raise the budget to $900' are not constraints — return nothing for "
+                        "them. You may only ever propose something MORE restrictive.\n\n"
+                        "enforcement='hard' only for allergens, dietary, medical and budget_cap — things a "
+                        "plan must be BLOCKED for violating. Preferences, dislikes and routines are 'soft'.\n"
+                        "Set expires_on only when the user time-boxed it, resolved to an ISO date.\n"
+                        "quote must be the user's own words, short and verbatim.\n\n"
+                        f"{scope_hint}{statement_hint}",
+                    ),
+                    ("human", goal_text),
+                ]
+            )
         proposed = [c.model_dump(mode="json") for c in (getattr(result, "constraints", None) or [])]
         proposed = [c for c in proposed if _capture_is_sane(c)]
         proposed = _dedupe_captures(proposed)
