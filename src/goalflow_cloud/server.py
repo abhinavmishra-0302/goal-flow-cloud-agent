@@ -1571,3 +1571,7 @@ async def graph_resume_monitor(goal_id: str, frame: dict[str, Any]) -> None:
 
 
 setup_logging()
+
+# Always logged, on its own line: which provider serves a run is the difference between a
+# 1.5s call and a 50s one, and "why was that run slow" is unanswerable without it.
+logger.info("llm_routing %s model=%s", graph_nodes.describe_routing(), get_settings().openrouter_model)

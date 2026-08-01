@@ -55,6 +55,84 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# The one place a cloud LLM client is built
+# ---------------------------------------------------------------------------
+
+#: One shared HTTP client for every OpenRouter call in the process.
+#:
+#: Each of the four interpretation-window calls used to construct its own ``ChatOpenAI``,
+#: and therefore its own ``httpx.Client`` — so a single goal paid FOUR separate TCP+TLS
+#: handshakes to openrouter.ai, and pooled nothing across goals either. Created lazily so
+#: importing this module never opens a socket (the offline gates import it constantly).
+_http_client: Any = None
+
+
+def _shared_http_client() -> Any:
+    global _http_client
+    if _http_client is None:
+        import httpx
+
+        _http_client = httpx.Client(
+            # Matches the longest per-call timeout below; the caller's own `timeout` is what
+            # actually bounds each request. This is only the backstop.
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+        )
+    return _http_client
+
+
+def build_chat(*, max_tokens: int, timeout: int, max_retries: int, temperature: float) -> ChatOpenAI:
+    """Build a ChatOpenAI for one cloud call site.
+
+    Carries the v8 routing: OpenRouter ``provider`` preference via ``extra_body`` and an
+    optional ``reasoning_effort``. Both are **omitted entirely** when unset, so the request
+    body is byte-identical to v7 — which is what lets every offline gate keep passing.
+
+    See ``config.openrouter_provider_order`` for why pinning matters (measured: 50.1s
+    unpinned vs 1.5s pinned for the same work) and ``openrouter_reasoning_effort`` for why
+    the effort knob ships switched off.
+    """
+    settings = get_settings()
+    kwargs: dict[str, Any] = {
+        "model": settings.openrouter_model,
+        "api_key": settings.openrouter_api_key,
+        "base_url": settings.openrouter_base_url,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "timeout": timeout,
+        "max_retries": max_retries,
+        "http_client": _shared_http_client(),
+    }
+
+    order = [p.strip() for p in settings.openrouter_provider_order.split(",") if p.strip()]
+    if order:
+        kwargs["extra_body"] = {
+            "provider": {
+                "order": order,
+                "allow_fallbacks": settings.openrouter_provider_allow_fallbacks,
+            }
+        }
+
+    effort = settings.openrouter_reasoning_effort.strip().lower()
+    if effort:
+        kwargs["reasoning_effort"] = effort
+
+    return ChatOpenAI(**kwargs)
+
+
+def describe_routing() -> str:
+    """One line for startup logging: what every cloud call will actually send."""
+    settings = get_settings()
+    order = [p.strip() for p in settings.openrouter_provider_order.split(",") if p.strip()]
+    if not order and not settings.openrouter_reasoning_effort.strip():
+        return "off"
+    provider = (
+        f"{order} allow_fallbacks={settings.openrouter_provider_allow_fallbacks}" if order else "-"
+    )
+    return f"provider={provider} reasoning_effort={settings.openrouter_reasoning_effort or '-'}"
+
+
+# ---------------------------------------------------------------------------
 # State schema
 # ---------------------------------------------------------------------------
 
@@ -355,15 +433,7 @@ def _understanding_thought(intent: dict[str, Any], hard: dict[str, Any], domain:
     max_tokens = settings.openrouter_max_tokens
     thought_tokens = min(max_tokens, 60) if isinstance(max_tokens, int) and max_tokens > 0 else 60
     try:
-        llm = ChatOpenAI(
-            model=settings.openrouter_model,
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-            temperature=0.2,
-            max_tokens=thought_tokens,
-            timeout=15,
-            max_retries=0,
-        )
+        llm = build_chat(max_tokens=thought_tokens, timeout=15, max_retries=0, temperature=0.2)
         response = llm.invoke(
             [
                 (
@@ -437,18 +507,10 @@ def interpret_goal(state: GraphState) -> GraphState:
     settings = get_settings()
     today = date.today()
     try:
-        llm = ChatOpenAI(
-            model=settings.openrouter_model,
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-            temperature=0,
-            # Cap the token reservation. Interpreting a goal into a small
-            # structured intent needs little; leaving this unset makes OpenRouter
-            # reserve the model max (~65k), which a low-credit key can't afford
-            # (HTTP 402). Configurable via OPENROUTER_MAX_TOKENS.
-            max_tokens=settings.openrouter_max_tokens,
-            timeout=45,
-            max_retries=1,
+        # max_tokens caps the RESERVATION: left unset OpenRouter reserves the model max
+        # (~65k) and a low-credit key hits HTTP 402. Configurable via OPENROUTER_MAX_TOKENS.
+        llm = build_chat(
+            max_tokens=settings.openrouter_max_tokens, timeout=45, max_retries=1, temperature=0
         )
         structured_llm = llm.with_structured_output(InterpretedIntent, method="function_calling")
         intent = structured_llm.invoke(
@@ -693,15 +755,7 @@ def _relevant_soft_ids(
     # A relevance pass that silently never runs is worse than not having one.
     selection_tokens = min(max_tokens, 1200) if isinstance(max_tokens, int) and max_tokens > 0 else 1200
     try:
-        llm = ChatOpenAI(
-            model=settings.openrouter_model,
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-            temperature=0,
-            max_tokens=selection_tokens,
-            timeout=20,
-            max_retries=0,
-        )
+        llm = build_chat(max_tokens=selection_tokens, timeout=20, max_retries=0, temperature=0)
         structured_llm = llm.with_structured_output(_SoftSelection, method="function_calling")
         selection = structured_llm.invoke(
             [
@@ -833,15 +887,7 @@ def detect_constraints(state: GraphState) -> GraphState:
         else "There is no goal here, only a statement: use scope='household' and applies_to=['*']."
     )
     try:
-        llm = ChatOpenAI(
-            model=settings.openrouter_model,
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-            temperature=0,
-            max_tokens=capture_tokens,
-            timeout=20,
-            max_retries=0,
-        )
+        llm = build_chat(max_tokens=capture_tokens, timeout=20, max_retries=0, temperature=0)
         structured_llm = llm.with_structured_output(_CaptureResult, method="function_calling")
         result = structured_llm.invoke(
             [

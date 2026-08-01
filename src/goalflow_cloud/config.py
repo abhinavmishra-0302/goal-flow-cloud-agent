@@ -39,6 +39,35 @@ class Settings:
     openrouter_max_tokens: int = field(
         default_factory=lambda: int(os.getenv("OPENROUTER_MAX_TOKENS", "2500"))
     )
+    #: v8 — ordered OpenRouter provider preference, e.g. "cerebras,groq". Empty = send no
+    #: `provider` field at all, which is what every offline gate assumes.
+    #:
+    #: WHY THIS EXISTS (measured, v8-M0): with no `provider` field OpenRouter load-balances
+    #: across nineteen endpoints whose throughput spans 39x, and it kept landing us on the
+    #: slowest tier — CoreWeave at 52 tok/s and Novita at 76, against Cerebras at 1523. The
+    #: same compose-shaped task took 50.1s unpinned and 1.5s pinned. The interpretation
+    #: window was never really a prompt problem; it was a routing default nobody had set.
+    openrouter_provider_order: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_PROVIDER_ORDER", "")
+    )
+    #: Only read when the order is set. Defaults TRUE deliberately: `false` turns "prefer
+    #: these providers" into "these providers or a 404", and a goal interpreted by Groq
+    #: instead of Cerebras is a demo that ran.
+    openrouter_provider_allow_fallbacks: bool = field(
+        default_factory=lambda: os.getenv("OPENROUTER_PROVIDER_ALLOW_FALLBACKS", "").strip().lower()
+        != "false"
+    )
+    #: v8 — `reasoning_effort` for every cloud call. Empty = never send it, which is the
+    #: shipped default.
+    #:
+    #: DO NOT SET THIS TO "low" WITHOUT RE-MEASURING. v8-M0 benchmarked it on every
+    #: provider: reasoning tokens collapse from ~1400 to 26-89 and the model stops being
+    #: able to do the job — every `low` run returned an unusable result. And there is
+    #: nothing to win, because `medium` and the provider default are within 0.2s of each
+    #: other once the provider is fast. The knob is here for a future model, not this one.
+    openrouter_reasoning_effort: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_REASONING_EFFORT", "")
+    )
 
     # --- Household constraint store ---
     #: Where the household constraint store lives (v6). Empty = the repo's seed,
@@ -57,8 +86,14 @@ class Settings:
 
 
 def get_settings() -> Settings:
-    """Return process-wide settings.
+    """Return process-wide settings, re-read from the environment on every call.
 
-    TODO(v2-M1): cache (functools.lru_cache) once server startup wiring lands.
+    NOT CACHED, AND THE TODO THAT ASKED FOR IT IS WRONG. v8 tried ``lru_cache`` here — the
+    dataclass is rebuilt at every LLM call site, four times per goal — and it broke
+    ``verify_capture`` immediately: gates and tests set ``GOALFLOW_PROFILE_PATH`` (and the
+    OPENROUTER_* vars) *after* import and expect the next read to see them, which is also how
+    the demo's scratch-profile trick works. The saving is twelve ``os.getenv`` calls against a
+    round-trip measured in seconds; the cost is a whole class of "why is it still using the
+    seed" bugs. Cache this only behind explicit startup wiring that re-reads on change.
     """
     return Settings()
