@@ -1440,25 +1440,26 @@ async def relay_agent_event(device_id: str, event: AgentEvent) -> None:
     and pending count, derived by the DEVICE from its task DAG. The cloud cannot
     compute those — only the device can ground a decomposition — so this is the one
     place the board's numbers can come from.
+
+    v8 — THIS NO LONGER MIRRORS THE STREAM INTO GRAPH STATE, and the numbers are why.
+    Every agent_event used to append itself to the graph's ``event_log`` through a
+    synchronous ``graph.update_state``: not wrapped in ``to_thread``, so on the event loop,
+    and placed *before* the relay below, so ahead of the UI. Because ``event_log``
+    accumulates, each write re-serialised the whole thing — measured on one goal thread,
+    2810 checkpoints growing 10 KB to 810 KB, **1.19 GB of synchronous SQLite for a single
+    goal**, and 6.84 GB across two days of runs.
+
+    All of it for a reader that does not exist. ``event_log`` was written in five places and
+    read in none; the only consumer ever planned is a ``TODO(v2-M1): summarize event_log for
+    the Trace/Explain surface`` in ``finalize``, which was never built. The node-level
+    entries stay — they are bounded, and ``finalize``'s ``len(event_log)`` becomes a count of
+    nodes rather than of stream chunks, which is the more useful number anyway.
+
+    Nothing else depended on it: the board's figures come from ``task_update`` above, and the
+    UI has always been fed by the relay below.
     """
     if event.event == "task_update":
         await push_board(device_id, board.on_task_update(device_id, event.goal_id, event.payload or {}))
-    try:
-        graph.update_state(
-            {"configurable": {"thread_id": event.goal_id}},
-            {
-                "event_log": [
-                    {
-                        "event": "agent_event",
-                        "goal_id": event.goal_id,
-                        "correlation_id": event.correlation_id,
-                        "payload": event.model_dump(mode="json"),
-                    }
-                ]
-            },
-        )
-    except Exception:
-        logger.exception("graph_event_log_append_failed")
     await registry.send_to_uis(device_id, event.model_dump(mode="json"))
 
 
