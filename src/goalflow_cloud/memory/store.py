@@ -470,22 +470,44 @@ def _specificity(entry: dict[str, Any], domain: str) -> int:
 
 
 def _stricter(kind: str, current: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
-    """Break a specificity tie toward the tighter constraint.
+    """Break a specificity tie: tighter if the values order, otherwise NEWER.
 
-    Numbers compare (a lower cap is stricter). Windows do not order meaningfully, so
-    the incumbent stands and the collision is logged rather than silently resolved —
-    two equally-specific quiet-hour windows is a store-authoring bug, not an input.
+    Numbers compare — a lower cap is stricter, and that is a fact about the values.
+
+    Windows do not order that way, and through v8 that meant "the incumbent stands":
+    whichever entry the store happened to list first won, permanently. THAT IS THE BUG
+    THAT SILENTLY BROKE THE CROSS-GOAL MOMENT. Approving "we're away Tuesday and
+    Wednesday" promotes a household-wide away window, but an older household-wide away
+    window was already live, so every other goal kept resolving the OLD one — the new
+    window was written, logged, and invisible. `fan_out_household_change` then compared
+    each goal's enforced set before and after, found them identical, and correctly
+    concluded nothing had moved. Nothing had. The meal plan was never re-planned, and no
+    error was raised anywhere, because at every individual step the code was right.
+
+    Values do not order; ENTRIES do. THE STORE IS APPEND-ONLY, so a later position in it
+    is literally "said afterwards" — and at equal specificity the later statement is the
+    one a person means. `captured_on` is not enough on its own: it has day granularity,
+    and a demo states every one of these rules on the same simulated day. Position is
+    exact and needs no new field. It also gets the seed right for free — fixtures are
+    written first, so anything the household actually said outranks them.
+
+    The warning stays, because a same-specificity collision is still worth authoring out
+    of the store; it just no longer describes a rule being silently ignored forever.
     """
     current_value, candidate_value = current.get("value"), candidate.get("value")
     if isinstance(current_value, (int, float)) and isinstance(candidate_value, (int, float)):
         return candidate if candidate_value < current_value else current
+
     logger.warning(
-        "constraint_tie kind=%s ids=%s,%s — keeping the first; give one a narrower applies_to",
+        "constraint_tie kind=%s ids=%s,%s — same specificity; taking the later entry (%s). "
+        "Give one a narrower applies_to.",
         kind,
         current.get("id"),
         candidate.get("id"),
+        candidate.get("id"),
     )
-    return current
+    # `entries` is iterated in store order, so `candidate` is always the newer statement.
+    return candidate
 
 
 def _is_expired(entry: dict[str, Any], today: date) -> bool:

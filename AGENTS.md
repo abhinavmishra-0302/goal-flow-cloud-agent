@@ -33,6 +33,17 @@ Change `CONTRACT.md` first when the protocol moves.
   `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL` (default `openai/gpt-oss-120b` — the
   `:free` variants are 429-throttled/unusable), `OPENROUTER_MAX_TOKENS`,
   `WS_HOST`/`WS_PORT`, `LOG_LEVEL`.
+- **`OPENROUTER_PROVIDER_ORDER=cerebras` + `OPENROUTER_PROVIDER_ALLOW_FALLBACKS=false` (v8) is what decides how fast this
+  is.** Unset, OpenRouter load-balances across nineteen endpoints spanning 39x in
+  throughput and lands on the slow ones: interpretation measured 19.7s unpinned vs 2.3s
+  pinned. Fallbacks are OFF deliberately — the next-best provider measured 203-234s on the
+  real pipeline, slower than no pinning at all, so a fallback is a stall rather than a
+  degrade. Every LLM client is built by `graph/nodes.py:build_chat()`; both it and the
+  startup `llm_routing` log line are the places to look. `OPENROUTER_REASONING_EFFORT`
+  exists and ships OFF — read the comment in `config.py` before setting it, `low` was
+  measured to break the output outright.
+- Each LLM call logs `llm_call site=... elapsed_ms=...`. Four run per goal creation:
+  `interpret`, `detect_constraints`, `soft_select`, `thought`.
 
 ## Architecture / key files
 

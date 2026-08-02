@@ -37,11 +37,14 @@ from goalflow_cloud.memory.store import (  # noqa: E402
     load_family_profile,
     resolve_constraints,
 )
-from goalflow_cloud.server import _window_words  # noqa: E402
+from goalflow_cloud.server import _window_already_household, _window_words  # noqa: E402
 
 TODAY = date(2026, 7, 28)
 AWAY_START = (TODAY + timedelta(days=2)).isoformat()
 AWAY_END = (TODAY + timedelta(days=3)).isoformat()
+#: A second, LONGER trip stated after the first — same start, so only the end moves and
+#: the two entries cannot be told apart by anything but which was said later.
+LATER_END = (TODAY + timedelta(days=5)).isoformat()
 
 
 def main() -> int:
@@ -110,12 +113,85 @@ def main() -> int:
         check("away_window" not in later["hard"],
               f"the window must expire on its own, still present as {later['hard'].get('away_window')}")
 
+        # 5b. PROVENANCE. The window is now live household-wide, so EVERY other goal
+        #     resolves it into its own `constraints.hard` — and the fan-out reads the
+        #     approved goal's resolved hard block. Without a guard, approving that meal
+        #     week re-promoted the window it had just read, under a fresh id and a fresh
+        #     expiry, and the next goal inherited THAT. Found in a live demo: four
+        #     captured away windows had stacked up, one of them seven days long, and
+        #     because `append_constraints` is idempotent the real away goal's approval
+        #     then wrote nothing and the cross-goal re-plan silently stopped firing.
+        #
+        #     The distinction is authorship: a goal whose window equals what the
+        #     household already holds for everyone READ it and has nothing to promote.
+        inherited_by_meal = after["hard"]["away_window"]
+        check(
+            _window_already_household(load_family_profile(store), "away_window",
+                                      inherited_by_meal, today=TODAY),
+            "a goal carrying the window it inherited must not re-promote it",
+        )
+        check(
+            not _window_already_household(
+                load_family_profile(store), "away_window",
+                {"start": "2026-09-10", "end": "2026-09-12"}, today=TODAY),
+            "a genuinely different trip must still be promotable",
+        )
+        # And the household must hold exactly what was written — the guard is a
+        # provenance test, not a blanket "never write twice".
+        check(
+            resolve_constraints(load_family_profile(store), "", today=TODAY)["hard"]
+            .get("away_window") == {"start": AWAY_START, "end": AWAY_END},
+            "the household-wide resolution is the promoted window itself",
+        )
+
         # 6. THE SEED IS UNTOUCHED — this gate writes to a copy, like the capture gate.
         seed_rows = [c for c in json.loads(seed.read_text())["constraints"] if c.get("source") == "chat"]
         check(not any(c["kind"] == "away_window" for c in seed_rows),
               "the committed seed must not have gained a captured away window")
 
-    # 7. THE CARD HAS ONE LINE, so the window has to read as words, not a date range.
+    # 7. A NEWER WINDOW WINS — the failure that silently broke the demo twice.
+    #
+    #    Approving a second trip while an older household window is still live WROTE the
+    #    new window, logged it, and left it INVISIBLE: two entries at the same
+    #    specificity, and resolution kept whichever came first in the store. So every
+    #    other goal went on resolving the old dates, `fan_out_household_change` compared
+    #    each goal's enforced set before and after, found them identical, and correctly
+    #    concluded nothing had moved. Nothing had. No error was raised at any step,
+    #    because at every individual step the code was right.
+    #
+    #    Both entries carry the SAME captured_on — a demo states every one of these rules
+    #    on one simulated day — which is why store ORDER, not the date, is what decides.
+    #
+    #    Its own store: this writes a second window that outlives the first, and the
+    #    expiry and provenance checks above are asserted against a store with exactly one.
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Path(tmp) / "family_profile.json"
+        shutil.copy(seed, store)
+        first = {
+            "kind": "away_window",
+            "value": {"start": AWAY_START, "end": AWAY_END},
+            "enforcement": "hard", "scope": "household", "applies_to": ["*"],
+            "label": "away window", "expires_on": AWAY_END,
+        }
+        append_constraints([dict(first)], path=store, today=TODAY)
+        settled = resolve_constraints(load_family_profile(store), "meal_plan", today=TODAY)
+
+        # Same start, later end — so nothing but "which was said second" tells them apart.
+        second = {**first, "value": {"start": AWAY_START, "end": LATER_END}, "expires_on": LATER_END}
+        written = append_constraints([dict(second)], path=store, today=TODAY)
+        check(len(written) == 1, f"a window with different dates must still be writable, got {written}")
+
+        moved = resolve_constraints(load_family_profile(store), "meal_plan", today=TODAY)
+        check(
+            moved["hard"].get("away_window") == {"start": AWAY_START, "end": LATER_END},
+            f"the NEWEST household window must be what other goals resolve, got {moved['hard'].get('away_window')}",
+        )
+        check(
+            moved["hard"] != settled["hard"],
+            "the enforced set must actually move, or the fan-out sees no change and re-plans nothing",
+        )
+
+    # 8. THE CARD HAS ONE LINE, so the window has to read as words, not a date range.
     for window, want in (
         ({"start": AWAY_START, "end": AWAY_END}, "Thu & Fri"),
         ({"start": AWAY_START, "end": AWAY_START}, "Thu"),

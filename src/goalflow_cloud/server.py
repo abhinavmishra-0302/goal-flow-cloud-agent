@@ -195,6 +195,12 @@ class Session:
     #: webview about, right now" — so it is a tiny structure separate from the board's
     #: per-goal cache. Replayed to a freshly-bound ``chat`` socket in ``_bind_ui``.
     create_phase: dict[str, Any] | None = None
+    #: THE DEVICE'S TODAY, as last reported (ISO), or None until it says.
+    #:
+    #: The device runs a SimulatedClock that `advance_day` steps, so `date.today()`
+    #: disagrees with the world the moment anyone presses it. Learned from frames the
+    #: device already sends, so nothing on the wire had to change. DESIGN.md §3.
+    world_today: str | None = None
 
 
 class ConnectionRegistry:
@@ -569,6 +575,39 @@ class ConnectionRegistry:
         capabilities = self._session(device_id).capabilities
         return capabilities.model_dump(mode="json") if capabilities else None
 
+    def set_world_today(self, device_id: str, sim_date: str | None) -> None:
+        """Remember the device's simulated today. Ignores anything unparseable."""
+        if not sim_date:
+            return
+        try:
+            parsed = date.fromisoformat(str(sim_date)[:10])
+        except ValueError:
+            logger.debug("world_today_unparseable device=%s value=%r", device_id, sim_date)
+            return
+        session = self._session(device_id)
+        if session.world_today != parsed.isoformat():
+            logger.info("world_today device=%s date=%s (%s)",
+                        device_id, parsed.isoformat(), parsed.strftime("%A"))
+        session.world_today = parsed.isoformat()
+
+    def world_today(self, device_id: str) -> date:
+        """The day THE WORLD is on for this home — the device's, or real today.
+
+        Every date the cloud reasons about belongs to the device's world, not to the
+        machine the cloud happens to run on: the plan's rows are dated by the device,
+        Advance day moves only the device, and a SimulatedClock anchored at process
+        start drifts from wall-clock the moment either of those happens. Falling back
+        to `date.today()` is right for the only case it covers — a device that has not
+        spoken yet, which is also a device that has not simulated anything yet.
+        """
+        stored = self._session(device_id).world_today
+        if not stored:
+            return date.today()
+        try:
+            return date.fromisoformat(stored)
+        except ValueError:  # pragma: no cover - set_world_today validates on the way in
+            return date.today()
+
     # --- discovery ---
     async def send_devices(self, websocket: WebSocket) -> None:
         frame = Devices(devices=self.device_list()).model_dump(mode="json")
@@ -728,6 +767,8 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
         await graph_resume_monitor(proposal.goal_id, proposal.model_dump(mode="json"))
     elif sender_role == "device" and frame_type == "status":
         status = Status(**frame)
+        # The device's clock, learned from a frame it was already sending.
+        registry.set_world_today(device_id, status.payload.sim_date)
         await registry.send_to_uis(device_id, status.model_dump(mode="json"))
         await push_board(device_id, board.on_status(device_id, status.goal_id, status.model_dump(mode="json")))
         # v7 — the board now HAS the change the chat surface promised. Released here and
@@ -748,7 +789,13 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
         # v3.2 world tick summary — a board surface. The per-goal status/proposal frames
         # that ride alongside it already updated the cards; this is just the "what
         # happened today" list, relayed straight through to the boards.
-        await registry.send_to_uis(device_id, DayAdvanced(**frame).model_dump(mode="json"))
+        #
+        # The frame that says the world moved, so the one that must not be missed: a
+        # goal created straight after Advance day, with no status in between, would
+        # otherwise be interpreted against yesterday.
+        advanced = DayAdvanced(**frame)
+        registry.set_world_today(device_id, advanced.sim_date)
+        await registry.send_to_uis(device_id, advanced.model_dump(mode="json"))
     else:
         logger.warning("unknown_route role=%s type=%s", sender_role, frame_type)
 
@@ -952,7 +999,10 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
 
     async with goal_lock(goal_id):
         state = await asyncio.to_thread(
-            graph_nodes.start_goal, graph, user_goal.text, goal_id, capabilities
+            graph_nodes.start_goal, graph, user_goal.text, goal_id, capabilities,
+            # Read here rather than inside the graph: only the hub knows which home the
+            # goal belongs to, and two homes can be on different simulated days.
+            registry.world_today(device_id).isoformat(),
         )
     if state.get("error"):
         # The bracket is open (above), so it has to be closed or the webview dangles on a
@@ -1297,6 +1347,31 @@ async def _close_when_saved(device_id: str, goal_id: str, waiting_on: list[str])
 HOUSEHOLD_WIDE_KINDS = ("away_window",)
 
 
+def _window_already_household(
+    profile: dict[str, Any],
+    kind: str,
+    window: dict[str, Any],
+    today: date | None = None,
+) -> bool:
+    """Is this window ALREADY a fact about the household, rather than this goal's to make?
+
+    The provenance test behind the fan-out's guard, extracted so it can be asserted on
+    (gate 17) rather than only observed in a demo that has already gone wrong.
+
+    Resolving against the EMPTY domain is what makes it a provenance question: an entry
+    reaching `applies_to: ["*"]` matches at specificity 0, and a domain-scoped one does
+    not match at all (``_specificity`` returns -1 for a falsy domain), so what comes back
+    is precisely the set of windows already promoted household-wide. A goal whose window
+    is one of them READ it; a goal whose window differs BROUGHT it.
+    """
+    inherited = resolve_constraints(profile, "", today=today or date.today())["hard"].get(kind)
+    return (
+        isinstance(inherited, dict)
+        and inherited.get("start") == window.get("start")
+        and inherited.get("end") == window.get("end")
+    )
+
+
 async def fan_out_household_change(device_id: str, approved_goal_id: str) -> list[str]:
     """Promote an approved goal's window to the household, and re-plan whoever it moves.
 
@@ -1318,14 +1393,50 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> lis
     if not contract:
         return []
     hard = (contract.get("constraints") or {}).get("hard") or {}
-    window = next((hard[kind] for kind in HOUSEHOLD_WIDE_KINDS if isinstance(hard.get(kind), dict)), None)
+    # The kind is carried, not assumed: HOUSEHOLD_WIDE_KINDS is a tuple, and the guard
+    # below has to compare like with like when a second kind is added to it.
+    kind, window = next(
+        ((k, hard[k]) for k in HOUSEHOLD_WIDE_KINDS if isinstance(hard.get(k), dict)),
+        (None, None),
+    )
     if not window or not (window.get("start") and window.get("end")):
+        return []
+
+    # THE PROVENANCE GUARD. `contract.constraints.hard` is the RESOLVED set for
+    # this goal — what it was given, not what it brought — so an away window in it may
+    # have been AUTHORED by this goal (the trip it is about) or merely INHERITED from a
+    # household that already knows it is away. Promoting either meant every goal
+    # re-promoted the window it had just read: a Weekly Meal Plan wrote two household
+    # away windows this way, one of them seven days long, and once a stale window covers
+    # the demo week the real away goal's approval writes nothing (append_constraints is
+    # idempotent) and the cross-goal re-plan silently never fires. The bug is invisible
+    # until the demo stops working.
+    #
+    # Authorship is decided by asking what the household holds FOR EVERYONE: resolving
+    # against the empty domain matches `applies_to: ["*"]` entries and skips
+    # domain-scoped ones (_specificity), so it is exactly the set of already-promoted
+    # facts. If this goal's window is one of them, the goal is a reader and there is
+    # nothing to promote.
+    #
+    # LIMIT, stated: a SECOND trip proposed while the first household window is still
+    # live promotes normally (different dates), but a re-approval that merely re-states
+    # the live window does not. That is the intended reading — a household fact is
+    # authored once — and the entry retires itself on `expires_on` either way.
+    # The household's clock is the DEVICE's — expiry, `captured_on` and every
+    # re-resolution below must agree with the world the plans are dated in.
+    today = registry.world_today(device_id)
+    before_profile = await asyncio.to_thread(load_family_profile)
+    if _window_already_household(before_profile, kind, window, today=today):
+        logger.info(
+            "household_window_inherited goal=%s start=%s end=%s — already a household fact, not re-promoted",
+            approved_goal_id, window["start"], window["end"],
+        )
         return []
 
     written = await asyncio.to_thread(
         append_constraints,
         [{
-            "kind": "away_window",
+            "kind": kind,
             "value": {"start": window["start"], "end": window["end"]},
             "enforcement": "hard",
             "scope": "household",
@@ -1336,6 +1447,7 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> lis
             # quietly empty every future meal week for the same two dates.
             "expires_on": window["end"],
         }],
+        today=today,
     )
     if not written:
         # Already known — a re-sent approval, or a reconnect replaying one. The store is
@@ -1347,7 +1459,6 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> lis
                 approved_goal_id, window["start"], window["end"])
 
     profile = await asyncio.to_thread(load_family_profile)
-    today = date.today()
     _, summaries = board.snapshot(device_id)
     pushed = 0
     #: Which goals the create-phase webview should wait for before it closes.
@@ -1440,25 +1551,26 @@ async def relay_agent_event(device_id: str, event: AgentEvent) -> None:
     and pending count, derived by the DEVICE from its task DAG. The cloud cannot
     compute those — only the device can ground a decomposition — so this is the one
     place the board's numbers can come from.
+
+    v8 — THIS NO LONGER MIRRORS THE STREAM INTO GRAPH STATE, and the numbers are why.
+    Every agent_event used to append itself to the graph's ``event_log`` through a
+    synchronous ``graph.update_state``: not wrapped in ``to_thread``, so on the event loop,
+    and placed *before* the relay below, so ahead of the UI. Because ``event_log``
+    accumulates, each write re-serialised the whole thing — measured on one goal thread,
+    2810 checkpoints growing 10 KB to 810 KB, **1.19 GB of synchronous SQLite for a single
+    goal**, and 6.84 GB across two days of runs.
+
+    All of it for a reader that does not exist. ``event_log`` was written in five places and
+    read in none; the only consumer ever planned is a ``TODO(v2-M1): summarize event_log for
+    the Trace/Explain surface`` in ``finalize``, which was never built. The node-level
+    entries stay — they are bounded, and ``finalize``'s ``len(event_log)`` becomes a count of
+    nodes rather than of stream chunks, which is the more useful number anyway.
+
+    Nothing else depended on it: the board's figures come from ``task_update`` above, and the
+    UI has always been fed by the relay below.
     """
     if event.event == "task_update":
         await push_board(device_id, board.on_task_update(device_id, event.goal_id, event.payload or {}))
-    try:
-        graph.update_state(
-            {"configurable": {"thread_id": event.goal_id}},
-            {
-                "event_log": [
-                    {
-                        "event": "agent_event",
-                        "goal_id": event.goal_id,
-                        "correlation_id": event.correlation_id,
-                        "payload": event.model_dump(mode="json"),
-                    }
-                ]
-            },
-        )
-    except Exception:
-        logger.exception("graph_event_log_append_failed")
     await registry.send_to_uis(device_id, event.model_dump(mode="json"))
 
 
@@ -1571,3 +1683,7 @@ async def graph_resume_monitor(goal_id: str, frame: dict[str, Any]) -> None:
 
 
 setup_logging()
+
+# Always logged, on its own line: which provider serves a run is the difference between a
+# 1.5s call and a 50s one, and "why was that run slow" is unanswerable without it.
+logger.info("llm_routing %s model=%s", graph_nodes.describe_routing(), get_settings().openrouter_model)

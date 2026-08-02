@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from operator import add
@@ -52,6 +54,104 @@ from goalflow_cloud.memory.store import (
 from goalflow_cloud.models.contract import Dispatch
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# The one place a cloud LLM client is built
+# ---------------------------------------------------------------------------
+
+#: One shared HTTP client for every OpenRouter call in the process.
+#:
+#: Each of the four interpretation-window calls used to construct its own ``ChatOpenAI``,
+#: and therefore its own ``httpx.Client`` — so a single goal paid FOUR separate TCP+TLS
+#: handshakes to openrouter.ai, and pooled nothing across goals either. Created lazily so
+#: importing this module never opens a socket (the offline gates import it constantly).
+_http_client: Any = None
+
+
+def _shared_http_client() -> Any:
+    global _http_client
+    if _http_client is None:
+        import httpx
+
+        _http_client = httpx.Client(
+            # Matches the longest per-call timeout below; the caller's own `timeout` is what
+            # actually bounds each request. This is only the backstop.
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+        )
+    return _http_client
+
+
+def build_chat(*, max_tokens: int, timeout: int, max_retries: int, temperature: float) -> ChatOpenAI:
+    """Build a ChatOpenAI for one cloud call site.
+
+    Carries the v8 routing: OpenRouter ``provider`` preference via ``extra_body`` and an
+    optional ``reasoning_effort``. Both are **omitted entirely** when unset, so the request
+    body is byte-identical to v7 — which is what lets every offline gate keep passing.
+
+    See ``config.openrouter_provider_order`` for why pinning matters (measured: 50.1s
+    unpinned vs 1.5s pinned for the same work) and ``openrouter_reasoning_effort`` for why
+    the effort knob ships switched off.
+    """
+    settings = get_settings()
+    kwargs: dict[str, Any] = {
+        "model": settings.openrouter_model,
+        "api_key": settings.openrouter_api_key,
+        "base_url": settings.openrouter_base_url,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "timeout": timeout,
+        "max_retries": max_retries,
+        "http_client": _shared_http_client(),
+    }
+
+    order = [p.strip() for p in settings.openrouter_provider_order.split(",") if p.strip()]
+    if order:
+        kwargs["extra_body"] = {
+            "provider": {
+                "order": order,
+                "allow_fallbacks": settings.openrouter_provider_allow_fallbacks,
+            }
+        }
+
+    effort = settings.openrouter_reasoning_effort.strip().lower()
+    if effort:
+        kwargs["reasoning_effort"] = effort
+
+    return ChatOpenAI(**kwargs)
+
+
+@contextmanager
+def timed_llm(site: str):
+    """Time one cloud LLM call and say so.
+
+    The cloud had NO duration instrumentation of any kind: the only way to tell which of the
+    four interpretation-window calls was the slow one was to subtract ``ts=`` between
+    ``graph_node_enter``/``graph_node_exit`` lines — and ``present_understanding`` has no exit
+    line until the human answers the gate, so its call was invisible entirely. That is a poor
+    position to profile from, and it is how a routing default went unnoticed for eight
+    versions.
+
+    Logged even when the call raises, because a call that fails slowly is the interesting one.
+    """
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.info("llm_call site=%s elapsed_ms=%d", site, (time.perf_counter() - started) * 1000)
+
+
+def describe_routing() -> str:
+    """One line for startup logging: what every cloud call will actually send."""
+    settings = get_settings()
+    order = [p.strip() for p in settings.openrouter_provider_order.split(",") if p.strip()]
+    if not order and not settings.openrouter_reasoning_effort.strip():
+        return "off"
+    provider = (
+        f"{order} allow_fallbacks={settings.openrouter_provider_allow_fallbacks}" if order else "-"
+    )
+    return f"provider={provider} reasoning_effort={settings.openrouter_reasoning_effort or '-'}"
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +201,12 @@ class GraphState(TypedDict, total=False):
     # per session by the hub). The interpreter judges actionability against THIS
     # rather than a hardcoded topic list — see capability_digest.
     device_capabilities: dict[str, Any]
+    #: The day THE WORLD is on (ISO), as the device last reported it. Empty
+    #: means nobody has said, and every node falls back to real today. Stamped once,
+    #: when the goal starts: a goal is interpreted, grounded and dispatched against a
+    #: single day, and re-reading the clock mid-run would let a world tick land in the
+    #: middle of one goal's reasoning. See _today().
+    world_today: str
 
 
 class InterpretedIntent(BaseModel):
@@ -355,34 +461,27 @@ def _understanding_thought(intent: dict[str, Any], hard: dict[str, Any], domain:
     max_tokens = settings.openrouter_max_tokens
     thought_tokens = min(max_tokens, 60) if isinstance(max_tokens, int) and max_tokens > 0 else 60
     try:
-        llm = ChatOpenAI(
-            model=settings.openrouter_model,
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-            temperature=0.2,
-            max_tokens=thought_tokens,
-            timeout=15,
-            max_retries=0,
-        )
-        response = llm.invoke(
-            [
-                (
-                    "system",
-                    "Write one short sentence describing how GoalFlow will approach the user's goal. "
-                    "Keep it under 22 words. Do not mention internal systems or uncertainty.",
-                ),
-                (
-                    "human",
-                    "Objective: {objective}\nDomain: {domain}\nTime window: {time_window}\n"
-                    "Hard constraints: {hard}".format(
-                        objective=intent.get("objective", ""),
-                        domain=domain,
-                        time_window=intent.get("time_window") or {},
-                        hard=hard,
+        llm = build_chat(max_tokens=thought_tokens, timeout=15, max_retries=0, temperature=0.2)
+        with timed_llm("thought"):
+            response = llm.invoke(
+                [
+                    (
+                        "system",
+                        "Write one short sentence describing how GoalFlow will approach the user's goal. "
+                        "Keep it under 22 words. Do not mention internal systems or uncertainty.",
                     ),
-                ),
-            ]
-        )
+                    (
+                        "human",
+                        "Objective: {objective}\nDomain: {domain}\nTime window: {time_window}\n"
+                        "Hard constraints: {hard}".format(
+                            objective=intent.get("objective", ""),
+                            domain=domain,
+                            time_window=intent.get("time_window") or {},
+                            hard=hard,
+                        ),
+                    ),
+                ]
+            )
         thought = " ".join(str(getattr(response, "content", "") or "").split())
         if len(thought) > 180:
             thought = thought[:177].rstrip() + "..."
@@ -390,6 +489,58 @@ def _understanding_thought(intent: dict[str, Any], hard: dict[str, Any], domain:
     except Exception:
         logger.exception("understanding_thought_llm_failed")
         return fallback
+
+
+def _today(state: GraphState) -> date:
+    """The day THIS GOAL is being reasoned about — the device's world, not the cloud's.
+
+    Every node used to call ``date.today()``, which is the date on the machine running
+    the hub. That is not the day the goal lives on. The device runs a SimulatedClock
+    anchored at process start and stepped by Advance day, the plan's rows are dated by
+    it, and the world's events fire against it — so after a single Advance day the cloud
+    was resolving "tomorrow", "this week" and every goal horizon one day behind the world
+    the plan was for.
+
+    Falls back to real today when the device has not reported a date yet, which is also
+    the case where the device has not simulated anything yet, so the two agree.
+    """
+    stamped = (state.get("world_today") or "").strip()
+    if not stamped:
+        return date.today()
+    try:
+        return date.fromisoformat(stamped)
+    except ValueError:
+        logger.warning("world_today_unparseable value=%r — falling back to real today", stamped)
+        return date.today()
+
+
+#: How far ahead the interpreter's calendar runs. Two weeks covers "a week on Tuesday"
+#: without turning the system prompt into a wall of dates.
+CALENDAR_DAYS = 14
+
+
+def _calendar_block(today: date, days: int = CALENDAR_DAYS) -> str:
+    """The next fortnight, spelled out — so the model LOOKS UP a weekday, never counts to it.
+
+    WHY THIS EXISTS, and it is not defensive coding. Told only "Real today is 2026-08-02
+    (Sunday)", the interpreter resolved EVERY named weekday exactly one day early —
+    "Tuesday and Wednesday" came back as Mon 08-03..Tue 08-04, "Thursday and Friday" as
+    Wed..Thu, "Monday" as Sunday. Four for four, at temperature 0, reproducible on demand.
+    It is not reading the calendar wrong; it is not reading a calendar at all — it counts
+    ordinals from today and calls the answer Tuesday.
+
+    That lands in the worst possible place. `_align_away_window` takes this window
+    VERBATIM as the away window, the away window is what empties days out of every other
+    goal's plan, and a plan that loses the wrong two dinners is wrong in a way that looks
+    deliberate. So the arithmetic is done here, in code, and the model is left with a
+    lookup — the same division of labour as everywhere else in this system.
+    """
+    rows = []
+    for i in range(days):
+        day = today + timedelta(days=i)
+        suffix = "  <- today" if i == 0 else ""
+        rows.append(f"  {day.isoformat()} {day.strftime('%A')}{suffix}")
+    return "\n".join(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -435,81 +586,79 @@ def interpret_goal(state: GraphState) -> GraphState:
         }
 
     settings = get_settings()
-    today = date.today()
+    today = _today(state)
     try:
-        llm = ChatOpenAI(
-            model=settings.openrouter_model,
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-            temperature=0,
-            # Cap the token reservation. Interpreting a goal into a small
-            # structured intent needs little; leaving this unset makes OpenRouter
-            # reserve the model max (~65k), which a low-credit key can't afford
-            # (HTTP 402). Configurable via OPENROUTER_MAX_TOKENS.
-            max_tokens=settings.openrouter_max_tokens,
-            timeout=45,
-            max_retries=1,
+        # max_tokens caps the RESERVATION: left unset OpenRouter reserves the model max
+        # (~65k) and a low-credit key hits HTTP 402. Configurable via OPENROUTER_MAX_TOKENS.
+        llm = build_chat(
+            max_tokens=settings.openrouter_max_tokens, timeout=45, max_retries=1, temperature=0
         )
         structured_llm = llm.with_structured_output(InterpretedIntent, method="function_calling")
-        intent = structured_llm.invoke(
-            [
-                (
-                    "system",
-                    "You are the GoalFlow cloud goal interpreter. Convert the user's natural-language "
-                    "goal into a generic, domain-agnostic task intent. Do not invent safety constraints. "
-                    f"Real today is {today.isoformat()} ({today.strftime('%A')}); resolve phrases like "
-                    "this week, today, tomorrow, weekend, next week into time_window.start/end ISO "
-                    "dates relative to it. For actionable goals, the start date must be real today "
-                    "or later; interpret 'this week' as the remaining week starting today.\n"
-                    "COUNT THE DAYS LITERALLY. 'tomorrow' is today+1, 'the day after tomorrow' is "
-                    "today+2, 'Thursday and Friday' is exactly those two dates and nothing between "
-                    "or around them. When the user names the days they will be away, the window is "
-                    "EXACTLY those days: start on the first, end on the last, and do not pad it — "
-                    "an away window is used to empty a plan, so an extra day is a dinner someone "
-                    "loses for no reason. "
-                    "Keep scope flexible and generic for the device planner.\n\n"
-                    "The connected device advertises exactly these capabilities:\n"
-                    f"{digest}\n\n"
-                    "Set actionable=true if the goal can plausibly be ADVANCED using them, "
-                    "and fill time_window. Judge the goal against the capability list, not "
-                    "against any fixed list of topics. Whether an action is PERMITTED is not "
-                    "your call — the device decides that and gives a better answer than you "
-                    "could; your question is only whether this is the kind of thing this "
-                    "product is for. If nothing it can do relates to the goal — general "
-                    "questions, trivia, facts, chit-chat, unrelated tasks — set "
-                    "actionable=false, put one short reason in decline_reason, and you may "
-                    "leave time_window empty.\n\n"
-                    "ALWAYS respond by calling the structured "
-                    "function — never answer the user's question directly in prose, even "
-                    "for out-of-scope goals (call it with actionable=false instead).\n\n"
-                    "DOMAIN: set `domain` to the advertised goal-shape id whose HINT best "
-                    "matches the KIND of goal — read what the goal is ABOUT, not which id "
-                    "is listed first. E.g. a birthday/party → the party shape; a trip or "
-                    "being away from home → the vacation/away shape; hosting guests for a "
-                    "dinner → the guest-dinner shape; planning the week's dinners → the "
-                    "meal shape; cutting the electricity/power bill or shifting appliance "
-                    "usage → the energy shape; keeping the kitchen stocked or spending less "
-                    "on groceries → the grocery shape. Do NOT default to meal planning — use "
-                    "the meal shape ONLY when the goal is genuinely about planning meals; a "
-                    "goal about the grocery BILL is the grocery shape, not the meal shape. "
-                    "The device ROUTES on this value, so a mismatched shape loses its "
-                    "handling. Coin a new short slug only when the goal is a KIND none of "
-                    "the advertised hints covers.\n\n"
-                    "THE EDGE: this product runs a HOME. It acts on the fridge, the "
-                    "shopping, the appliances, the calendar and the home's security — "
-                    "things inside the house. A goal that happens to mention the house "
-                    "while actually being about the wider world is NOT actionable here: "
-                    "booking travel, flights, hotels or an itinerary; finding somewhere to "
-                    "live; money beyond the household shopping; work, health care or "
-                    "anything requiring a service this home does not have. Read the "
-                    "advertised hints as the whole of what is possible — if advancing the "
-                    "goal would need something not in that list, say so with "
-                    "actionable=false rather than picking the closest shape. Getting the "
-                    "HOUSE ready for a trip is in scope; planning the TRIP is not.",
-                ),
-                ("human", goal_text),
-            ]
-        )
+        with timed_llm("interpret"):
+            intent = structured_llm.invoke(
+                [
+                    (
+                        "system",
+                        "You are the GoalFlow cloud goal interpreter. Convert the user's natural-language "
+                        "goal into a generic, domain-agnostic task intent. Do not invent safety constraints. "
+                        f"Real today is {today.isoformat()} ({today.strftime('%A')}); resolve phrases like "
+                        "this week, today, tomorrow, weekend, next week into time_window.start/end ISO "
+                        "dates relative to it. For actionable goals, the start date must be real today "
+                        "or later; interpret 'this week' as the remaining week starting today.\n\n"
+                        "THE CALENDAR. These are the only dates you may use. When the user names a "
+                        "weekday, COPY the ISO date sitting beside that name — do not count forward "
+                        "from today and do not compute it. A named weekday always means the NEXT one "
+                        "in this list, reading downward:\n"
+                        f"{_calendar_block(today)}\n\n"
+                        "'tomorrow' is the second line, 'the day after tomorrow' the third. "
+                        "'Thursday and Friday' is exactly those two dates and nothing between "
+                        "or around them. When the user names the days they will be away, the window is "
+                        "EXACTLY those days: start on the first, end on the last, and do not pad it — "
+                        "an away window is used to empty a plan, so an extra day is a dinner someone "
+                        "loses for no reason. "
+                        "Keep scope flexible and generic for the device planner.\n\n"
+                        "The connected device advertises exactly these capabilities:\n"
+                        f"{digest}\n\n"
+                        "Set actionable=true if the goal can plausibly be ADVANCED using them, "
+                        "and fill time_window. Judge the goal against the capability list, not "
+                        "against any fixed list of topics. Whether an action is PERMITTED is not "
+                        "your call — the device decides that and gives a better answer than you "
+                        "could; your question is only whether this is the kind of thing this "
+                        "product is for. If nothing it can do relates to the goal — general "
+                        "questions, trivia, facts, chit-chat, unrelated tasks — set "
+                        "actionable=false, put one short reason in decline_reason, and you may "
+                        "leave time_window empty.\n\n"
+                        "ALWAYS respond by calling the structured "
+                        "function — never answer the user's question directly in prose, even "
+                        "for out-of-scope goals (call it with actionable=false instead).\n\n"
+                        "DOMAIN: set `domain` to the advertised goal-shape id whose HINT best "
+                        "matches the KIND of goal — read what the goal is ABOUT, not which id "
+                        "is listed first. E.g. a birthday/party → the party shape; a trip or "
+                        "being away from home → the vacation/away shape; hosting guests for a "
+                        "dinner → the guest-dinner shape; planning the week's dinners → the "
+                        "meal shape; cutting the electricity/power bill or shifting appliance "
+                        "usage → the energy shape; keeping the kitchen stocked or spending less "
+                        "on groceries → the grocery shape. Do NOT default to meal planning — use "
+                        "the meal shape ONLY when the goal is genuinely about planning meals; a "
+                        "goal about the grocery BILL is the grocery shape, not the meal shape. "
+                        "The device ROUTES on this value, so a mismatched shape loses its "
+                        "handling. Coin a new short slug only when the goal is a KIND none of "
+                        "the advertised hints covers.\n\n"
+                        "THE EDGE: this product runs a HOME. It acts on the fridge, the "
+                        "shopping, the appliances, the calendar and the home's security — "
+                        "things inside the house. A goal that happens to mention the house "
+                        "while actually being about the wider world is NOT actionable here: "
+                        "booking travel, flights, hotels or an itinerary; finding somewhere to "
+                        "live; money beyond the household shopping; work, health care or "
+                        "anything requiring a service this home does not have. Read the "
+                        "advertised hints as the whole of what is possible — if advancing the "
+                        "goal would need something not in that list, say so with "
+                        "actionable=false rather than picking the closest shape. Getting the "
+                        "HOUSE ready for a trip is in scope; planning the TRIP is not.",
+                    ),
+                    ("human", goal_text),
+                ]
+            )
         if intent is None:
             # The model replied in free text instead of returning structured intent —
             # it treated the input as a question/chit-chat, not an actionable goal.
@@ -606,7 +755,7 @@ def load_memory(state: GraphState) -> GraphState:
     logger.info("graph_node_enter node=load_memory")
     profile = load_family_profile()
     domain = (state.get("intent") or {}).get("domain", "")
-    today = date.today()
+    today = _today(state)
 
     soft_ids = _relevant_soft_ids(state, profile, domain, today)
     resolved = resolve_constraints(profile, domain, today=today, soft_ids=soft_ids)
@@ -693,46 +842,39 @@ def _relevant_soft_ids(
     # A relevance pass that silently never runs is worse than not having one.
     selection_tokens = min(max_tokens, 1200) if isinstance(max_tokens, int) and max_tokens > 0 else 1200
     try:
-        llm = ChatOpenAI(
-            model=settings.openrouter_model,
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-            temperature=0,
-            max_tokens=selection_tokens,
-            timeout=20,
-            max_retries=0,
-        )
+        llm = build_chat(max_tokens=selection_tokens, timeout=20, max_retries=0, temperature=0)
         structured_llm = llm.with_structured_output(_SoftSelection, method="function_calling")
-        selection = structured_llm.invoke(
-            [
-                (
-                    "system",
-                    "You pick which household PREFERENCES are worth sending with a goal. "
-                    "These are soft biases, never safety rules — you are not deciding what is "
-                    "allowed, only what is relevant.\n\n"
-                    "Return the ids that would make a planner's output better for THIS goal, "
-                    "and leave out the ones that would only add noise: a vacation checklist "
-                    "does not need the family's dinner preferences, and a meal plan does not "
-                    "need the departure routine. Household notes about who is busy when are "
-                    "usually worth keeping.\n\n"
-                    "BE SPARING. Each id you return becomes a row on the confirmation card that "
-                    "the user reads before approving, so a preference that is merely NOT WRONG "
-                    "still costs them a line. Every candidate carries `applies_to`: an entry "
-                    "tagged for this domain is the default answer, and one tagged only for "
-                    "OTHER domains needs a real reason — the household tagged it that way on "
-                    "purpose. Two or three good ids beat six plausible ones, and returning no "
-                    "ids at all is better than padding the list.",
-                ),
-                (
-                    "human",
-                    "Goal: {objective}\nDomain: {domain}\n\nCandidates (JSON):\n{candidates}".format(
-                        objective=intent.get("objective") or state.get("goal_text", ""),
-                        domain=domain or "(none)",
-                        candidates=candidates,
+        with timed_llm("soft_select"):
+            selection = structured_llm.invoke(
+                [
+                    (
+                        "system",
+                        "You pick which household PREFERENCES are worth sending with a goal. "
+                        "These are soft biases, never safety rules — you are not deciding what is "
+                        "allowed, only what is relevant.\n\n"
+                        "Return the ids that would make a planner's output better for THIS goal, "
+                        "and leave out the ones that would only add noise: a vacation checklist "
+                        "does not need the family's dinner preferences, and a meal plan does not "
+                        "need the departure routine. Household notes about who is busy when are "
+                        "usually worth keeping.\n\n"
+                        "BE SPARING. Each id you return becomes a row on the confirmation card that "
+                        "the user reads before approving, so a preference that is merely NOT WRONG "
+                        "still costs them a line. Every candidate carries `applies_to`: an entry "
+                        "tagged for this domain is the default answer, and one tagged only for "
+                        "OTHER domains needs a real reason — the household tagged it that way on "
+                        "purpose. Two or three good ids beat six plausible ones, and returning no "
+                        "ids at all is better than padding the list.",
                     ),
-                ),
-            ]
-        )
+                    (
+                        "human",
+                        "Goal: {objective}\nDomain: {domain}\n\nCandidates (JSON):\n{candidates}".format(
+                            objective=intent.get("objective") or state.get("goal_text", ""),
+                            domain=domain or "(none)",
+                            candidates=candidates,
+                        ),
+                    ),
+                ]
+            )
         ids = [str(i) for i in (getattr(selection, "ids", None) or []) if str(i).strip()]
         known = {entry["id"] for entry in candidates}
         # Drop hallucinated ids rather than letting them silently select nothing —
@@ -811,7 +953,7 @@ def detect_constraints(state: GraphState) -> GraphState:
     # Same reasoning-token trap as the relevance pass: too small a budget and the
     # structured call never lands, silently.
     capture_tokens = min(max_tokens, 1200) if isinstance(max_tokens, int) and max_tokens > 0 else 1200
-    today = date.today()
+    today = _today(state)
     # A limit stated WITH a goal usually belongs to that goal ("keep the party under
     # $150"), not to the household forever. Telling the model which goal it is looking
     # at is what lets it say so — and a household-wide $150 would be resolved away by
@@ -833,48 +975,41 @@ def detect_constraints(state: GraphState) -> GraphState:
         else "There is no goal here, only a statement: use scope='household' and applies_to=['*']."
     )
     try:
-        llm = ChatOpenAI(
-            model=settings.openrouter_model,
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url,
-            temperature=0,
-            max_tokens=capture_tokens,
-            timeout=20,
-            max_retries=0,
-        )
+        llm = build_chat(max_tokens=capture_tokens, timeout=20, max_retries=0, temperature=0)
         structured_llm = llm.with_structured_output(_CaptureResult, method="function_calling")
-        result = structured_llm.invoke(
-            [
-                (
-                    "system",
-                    "You spot HOUSEHOLD RULES a person states in passing, so a home assistant can "
-                    "remember them instead of asking again next week.\n\n"
-                    "FIRST answer statement_only: does this message ask for ANYTHING to be done, "
-                    "arranged or got ready? If it asks for nothing and merely states a fact about "
-                    "the household, statement_only is TRUE — \"we've gone vegan\", \"Aarav is "
-                    "allergic to peanuts\", \"no dairy for two weeks\" are all statement_only. If "
-                    "it asks for something, even indirectly (\"plan our dinners\", \"get the house "
-                    "ready, we're away next week\"), statement_only is FALSE — the facts in it are "
-                    "context for a job that was requested.\n\n"
-                    f"Real today is {today.isoformat()}.\n\n"
-                    "Return a constraint ONLY for a standing fact or rule about the household: a diet "
-                    "('we've gone vegan', 'no dairy for a month'), an allergy, a medical restriction, a "
-                    "spending limit ('keep the party under $150'), a strong preference or routine.\n\n"
-                    "Return NOTHING for an ordinary goal or request. 'Plan our dinners this week' states "
-                    "no rule — it is just the job. Most messages produce no constraints, and that is the "
-                    "correct answer; inventing one puts words in the family's mouth.\n\n"
-                    "NEVER propose removing, relaxing or raising an existing rule. 'We can eat pork "
-                    "again' and 'raise the budget to $900' are not constraints — return nothing for "
-                    "them. You may only ever propose something MORE restrictive.\n\n"
-                    "enforcement='hard' only for allergens, dietary, medical and budget_cap — things a "
-                    "plan must be BLOCKED for violating. Preferences, dislikes and routines are 'soft'.\n"
-                    "Set expires_on only when the user time-boxed it, resolved to an ISO date.\n"
-                    "quote must be the user's own words, short and verbatim.\n\n"
-                    f"{scope_hint}{statement_hint}",
-                ),
-                ("human", goal_text),
-            ]
-        )
+        with timed_llm("detect_constraints"):
+            result = structured_llm.invoke(
+                [
+                    (
+                        "system",
+                        "You spot HOUSEHOLD RULES a person states in passing, so a home assistant can "
+                        "remember them instead of asking again next week.\n\n"
+                        "FIRST answer statement_only: does this message ask for ANYTHING to be done, "
+                        "arranged or got ready? If it asks for nothing and merely states a fact about "
+                        "the household, statement_only is TRUE — \"we've gone vegan\", \"Aarav is "
+                        "allergic to peanuts\", \"no dairy for two weeks\" are all statement_only. If "
+                        "it asks for something, even indirectly (\"plan our dinners\", \"get the house "
+                        "ready, we're away next week\"), statement_only is FALSE — the facts in it are "
+                        "context for a job that was requested.\n\n"
+                        f"Real today is {today.isoformat()}.\n\n"
+                        "Return a constraint ONLY for a standing fact or rule about the household: a diet "
+                        "('we've gone vegan', 'no dairy for a month'), an allergy, a medical restriction, a "
+                        "spending limit ('keep the party under $150'), a strong preference or routine.\n\n"
+                        "Return NOTHING for an ordinary goal or request. 'Plan our dinners this week' states "
+                        "no rule — it is just the job. Most messages produce no constraints, and that is the "
+                        "correct answer; inventing one puts words in the family's mouth.\n\n"
+                        "NEVER propose removing, relaxing or raising an existing rule. 'We can eat pork "
+                        "again' and 'raise the budget to $900' are not constraints — return nothing for "
+                        "them. You may only ever propose something MORE restrictive.\n\n"
+                        "enforcement='hard' only for allergens, dietary, medical and budget_cap — things a "
+                        "plan must be BLOCKED for violating. Preferences, dislikes and routines are 'soft'.\n"
+                        "Set expires_on only when the user time-boxed it, resolved to an ISO date.\n"
+                        "quote must be the user's own words, short and verbatim.\n\n"
+                        f"{scope_hint}{statement_hint}",
+                    ),
+                    ("human", goal_text),
+                ]
+            )
         proposed = [c.model_dump(mode="json") for c in (getattr(result, "constraints", None) or [])]
         proposed = [c for c in proposed if _capture_is_sane(c)]
         proposed = _dedupe_captures(proposed)
@@ -1074,7 +1209,9 @@ def capture_gate(state: GraphState) -> GraphState:
     if isinstance(incoming, dict) and "payload" in incoming:
         incoming = incoming["payload"]
     accepted = _accepted_constraints(incoming, proposed)
-    written = append_constraints(accepted) if accepted else []
+    # Stamped against the world's day, same as the capture inside the understanding
+    # gate — a rule and its expiry have to be dated in the calendar the plans use.
+    written = append_constraints(accepted, today=_today(state)) if accepted else []
 
     message = (
         "Noted — I'll remember that: " + ", ".join(entry.get("label", "") for entry in written) + "."
@@ -1177,9 +1314,12 @@ def present_understanding(state: GraphState) -> GraphState:
         for entry in accepted:
             if entry.get("scope") == "goal" and not entry.get("expires_on") and window_end:
                 entry["expires_on"] = window_end
-        written = append_constraints(accepted)
+        # Stamped and expiry-checked against the WORLD's day: a rule captured on
+        # simulated Monday but dated the real Sunday has expiry maths a day out from
+        # the plan it binds.
+        today = _today(state)
+        written = append_constraints(accepted, today=today)
         if written:
-            today = date.today()
             resolved = resolve_constraints(load_family_profile(), domain, today=today)
             memory = {
                 **memory,
@@ -1229,7 +1369,7 @@ def build_contract(state: GraphState) -> GraphState:
     goal_id = state.get("goal_id") or str(uuid4())
     correlation_id = state.get("correlation_id") or str(uuid4())
     domain = intent["domain"]
-    today = date.today()
+    today = _today(state)
     # Monitoring/prep begins NOW, so the window START is real today for EVERY goal — NOT
     # the LLM's start, which for an event goal ("next Sunday") is the EVENT date and would
     # peg progress at 0% until then. The LLM's end is the goal's horizon (the card's ETA).
@@ -1704,12 +1844,17 @@ def start_goal(
     goal_text: str,
     goal_id: str,
     device_capabilities: dict[str, Any] | None = None,
+    world_today: str | None = None,
 ) -> dict[str, Any]:
     """Kick off a goal run and return checkpointed state plus any interrupt.
 
     ``device_capabilities`` is the connected device's ``capabilities`` frame. The
     interpreter judges actionability against it, so what the assistant can do
     follows the hardware that is plugged in rather than a list in this file.
+
+    ``world_today`` is the device's simulated date — the day this goal is FOR.
+    Stamped into the state once, here, so every node in the run reasons about the same
+    day; omitted, the run falls back to real today. See ``_today``.
     """
     config = {"configurable": {"thread_id": goal_id}}
     result = graph.invoke(
@@ -1719,6 +1864,7 @@ def start_goal(
             "task_status": "created",
             "event_log": [],
             "device_capabilities": device_capabilities or {},
+            "world_today": world_today or "",
         },
         config=config,
     )
