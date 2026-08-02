@@ -323,6 +323,12 @@ class BoardService:
         # on_track on a danger, so a warn-only deferral would otherwise read green —
         # the same false-green the plan-ready precheck fix above closes.
         deferred = any(e.get("result") == "deferred_precheck" for e in payload.get("executed") or [])
+        # v8.1: an actuator that RAN and threw — usually because the plan named something
+        # the household does not have. Alerts like a deferral, but NOT "waiting": a
+        # deferral runs when the world recovers, and this one never will, because the
+        # arguments were frozen at planning time. Without it, a step that failed left the
+        # card looking exactly like a step that worked.
+        failed = any(e.get("result") == "failed_actuator" for e in payload.get("executed") or [])
 
         # An adaptation that has been approved and actually RAN is resolved — its alert
         # has to go. _bump only ever counted upward and nothing cleared it, so approving
@@ -335,7 +341,7 @@ class BoardService:
         # card went on insisting it needed them.
         executed = payload.get("executed") or []
         answered = summary.task_status == "adapting" and task_status != "adapting"
-        if task_status == "done" or answered or (executed and not deferred and task_status != "adapting"):
+        if task_status == "done" or answered or (executed and not deferred and not failed and task_status != "adapting"):
             alerts = GoalAlerts(count=0, severity=None)
 
         # ...and only THEN raise what this tick reports. Order matters: a deferral that
@@ -343,7 +349,7 @@ class BoardService:
         # survive the clear above. A deferred effect is the world's fault, not the
         # plan's — warn, not danger. It also holds the goal: the effect runs when the
         # world recovers, so the card is Waiting (on the world), not On Track.
-        if deferred:
+        if deferred or failed:
             alerts = _bump(alerts, "warn")
 
         # Most-severe-first, so a deferral can't downgrade a goal that already has a

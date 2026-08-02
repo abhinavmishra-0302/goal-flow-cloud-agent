@@ -201,6 +201,12 @@ class GraphState(TypedDict, total=False):
     # per session by the hub). The interpreter judges actionability against THIS
     # rather than a hardcoded topic list — see capability_digest.
     device_capabilities: dict[str, Any]
+    #: v8.1 — the day THE WORLD is on (ISO), as the device last reported it. Empty
+    #: means nobody has said, and every node falls back to real today. Stamped once,
+    #: when the goal starts: a goal is interpreted, grounded and dispatched against a
+    #: single day, and re-reading the clock mid-run would let a world tick land in the
+    #: middle of one goal's reasoning. See _today().
+    world_today: str
 
 
 class InterpretedIntent(BaseModel):
@@ -485,6 +491,58 @@ def _understanding_thought(intent: dict[str, Any], hard: dict[str, Any], domain:
         return fallback
 
 
+def _today(state: GraphState) -> date:
+    """The day THIS GOAL is being reasoned about — the device's world, not the cloud's.
+
+    Every node used to call ``date.today()``, which is the date on the machine running
+    the hub. That is not the day the goal lives on. The device runs a SimulatedClock
+    anchored at process start and stepped by Advance day, the plan's rows are dated by
+    it, and the world's events fire against it — so after a single Advance day the cloud
+    was resolving "tomorrow", "this week" and every goal horizon one day behind the world
+    the plan was for.
+
+    Falls back to real today when the device has not reported a date yet, which is also
+    the case where the device has not simulated anything yet, so the two agree.
+    """
+    stamped = (state.get("world_today") or "").strip()
+    if not stamped:
+        return date.today()
+    try:
+        return date.fromisoformat(stamped)
+    except ValueError:
+        logger.warning("world_today_unparseable value=%r — falling back to real today", stamped)
+        return date.today()
+
+
+#: How far ahead the interpreter's calendar runs. Two weeks covers "a week on Tuesday"
+#: without turning the system prompt into a wall of dates.
+CALENDAR_DAYS = 14
+
+
+def _calendar_block(today: date, days: int = CALENDAR_DAYS) -> str:
+    """The next fortnight, spelled out — so the model LOOKS UP a weekday, never counts to it.
+
+    WHY THIS EXISTS, and it is not defensive coding. Told only "Real today is 2026-08-02
+    (Sunday)", the interpreter resolved EVERY named weekday exactly one day early —
+    "Tuesday and Wednesday" came back as Mon 08-03..Tue 08-04, "Thursday and Friday" as
+    Wed..Thu, "Monday" as Sunday. Four for four, at temperature 0, reproducible on demand.
+    It is not reading the calendar wrong; it is not reading a calendar at all — it counts
+    ordinals from today and calls the answer Tuesday.
+
+    That lands in the worst possible place. `_align_away_window` takes this window
+    VERBATIM as the away window, the away window is what empties days out of every other
+    goal's plan, and a plan that loses the wrong two dinners is wrong in a way that looks
+    deliberate. So the arithmetic is done here, in code, and the model is left with a
+    lookup — the same division of labour as everywhere else in this system.
+    """
+    rows = []
+    for i in range(days):
+        day = today + timedelta(days=i)
+        suffix = "  <- today" if i == 0 else ""
+        rows.append(f"  {day.isoformat()} {day.strftime('%A')}{suffix}")
+    return "\n".join(rows)
+
+
 # ---------------------------------------------------------------------------
 # Nodes (harness modules) — signatures + TODO stubs
 # ---------------------------------------------------------------------------
@@ -528,7 +586,7 @@ def interpret_goal(state: GraphState) -> GraphState:
         }
 
     settings = get_settings()
-    today = date.today()
+    today = _today(state)
     try:
         # max_tokens caps the RESERVATION: left unset OpenRouter reserves the model max
         # (~65k) and a low-credit key hits HTTP 402. Configurable via OPENROUTER_MAX_TOKENS.
@@ -546,9 +604,14 @@ def interpret_goal(state: GraphState) -> GraphState:
                         f"Real today is {today.isoformat()} ({today.strftime('%A')}); resolve phrases like "
                         "this week, today, tomorrow, weekend, next week into time_window.start/end ISO "
                         "dates relative to it. For actionable goals, the start date must be real today "
-                        "or later; interpret 'this week' as the remaining week starting today.\n"
-                        "COUNT THE DAYS LITERALLY. 'tomorrow' is today+1, 'the day after tomorrow' is "
-                        "today+2, 'Thursday and Friday' is exactly those two dates and nothing between "
+                        "or later; interpret 'this week' as the remaining week starting today.\n\n"
+                        "THE CALENDAR. These are the only dates you may use. When the user names a "
+                        "weekday, COPY the ISO date sitting beside that name — do not count forward "
+                        "from today and do not compute it. A named weekday always means the NEXT one "
+                        "in this list, reading downward:\n"
+                        f"{_calendar_block(today)}\n\n"
+                        "'tomorrow' is the second line, 'the day after tomorrow' the third. "
+                        "'Thursday and Friday' is exactly those two dates and nothing between "
                         "or around them. When the user names the days they will be away, the window is "
                         "EXACTLY those days: start on the first, end on the last, and do not pad it — "
                         "an away window is used to empty a plan, so an extra day is a dinner someone "
@@ -692,7 +755,7 @@ def load_memory(state: GraphState) -> GraphState:
     logger.info("graph_node_enter node=load_memory")
     profile = load_family_profile()
     domain = (state.get("intent") or {}).get("domain", "")
-    today = date.today()
+    today = _today(state)
 
     soft_ids = _relevant_soft_ids(state, profile, domain, today)
     resolved = resolve_constraints(profile, domain, today=today, soft_ids=soft_ids)
@@ -890,7 +953,7 @@ def detect_constraints(state: GraphState) -> GraphState:
     # Same reasoning-token trap as the relevance pass: too small a budget and the
     # structured call never lands, silently.
     capture_tokens = min(max_tokens, 1200) if isinstance(max_tokens, int) and max_tokens > 0 else 1200
-    today = date.today()
+    today = _today(state)
     # A limit stated WITH a goal usually belongs to that goal ("keep the party under
     # $150"), not to the household forever. Telling the model which goal it is looking
     # at is what lets it say so — and a household-wide $150 would be resolved away by
@@ -1146,7 +1209,9 @@ def capture_gate(state: GraphState) -> GraphState:
     if isinstance(incoming, dict) and "payload" in incoming:
         incoming = incoming["payload"]
     accepted = _accepted_constraints(incoming, proposed)
-    written = append_constraints(accepted) if accepted else []
+    # Stamped against the world's day, same as the capture inside the understanding
+    # gate — a rule and its expiry have to be dated in the calendar the plans use.
+    written = append_constraints(accepted, today=_today(state)) if accepted else []
 
     message = (
         "Noted — I'll remember that: " + ", ".join(entry.get("label", "") for entry in written) + "."
@@ -1249,9 +1314,12 @@ def present_understanding(state: GraphState) -> GraphState:
         for entry in accepted:
             if entry.get("scope") == "goal" and not entry.get("expires_on") and window_end:
                 entry["expires_on"] = window_end
-        written = append_constraints(accepted)
+        # v8.1: stamped and expiry-checked against the WORLD's day. A rule captured on
+        # simulated Monday that says `captured_on` was the real Sunday is a rule whose
+        # own expiry maths is a day out from the plan it is meant to bind.
+        today = _today(state)
+        written = append_constraints(accepted, today=today)
         if written:
-            today = date.today()
             resolved = resolve_constraints(load_family_profile(), domain, today=today)
             memory = {
                 **memory,
@@ -1301,7 +1369,7 @@ def build_contract(state: GraphState) -> GraphState:
     goal_id = state.get("goal_id") or str(uuid4())
     correlation_id = state.get("correlation_id") or str(uuid4())
     domain = intent["domain"]
-    today = date.today()
+    today = _today(state)
     # Monitoring/prep begins NOW, so the window START is real today for EVERY goal — NOT
     # the LLM's start, which for an event goal ("next Sunday") is the EVENT date and would
     # peg progress at 0% until then. The LLM's end is the goal's horizon (the card's ETA).
@@ -1776,12 +1844,17 @@ def start_goal(
     goal_text: str,
     goal_id: str,
     device_capabilities: dict[str, Any] | None = None,
+    world_today: str | None = None,
 ) -> dict[str, Any]:
     """Kick off a goal run and return checkpointed state plus any interrupt.
 
     ``device_capabilities`` is the connected device's ``capabilities`` frame. The
     interpreter judges actionability against it, so what the assistant can do
     follows the hardware that is plugged in rather than a list in this file.
+
+    ``world_today`` (v8.1) is the device's simulated date — the day this goal is FOR.
+    Stamped into the state once, here, so every node in the run reasons about the same
+    day; omitted, the run falls back to real today. See ``_today``.
     """
     config = {"configurable": {"thread_id": goal_id}}
     result = graph.invoke(
@@ -1791,6 +1864,7 @@ def start_goal(
             "task_status": "created",
             "event_log": [],
             "device_capabilities": device_capabilities or {},
+            "world_today": world_today or "",
         },
         config=config,
     )
