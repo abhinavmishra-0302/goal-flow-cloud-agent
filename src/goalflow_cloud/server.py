@@ -195,15 +195,11 @@ class Session:
     #: webview about, right now" — so it is a tiny structure separate from the board's
     #: per-goal cache. Replayed to a freshly-bound ``chat`` socket in ``_bind_ui``.
     create_phase: dict[str, Any] | None = None
-    #: v8.1 — THE DEVICE'S TODAY, as last reported (ISO), or None until it says.
+    #: THE DEVICE'S TODAY, as last reported (ISO), or None until it says.
     #:
-    #: The device runs a SimulatedClock: it anchors at real today when the process
-    #: starts and `control advance_day` steps it. The cloud used `date.today()`
-    #: everywhere, so the moment anyone pressed Advance day the two disagreed and the
-    #: cloud was interpreting "tomorrow", "this week" and every plan horizon against a
-    #: day the world had already left. Learned from the frames the device already
-    #: sends — `status.payload.sim_date` and `day_advanced.sim_date` — so nothing on
-    #: the wire had to change for the cloud to stop guessing.
+    #: The device runs a SimulatedClock that `advance_day` steps, so `date.today()`
+    #: disagrees with the world the moment anyone presses it. Learned from frames the
+    #: device already sends, so nothing on the wire had to change. DESIGN.md §3.
     world_today: str | None = None
 
 
@@ -771,7 +767,7 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
         await graph_resume_monitor(proposal.goal_id, proposal.model_dump(mode="json"))
     elif sender_role == "device" and frame_type == "status":
         status = Status(**frame)
-        # The device's clock, learned from a frame it was already sending (v8.1).
+        # The device's clock, learned from a frame it was already sending.
         registry.set_world_today(device_id, status.payload.sim_date)
         await registry.send_to_uis(device_id, status.model_dump(mode="json"))
         await push_board(device_id, board.on_status(device_id, status.goal_id, status.model_dump(mode="json")))
@@ -794,9 +790,9 @@ async def route_message(sender_role: Role, device_id: str, frame: dict[str, Any]
         # that ride alongside it already updated the cards; this is just the "what
         # happened today" list, relayed straight through to the boards.
         #
-        # v8.1: and it is the frame that says the world moved, so it is the one that
-        # must not be missed. A goal created straight after Advance day, with no status
-        # in between, would otherwise be interpreted against yesterday.
+        # The frame that says the world moved, so the one that must not be missed: a
+        # goal created straight after Advance day, with no status in between, would
+        # otherwise be interpreted against yesterday.
         advanced = DayAdvanced(**frame)
         registry.set_world_today(device_id, advanced.sim_date)
         await registry.send_to_uis(device_id, advanced.model_dump(mode="json"))
@@ -1004,10 +1000,8 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
     async with goal_lock(goal_id):
         state = await asyncio.to_thread(
             graph_nodes.start_goal, graph, user_goal.text, goal_id, capabilities,
-            # v8.1: the day the WORLD is on, not the day this process is on. Read here
-            # rather than inside the graph because only the hub knows which home the
-            # goal belongs to — the clock is per device, and two homes can be on
-            # different simulated days.
+            # Read here rather than inside the graph: only the hub knows which home the
+            # goal belongs to, and two homes can be on different simulated days.
             registry.world_today(device_id).isoformat(),
         )
     if state.get("error"):
@@ -1408,7 +1402,7 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> lis
     if not window or not (window.get("start") and window.get("end")):
         return []
 
-    # THE PROVENANCE GUARD (v8.1). `contract.constraints.hard` is the RESOLVED set for
+    # THE PROVENANCE GUARD. `contract.constraints.hard` is the RESOLVED set for
     # this goal — what it was given, not what it brought — so an away window in it may
     # have been AUTHORED by this goal (the trip it is about) or merely INHERITED from a
     # household that already knows it is away. Promoting either meant every goal
@@ -1428,8 +1422,8 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> lis
     # live promotes normally (different dates), but a re-approval that merely re-states
     # the live window does not. That is the intended reading — a household fact is
     # authored once — and the entry retires itself on `expires_on` either way.
-    # v8.1: the household's clock is the DEVICE's — expiry, `captured_on` and every
-    # re-resolution below have to agree with the world the plans are dated in.
+    # The household's clock is the DEVICE's — expiry, `captured_on` and every
+    # re-resolution below must agree with the world the plans are dated in.
     today = registry.world_today(device_id)
     before_profile = await asyncio.to_thread(load_family_profile)
     if _window_already_household(before_profile, kind, window, today=today):

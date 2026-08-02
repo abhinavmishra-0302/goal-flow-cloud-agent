@@ -201,7 +201,7 @@ class GraphState(TypedDict, total=False):
     # per session by the hub). The interpreter judges actionability against THIS
     # rather than a hardcoded topic list — see capability_digest.
     device_capabilities: dict[str, Any]
-    #: v8.1 — the day THE WORLD is on (ISO), as the device last reported it. Empty
+    #: The day THE WORLD is on (ISO), as the device last reported it. Empty
     #: means nobody has said, and every node falls back to real today. Stamped once,
     #: when the goal starts: a goal is interpreted, grounded and dispatched against a
     #: single day, and re-reading the clock mid-run would let a world tick land in the
@@ -1314,9 +1314,9 @@ def present_understanding(state: GraphState) -> GraphState:
         for entry in accepted:
             if entry.get("scope") == "goal" and not entry.get("expires_on") and window_end:
                 entry["expires_on"] = window_end
-        # v8.1: stamped and expiry-checked against the WORLD's day. A rule captured on
-        # simulated Monday that says `captured_on` was the real Sunday is a rule whose
-        # own expiry maths is a day out from the plan it is meant to bind.
+        # Stamped and expiry-checked against the WORLD's day: a rule captured on
+        # simulated Monday but dated the real Sunday has expiry maths a day out from
+        # the plan it binds.
         today = _today(state)
         written = append_constraints(accepted, today=today)
         if written:
@@ -1852,7 +1852,7 @@ def start_goal(
     interpreter judges actionability against it, so what the assistant can do
     follows the hardware that is plugged in rather than a list in this file.
 
-    ``world_today`` (v8.1) is the device's simulated date — the day this goal is FOR.
+    ``world_today`` is the device's simulated date — the day this goal is FOR.
     Stamped into the state once, here, so every node in the run reasons about the same
     day; omitted, the run falls back to real today. See ``_today``.
     """
