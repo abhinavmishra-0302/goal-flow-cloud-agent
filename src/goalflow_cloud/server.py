@@ -1034,6 +1034,9 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
             goal_id=goal_id,
             kind="out_of_scope",
             message=explanation.get("message") or "That goal is outside what I can help with.",
+            # The close below is scheduled in the same breath, so the surface can be told
+            # exactly how long it has instead of guessing (v9).
+            closes_in_s=OUT_OF_SCOPE_DWELL_S,
         )
         logger.info("task_status status=done gate=out_of_scope")
         # The bracket is ALREADY open (v7.4 opens it on arrival), and re-opening would

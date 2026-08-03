@@ -244,7 +244,8 @@ dispatch — today, when the interpreter declines an out-of-scope goal.
 
 ```json
 { "type": "notice", "goal_id": "...", "kind": "out_of_scope",
-  "message": "That's outside what I do. I'm your home goal assistant — I can help with <the device's advertised capabilities>. Try one of those and I'll get going." }
+  "message": "That's outside what I do. I'm your home goal assistant — I can help with <the device's advertised capabilities>. Try one of those and I'll get going.",
+  "closes_in_s": 4.5 }
 ```
 
 `kind` is `"out_of_scope"` (declined by the interpreter) or `"declined"` (v4.1,
@@ -252,6 +253,16 @@ active). A `"declined"` notice is emitted when the create phase is **cancelled a
 understanding gate** (`understanding_response { confirmed: false }`, or an aborted
 create flow) — sent ALONGSIDE `chat_ui_close { goal_id }` so the input (Bixby) surface
 can SPEAK the cancellation while the webview closes.
+
+**`closes_in_s`** (v9, optional) — seconds until the cloud closes the webview, set
+only where that close is **already scheduled**. Today that is the out-of-scope refusal,
+which posts `_close_after(..., OUT_OF_SCOPE_DWELL_S)` in the same breath as the notice.
+
+It is on the wire so the refusal card can draw a **real** remaining-time indicator. The
+alternative was for the UI to hold its own copy of the dwell, which would drift silently
+the first time the cloud changed it — the same class of untruth as a determinate progress
+bar over an indeterminate run. Absent/`null` means *no scheduled close*, and the UI then
+draws no countdown at all rather than inventing a deadline.
 
 ### `chat_ui_open` / `chat_ui_close` (cloud → ui, v4.1) — the create-phase bracket
 
