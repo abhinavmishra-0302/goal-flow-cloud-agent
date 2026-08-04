@@ -1291,7 +1291,13 @@ async def _close_after(device_id: str, goal_id: str, seconds: float) -> None:
 #: decoration: the tap moved the goal from the chat to the board, and a hand-off with no
 #: visible moment reads as a crash. Long enough to register as a transition, short enough
 #: that nobody is waiting on it.
-SAVE_DWELL_S = 1.6
+#:
+#: v9: 1.6 -> 3.0. At 1.6 the screen was up for barely longer than it takes to focus on it,
+#: and the close reads as an interruption rather than an ending — the sentence under the
+#: spinner ("your Family Hub takes it from here…") is two lines nobody finished. This is
+#: the LAST thing the user sees of the create phase before the webview vanishes; it can
+#: afford three seconds. The chat's own floor stays above it (App.tsx MIN_SAVING_MS).
+SAVE_DWELL_S = 3.0
 
 #: How long the webview will hold open waiting for another goal to finish re-planning
 #: after a household change (v7). The re-plan is a real LLM call on the device, so this is
