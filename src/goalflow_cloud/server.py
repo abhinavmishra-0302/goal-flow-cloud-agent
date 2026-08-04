@@ -1505,7 +1505,12 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> lis
             f"\"you're away · from {source}\". Do not invent other wording for those two fields — they "
             "are read by a person who wants to know why a day is empty, not what the system called it.\n"
             "Then adjust the days immediately before and after if it helps: use up what would spoil "
-            "before leaving, and keep the first day back light, because the kitchen will be bare."
+            "before leaving, and keep the first day back light, because the kitchen will be bare.\n"
+            "Those two rows are still DINNERS. Give each one a real dish the household could cook "
+            "tonight — 'Spinach and paneer stir-fry', 'Lentil soup with toast' — using what the "
+            "kitchen actually has. 'Use up leftovers before away' and 'Light meal after away' are "
+            "descriptions of your own instruction, not meals; the reason goes in \"why\", never in "
+            "the title. This rule does NOT apply to the skipped rows above, whose title is fixed."
         )
         # ARM BEFORE SENDING. The device can answer faster than we can set this up, and a
         # waiter registered after the fact waits for an event that already fired.
