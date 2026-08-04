@@ -575,16 +575,6 @@ class Notice(_ContractModel):
     #: a new kind never fails validation and vanishes.
     kind: str
     message: str
-    #: v9: how long this surface has before the cloud closes the webview under it,
-    #: in seconds. Only set where a close is genuinely already scheduled (today:
-    #: the out-of-scope refusal, which posts ``_close_after`` in the same breath).
-    #:
-    #: It is on the wire because the alternative is a duplicated constant. The refusal
-    #: card draws a real remaining-time indicator, and a countdown the UI GUESSED would
-    #: drift silently the first time this dwell changed — which is exactly the bug the
-    #: v9 pass deleted from the working screen. None means "no scheduled close", and
-    #: the UI then shows no countdown rather than inventing one.
-    closes_in_s: float | None = None
 
 
 # ---------------------------------------------------------------------------
