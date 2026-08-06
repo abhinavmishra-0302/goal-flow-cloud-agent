@@ -97,8 +97,12 @@ class Settings:
     #: inside a gate the user is already reading. Move to s2.1-pro by topping up API
     #: credit at https://fish.audio/app/developers; nothing else changes.
     fish_model: str = field(default_factory=lambda: os.getenv("FISH_MODEL", "s2.1-pro-free"))
-    #: A fish.audio voice model id. Empty = fish's default voice, which is a perfectly
-    #: good demo voice and one less thing to configure.
+    #: A fish.audio voice model id. Empty = fish's default voice.
+    #:
+    #: The DEMO's voice is set in `.env.example` (an id, not a secret) rather than here,
+    #: so a run with no configuration at all still speaks — with fish's default — instead
+    #: of failing on a voice this account may not own. Measured cost of the chosen voice
+    #: over the default, same sentence: TTFA 373ms → 990ms, total 4.6s → 5.1s.
     fish_reference_id: str = field(default_factory=lambda: os.getenv("FISH_REFERENCE_ID", ""))
     #: wav | pcm | mp3 | opus. mp3 because every browser plays it from an <audio> src
     #: with no decoding of our own.
