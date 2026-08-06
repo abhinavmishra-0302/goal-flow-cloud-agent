@@ -35,14 +35,26 @@ class Utterance:
     """One thing the cloud is prepared to say, and the audio for it once made."""
 
     id: str
+    #: The WORDS, clean — no emotion tags. This is what goes on the wire as
+    #: `speech.payload.text`: the caption, the screen-reader string, and the only thing
+    #: left when synthesis fails. "[warm] Here's what I understood" is none of those.
     text: str
-    #: What moment this speaks for — "understanding" today. Carried so a UI can decide
-    #: whether it still wants to hear it (a gate answered before the audio arrives).
+    #: What moment this speaks for. Carried so a UI can decide whether it still wants to
+    #: hear it (a gate answered before the audio arrives).
     cue: str
     goal_id: str = ""
+    #: v11.1: what is actually SENT TO fish.audio — `text` with this cue's emotion cue
+    #: prefixed. Kept separate rather than stripped on the way out because the split is
+    #: the invariant: two fields that must differ are safer than one field two callers
+    #: disagree about. Empty falls back to `text`.
+    spoken: str = ""
     #: The complete mp3, populated after the first successful synthesis. Empty until
     #: then, and left empty if synthesis fails — a partial body is never cached.
     audio: bytes = field(default=b"", repr=False)
+
+    def to_synthesize(self) -> str:
+        """What fish.audio should receive."""
+        return self.spoken or self.text
 
 
 #: id -> Utterance, oldest first.
@@ -60,20 +72,22 @@ def utterance_id_for(goal_id: str, cue: str) -> str:
     return f"u-{goal_id}-{cue}"
 
 
-def mint_utterance(goal_id: str, cue: str, text: str) -> Utterance:
+def mint_utterance(goal_id: str, cue: str, text: str, spoken: str = "") -> Utterance:
     """Register ``text`` as speakable and return it. Re-minting is idempotent.
 
     Re-minting the same (goal, cue) with the SAME text keeps the cached audio; with
     different text it replaces the entry, because the sentence has changed and the old
     bytes now say something untrue. That happens for real: confirming a captured rule
     at the gate re-resolves the constraints behind it.
+
+    ``text`` is the clean caption; ``spoken`` is the tagged variant for fish.audio.
     """
     key = utterance_id_for(goal_id, cue)
     existing = _utterances.get(key)
     if existing is not None and existing.text == text:
         _utterances.move_to_end(key)
         return existing
-    utterance = Utterance(id=key, text=text, cue=cue, goal_id=goal_id)
+    utterance = Utterance(id=key, text=text, cue=cue, goal_id=goal_id, spoken=spoken)
     _utterances[key] = utterance
     _utterances.move_to_end(key)
     while len(_utterances) > MAX_UTTERANCES:

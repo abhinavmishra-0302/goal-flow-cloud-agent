@@ -42,6 +42,7 @@ from goalflow_cloud.speech import (  # noqa: E402
     speech_enabled,
     utterance_id_for,
 )
+from goalflow_cloud.speech import cues  # noqa: E402
 from goalflow_cloud.speech.client import speech_off_reason  # noqa: E402
 from goalflow_cloud.speech.utterances import MAX_UTTERANCES, reset_utterances  # noqa: E402
 
@@ -115,10 +116,23 @@ def main() -> int:
     check(spoken.startswith("Here's what I understood."), "the read comes first")
     check(GOAL_GATE["objective"] in spoken, "the objective is spoken verbatim, not paraphrased")
     check(spoken.rstrip().endswith("?"), "it ENDS on the question — that is what the buttons answer")
-    check("August 4" in spoken and "August 9" in spoken, "the window is spoken as dates")
     check("2026-08-04" not in spoken, "an ISO date is never read aloud")
-    check("peanut allergy" in spoken and "low sodium" in spoken, "the enforced rules are named")
-    check("2 household rules" in spoken, "and counted")
+    # v11.1 CUT THE WINDOW, and the measurement says why it went first: v11.0 ran 15.0s,
+    # naming all four rules is 12.0s, naming only the safety-critical ones is 10.6s, and
+    # a bare count is 8.2s. The window was the cheapest 3s to lose — it is on the card,
+    # and the card is where the button is.
+    check("August 4" not in spoken and "covers" not in spoken,
+          "the date window is NOT spoken — it was the first 3s cut, and it is on the card")
+    check("peanut allergy" in spoken and "low sodium" in spoken,
+          "the SAFETY-critical rules are still named: a listener whose eyes are elsewhere "
+          "has to hear that the allergy was understood")
+    check("no pork" not in _understanding_speech({**GOAL_GATE, "constraints": [
+              *GOAL_GATE["constraints"], {"kind": "dietary", "label": "no pork"}]}),
+          "and the ones that cannot hurt anyone are COUNTED, not named — that is where "
+          "the remaining seconds went")
+    check("1 more rule" in _understanding_speech({**GOAL_GATE, "constraints": [
+              *GOAL_GATE["constraints"], {"kind": "dietary", "label": "no pork"}]}),
+          "counted, so nothing is silently dropped")
     check(
         "prefers white meat" not in spoken,
         "PREFERENCES ARE NOT SPOKEN — the gate is about what can block the plan, and a "
@@ -138,8 +152,8 @@ def main() -> int:
     )
     check(
         _understanding_speech({"objective": "Plan dinner", "constraints": []})
-        == "Here's what I understood. Plan dinner. Shall I go ahead and plan it?",
-        "no window and no constraints still yields a whole, sayable sentence",
+        == "Here's what I understood. Plan dinner. Shall I go ahead?",
+        "no constraints still yields a whole, sayable sentence",
     )
 
     # --- list and date helpers -------------------------------------------------------
@@ -202,6 +216,93 @@ def main() -> int:
     check(frame["payload"]["text"] == spoken,
           "the text rides along: it is the caption, and the only thing left when synthesis fails")
 
+    # --- v11.1: the other four cues ---------------------------------------------------
+    #
+    # The composing screen. Two beats, and the reason there are two and not seven is
+    # measured: five of the harness's engines resolve in under 100ms while a spoken
+    # sentence takes 2-5s, so narrating them is arithmetically impossible rather than
+    # merely undesirable.
+    held = cues.working_start([
+        {"kind": "allergens", "label": "peanut allergy"},
+        {"kind": "medical", "label": "low sodium"},
+        {"kind": "dietary", "label": "no pork"},
+    ])
+    check("peanut allergy" in held and "low sodium" in held,
+          "the working beat names the SAFETY rules — it is the second time they are said, "
+          "and the point is that they are being kept while the user watches something else")
+    check("no pork" not in held, "and not the ones that cannot hurt anyone")
+    check(cues.working_start([]) == "Checking your kitchen and your calendar.",
+          "with no constraints it still says what it is doing")
+    check("rules" in cues.working_plan(),
+          "the planner beat promises the rules check — the harness's whole claim, in a "
+          "family's words rather than 'Safety Policy Engine'")
+
+    # The plan. The ONE cue an LLM writes, and the one with no fallback.
+    check(cues.plan_narration({"narration": "Chicken three nights."}) == "Chicken three nights.",
+          "the device's narration is passed through verbatim")
+    check(cues.plan_narration({}) == "" and cues.plan_narration(None) == "",
+          "NO DETERMINISTIC FALLBACK — code can only count rows, and 'seven items, three "
+          "needing approval' describes a data structure, not a week of dinners")
+    check(cues.plan_narration({"narration": "x" * 400}) == "",
+          "an over-long narration is DROPPED, not truncated — a sentence cut mid-clause "
+          "is worse than no sentence, and the plan is on screen either way")
+
+    # The approvals. Firm by name, everything else counted.
+    payload = {"proposals": [
+        {"tier": "firm", "action": "place a grocery order", "args": {"estimatedTotal": 58.2}},
+        {"tier": "firm", "action": "move Thursday's dinner"},
+        {"tier": "light", "action": "add to the shopping list"},
+        {"tier": "auto", "action": "defrost the chicken"},
+        {"tier": "auto", "action": "set a reminder"},
+    ]}
+    spoken_approvals = cues.approvals(payload)
+    check("2 things need your approval" in spoken_approvals, "firm proposals are counted")
+    check("place a grocery order" in spoken_approvals, "and NAMED — they spend money")
+    check("about $58" in spoken_approvals, "with the money spoken as words, not '58.2'")
+    check("20 cents" not in spoken_approvals and "58.20" not in spoken_approvals,
+          "and WITHOUT cents: the total is an estimate, and reading the cents aloud "
+          "claims a precision the number does not have")
+    check("defrost the chicken" not in spoken_approvals,
+          "auto proposals are never named — they already happened")
+    check("2 smaller" in spoken_approvals, "but they ARE counted, so nothing is hidden")
+    check("One thing needs your approval" in cues.approvals(
+        {"proposals": [{"tier": "firm", "action": "order groceries"}]}),
+        "one firm proposal is singular, not '1 things'")
+    check("Nothing needs your approval" in cues.approvals(
+        {"proposals": [{"tier": "auto", "action": "x"}]}),
+        "an all-auto plan SAYS so — a silent plan screen and a broken voice look "
+        "identical from the sofa")
+    check(cues.approvals({"proposals": []}) == "", "and no proposals at all says nothing")
+
+    # Saved.
+    check("Family Board" in cues.saved(), "the close says where the goal went")
+    # THE ONE CUE WITH A HARD DEADLINE: the chat UI unmounts at MIN_SAVING_MS = 3800ms,
+    # taking the audio with it. Measured at ~16.8 chars/second in the demo voice, so the
+    # budget is ~60 characters. The first version was 95 and was cut off mid-word on
+    # every run — which does not read as a timing bug, it reads as a crash.
+    check(len(cues.saved()) <= 60,
+          f"the saved line must fit the 3800ms webview close (~60 chars); it is "
+          f"{len(cues.saved())}")
+    check("other goals" in cues.saved(updating_others=True),
+          "and when the cross-goal fan-out is running it accounts for the wait rather "
+          "than promising a calm that has not started")
+
+    # --- emotion tags -----------------------------------------------------------------
+    check(cues.apply_emotion("Your week's ready.", "plan").startswith("[excited]"),
+          "the plan is excited — there is genuinely good news")
+    check(cues.apply_emotion("Here's what I understood.", "understanding").startswith("[warm]"),
+          "the gate is warm, NOT excited: enthusiasm over a peanut allergy reads as a "
+          "system that does not understand what it is holding")
+    check(cues.strip_tags("[warm] Here's what I understood.") == "Here's what I understood.",
+          "TAGS NEVER REACH THE CAPTION — payload.text is what a screen reader announces")
+    check(cues.strip_tags("[a] one [b] two") == "one two", "every tag, not just the first")
+    check(cues.apply_emotion("[sad] already tagged", "plan") == "[sad] already tagged",
+          "an explicit tag is never double-prefixed")
+    for cue_name in ("understanding", "working_start", "working_plan", "plan", "approvals", "saved"):
+        tagged = cues.apply_emotion("Some words.", cue_name)
+        check(tagged.startswith("["), f"cue {cue_name!r} has an emotion")
+        check(cues.strip_tags(tagged) == "Some words.", f"and cue {cue_name!r} strips clean")
+
     # --- the HTTP route --------------------------------------------------------------
     #
     # Imported late and deliberately: importing the server pulls in the whole hub, and
@@ -237,7 +338,7 @@ def main() -> int:
     reset_utterances()
     for f in failures:
         print(f"  FAIL {f}")
-    print("gate 31 (speech): " + ("PASS" if not failures else f"FAIL: {len(failures)}"))
+    print("gate 31 (speech, 5 cues): " + ("PASS" if not failures else f"FAIL: {len(failures)}"))
     return 0 if not failures else 1
 
 

@@ -28,6 +28,7 @@ past.
 | v5.1 | `agent_event: harness`, `plan_progress.total` |
 | v6 | `constraints.hard`: `peak_hours`, `away_window`, `budget_envelope`; `understanding.constraints` (provenance) and `proposed_constraints`/`capture_only`; `understanding_response.accepted_constraint_ids` |
 | v7 | `control: constraints_changed` (+ `payload.hard`/`steer`/`note`) — the one adaptation path that does not ask; `status.plan_changed_note`; `GoalSummary.plan_changed_note`; `plan[].status`/`status_reason`; `notice.kind: updating_goals` (non-terminal); `understanding.preferences` (the soft half, one row per entry); `understanding.constraints[].kind`; store-side `display_to` narrows `knew`/`constraints` on both the gate and `present_plan` without touching what is dispatched or enforced; `agent_event: thinking` gains `kind`/`step`/`detail`; `plan_ready.payload` gains `considered`/`rejected` |
+| v11.1 | `speech` gains five cues (`understanding`, `working_start`, `working_plan`, `plan`, `approvals`, `saved`); `plan_ready.payload.narration` — the plan written to be spoken, by the same compose call that writes the plan |
 | v11 | `speech` (cloud → ui) + the hub's `GET /speech/{utterance_id}.mp3` — the understanding gate said out loud. Additive and ignorable; absent entirely when the cloud has no TTS key |
 
 ## Transport
@@ -514,10 +515,21 @@ next. It exists so a waiting goal is visible rather than appearing stalled.
     ],
     "considered": 17,
     "rejected": [ { "option": "pork belly stir-fry", "reason": "no pork" } ],
+    "narration": "Chicken three nights, fish on Thursday, and everything that would have spoiled gets used up before you go away.",
     "explanation": "..."
   } }
 ```
 
+- `narration` (v11.1, optional) is the plan **written to be spoken aloud** — two short
+  sentences, ≤40 words. It is NOT a shorter `explanation`: that one is read on a screen
+  and may be a paragraph; this one is heard once, by someone who may not be looking.
+  Both are written by the SAME compose call, which is the point — a narration produced
+  by a second model reading the plan afterwards could contradict it, and would cost a
+  round trip at the one moment the user is waiting for good news. Absent or empty means
+  the voice says nothing about the plan; there is deliberately **no deterministic
+  fallback**, because code can only count rows and "seven items, three needing approval"
+  describes a data structure rather than a week of dinners. The cloud drops it silently
+  if it exceeds 260 characters — a sentence cut mid-clause is worse than no sentence.
 - `considered` / `rejected` (v7, optional) are **model-authored and display-only**.
   Nothing downstream reads them: a wrong rejection reason costs a wrong sentence, which
   is the right price for the clearest evidence a person can be given that something

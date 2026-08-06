@@ -52,6 +52,7 @@ from goalflow_cloud.memory.store import (
     soft_candidates,
 )
 from goalflow_cloud.models.contract import Dispatch
+from goalflow_cloud.speech import cues as speech_cues
 
 logger = logging.getLogger(__name__)
 
@@ -491,10 +492,17 @@ def _understanding_speech(understanding: dict[str, Any]) -> str:
     already display-ready; there is no interpretation left to do, only assembly.
 
     WHAT IT SAYS, and why in this order: the read first (that is the thing being
-    confirmed), the enforced rules second (they are what makes the read trustworthy),
-    the question last (it must be the most recent thing in the listener's ear when the
-    buttons are what answers it). The window is omitted rather than spoken for a
-    capture, which has no plan and therefore no window.
+    confirmed), the rules second (they are what makes the read trustworthy), the
+    question last (it must be the most recent thing in the listener's ear when the
+    buttons are what answers it).
+
+    v11.1 — SHORTER, AND THE MEASUREMENT SAYS WHERE THE TIME WENT. v11.0 spoke the date
+    window and named every rule, and ran 15.0s. Timed against the same voice: naming all
+    four rules is 12.0s, naming only the safety-critical ones and counting the rest is
+    10.6s, and a bare count is 8.2s. So the NAMES are the cost, not the window — the
+    window went first and bought 3s, and the rest comes from naming only what can hurt
+    someone. A peanut allergy has to be audible to a listener whose eyes are elsewhere;
+    "no pork" is on the card, and the card is where the button is.
     """
     objective = str(understanding.get("objective") or "").strip().rstrip(".")
 
@@ -514,25 +522,28 @@ def _understanding_speech(understanding: dict[str, Any]) -> str:
     if not objective:
         return ""
 
-    parts = [f"Here's what I understood. {objective}."]
+    rows = understanding.get("constraints") or []
+    safety, other = [], 0
+    for row in rows:
+        label = str(row.get("label") or "").strip()
+        if not label:
+            continue
+        if speech_cues._is_safety(str(row.get("kind") or ""), label):
+            safety.append(label)
+        else:
+            other += 1
 
-    window = understanding.get("time_window") or {}
-    start = _speak_date(str(window.get("start") or ""))
-    end = _speak_date(str(window.get("end") or ""))
-    if start and end and start != end:
-        parts.append(f"That covers {start} through {end}.")
-    elif start or end:
-        parts.append(f"That's for {start or end}.")
+    held = speech_cues.speak_list(safety, limit=2)
+    if held and other:
+        rules = f" — holding the {held}, plus {other} more {'rule' if other == 1 else 'rules'}"
+    elif held:
+        rules = f" — holding the {held}"
+    elif other:
+        rules = f", holding {other} household {'rule' if other == 1 else 'rules'}"
+    else:
+        rules = ""
 
-    labels = [str(row.get("label") or "").strip() for row in understanding.get("constraints") or []]
-    spoken = _speak_list(labels)
-    if spoken:
-        count = len([label for label in labels if label])
-        noun = "rule" if count == 1 else "rules"
-        parts.append(f"I'll hold {count} household {noun}: {spoken}.")
-
-    parts.append("Shall I go ahead and plan it?")
-    return " ".join(parts)
+    return f"Here's what I understood. {objective}{rules}. Shall I go ahead?"
 
 
 def _understanding_thought_fallback(intent: dict[str, Any], hard: dict[str, Any], domain: str) -> str:

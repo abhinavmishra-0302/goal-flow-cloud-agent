@@ -73,6 +73,7 @@ from goalflow_cloud.speech import (
     speech_enabled,
     stream_utterance,
 )
+from goalflow_cloud.speech import cues as speech_cues
 from goalflow_cloud.speech.client import (
     aclose as speech_aclose,
     describe_speech,
@@ -171,6 +172,14 @@ def log_frame(direction: str, role: str, frame: dict[str, Any]) -> None:
 INPUT_SURFACE_FRAMES = frozenset(
     {"hello_ack", "goal_accepted", "chat_ui_open", "chat_ui_close", "notice"}
 )
+
+#: Cues worth REPLAYING to a webview that binds mid-create (v11.1).
+#:
+#: The gate's question and the plan's summary describe screens that are still up when a
+#: socket rebinds. Progress narration does not — "checking your kitchen" replayed after
+#: grounding has finished is a voice describing the past, and `saved` replayed is a
+#: promise about a surface that is closing. Those are spoken live or not at all.
+REPLAYABLE_CUES = frozenset({"understanding", "plan", "approvals"})
 
 
 def wants(surface: str, frame_type: str | None) -> bool:
@@ -488,20 +497,28 @@ class ConnectionRegistry:
                 log_frame("out", "ui", notice)
                 await websocket.send_json(notice)
                 return
+            # v11: each cached utterance rides AFTER the frame it speaks for, never
+            # before — the UI plays audio against a screen it can already see, and a
+            # voice arriving first would be describing an empty panel.
+            speech = create_phase.get("speech") or {}
+
+            async def replay_speech(cue: str) -> None:
+                frame = speech.get(cue)
+                if frame is not None:
+                    log_frame("out", "ui", frame)
+                    await websocket.send_json(frame)
+
             if present_plan is None and understanding is not None:
                 log_frame("out", "ui", understanding)
                 await websocket.send_json(understanding)
-                # v11: AFTER the card, never before. The UI plays the audio against the
-                # gate it can see; arriving first it would be a voice describing an
-                # empty panel. Cleared the moment the gate is answered, so this only
-                # ever fires for a socket that binds while the question is still live.
-                speech = create_phase.get("speech")
-                if speech is not None:
-                    log_frame("out", "ui", speech)
-                    await websocket.send_json(speech)
+                # Cleared the moment the gate is answered, so this only ever fires for a
+                # socket that binds while the question is still live.
+                await replay_speech("understanding")
             if present_plan is not None:
                 log_frame("out", "ui", present_plan)
                 await websocket.send_json(present_plan)
+                await replay_speech("plan")
+                await replay_speech("approvals")
         except Exception:
             logger.debug("create_phase_replay_failed", exc_info=True)
 
@@ -515,10 +532,9 @@ class ConnectionRegistry:
             "understanding": None,
             "present_plan": None,
             "notice": None,
-            # v11: the speech frame that accompanied the understanding, replayed with
-            # it and cleared with it. A voice-over is only ever wanted next to the card
-            # it is about — a gate the user already answered must not start talking.
-            "speech": None,
+            # v11: the speech frames worth replaying, keyed BY CUE — a voice-over is
+            # only ever wanted next to the frame it is about. See capture_speech.
+            "speech": {},
         }
 
     def create_phase_goal(self, device_id: str) -> str | None:
@@ -539,11 +555,24 @@ class ConnectionRegistry:
             cp["understanding"] = frame
 
     def capture_speech(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> None:
-        """Cache the speech frame as broadcast (create-phase goal only)."""
+        """Cache a speech frame BY CUE, for replay beside the frame it speaks for.
+
+        v11.1 — this was a single slot when there was a single cue. With five, a slot
+        would mean the last utterance spoken is the one a rebinding webview hears, which
+        for a socket that reconnects during planning is "saved to your Family Board"
+        arriving before the plan.
+
+        REPLAYABLE CUES ONLY. Progress narration (``working_*``) is deliberately not
+        cached: it describes a phase that is, by the time anyone replays it, over. A
+        webview rejoining mid-run should rejoin the WORK — which is what `chat_ui_open`
+        plus the live stream already do.
+        """
+        if frame.get("payload", {}).get("cue") not in REPLAYABLE_CUES:
+            return
         session = self._sessions.get(device_id)
         cp = session.create_phase if session else None
         if cp and cp.get("goal_id") == goal_id:
-            cp["speech"] = frame
+            cp.setdefault("speech", {})[frame["payload"]["cue"]] = frame
 
     def resolve_understanding(self, device_id: str, goal_id: str) -> None:
         """The gate has been ANSWERED — stop replaying it.
@@ -567,8 +596,9 @@ class ConnectionRegistry:
             cp["understanding"] = None
             # ...and its voice with it, for the same reason: a socket rejoining during
             # planning should rejoin the WORK, not be read a question it already
-            # answered out loud.
-            cp["speech"] = None
+            # answered out loud. Only the GATE's cue — a plan narration cached later is
+            # about a screen that is still up.
+            (cp.get("speech") or {}).pop("understanding", None)
 
     def capture_present_plan(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> None:
         """Cache the present_plan frame as broadcast (create-phase goal only)."""
@@ -893,7 +923,15 @@ async def emit_speech(device_id: str, goal_id: str, cue: str, text: str) -> None
     if not text.strip() or not speech_enabled():
         return
     try:
-        utterance = mint_utterance(goal_id, cue, text.strip())
+        # THE CAPTION AND THE AUDIO SPLIT HERE, and this is the only place they may.
+        # `caption` is what a UI shows and a screen reader announces; `spoken` is what
+        # fish.audio receives, with this cue's emotion cue on the front. A tag that
+        # reaches the caption is a bug the user reads.
+        caption = speech_cues.strip_tags(text)
+        spoken = speech_cues.apply_emotion(caption, cue)
+        if not caption:
+            return
+        utterance = mint_utterance(goal_id, cue, caption, spoken=spoken)
         extension = get_settings().fish_format or "mp3"
         frame = Speech(
             goal_id=goal_id,
@@ -950,7 +988,7 @@ async def speech_audio(filename: str) -> Response:
     async def body() -> AsyncIterator[bytes]:
         chunks: list[bytes] = []
         try:
-            async for chunk in stream_utterance(utterance.text):
+            async for chunk in stream_utterance(utterance.to_synthesize()):
                 chunks.append(chunk)
                 yield chunk
         except SpeechUnavailable as exc:
@@ -1390,6 +1428,14 @@ async def handle_approval(device_id: str, approval: Approval) -> None:
     # BEFORE the webview closes, so the chat surface can hold its "saving, and updating
     # your other goals…" screen for exactly as long as the work takes.
     waiting_on = await fan_out_household_change(device_id, approval.goal_id)
+    # v11.1 — closure, and it must be able to account for the wait. When approving this
+    # goal changed the household, other goals are re-planning and the saving screen
+    # stays up for 20-30s; a voice promising to "keep an eye on it" while the surface
+    # is visibly still working would be describing a calm that has not started.
+    if registry.create_phase_goal(device_id) == approval.goal_id:
+        await emit_speech(
+            device_id, approval.goal_id, "saved", speech_cues.saved(bool(waiting_on))
+        )
     # v4.1: the initial approval ends the create phase — the user's final tap, the
     # moment the board becomes the primary surface. Close the webview bracket. GUARDED
     # on "still the create-phase goal", so a board adaptation approval (whose goal is
@@ -1723,6 +1769,61 @@ async def relay_agent_event(device_id: str, event: AgentEvent) -> None:
     if event.event == "task_update":
         await push_board(device_id, board.on_task_update(device_id, event.goal_id, event.payload or {}))
     await registry.send_to_uis(device_id, event.model_dump(mode="json"))
+    # v11.1: the composing screen's two beats, spoken AFTER the frame that causes them.
+    if event.event == "harness":
+        await _speak_working_beat(device_id, event.goal_id, event.payload or {})
+
+
+#: Which harness beats are worth saying out loud, and what each says.
+#:
+#: TWO, out of seven engines, and the arithmetic is the reason: Pre-Check, Capability
+#: Manager, Safety, Approval and Monitor all resolve in under 100ms (measured), while a
+#: spoken sentence takes 2-5s. A voice announcing an engine that has already finished is
+#: describing the past, and five of them in a row would still be talking after the plan
+#: arrived. Grounding (10s+) and the Planner are the only two with room to be narrated.
+#:
+#: Keyed on ``active`` deliberately: a beat that fires on ``done`` would announce work
+#: that is over.
+_SPOKEN_BEATS = {"grounding": "working_start", "planner": "working_plan"}
+
+
+async def _speak_working_beat(device_id: str, goal_id: str, payload: dict[str, Any]) -> None:
+    """Narrate the composing screen, at most once per engine per goal.
+
+    ONLY FOR THE CREATE-PHASE GOAL. An adaptation re-plans on the board days later,
+    firing the same beats — and a fridge that starts narrating grounding while the
+    family is looking at something else is the feature becoming noise. The create phase
+    is the one place someone is definitely watching this run happen.
+    """
+    if _SPOKEN_BEATS.get(str(payload.get("module") or "")) is None:
+        return
+    if str(payload.get("status") or "") != "active":
+        return
+    if registry.create_phase_goal(device_id) != goal_id:
+        return
+    cue = _SPOKEN_BEATS[str(payload["module"])]
+    if cue == "working_start":
+        contract = dispatched_contracts.get(goal_id) or {}
+        text = speech_cues.working_start(_speakable_constraints(contract))
+    else:
+        text = speech_cues.working_plan()
+    await emit_speech(device_id, goal_id, cue, text)
+
+
+def _speakable_constraints(contract: dict[str, Any]) -> list[dict[str, Any]]:
+    """The dispatched hard block as {kind, label} rows the cue engine can read.
+
+    Reads the CONTRACT rather than re-resolving the store: this must name what is
+    actually being enforced on this goal right now, and the store is a superset that
+    resolution has already narrowed once.
+    """
+    hard = ((contract.get("constraints") or {}).get("hard")) or {}
+    rows: list[dict[str, Any]] = []
+    for kind, value in hard.items():
+        label = graph_nodes._constraint_display(kind, value)
+        if label:
+            rows.append({"kind": kind, "label": label})
+    return rows
 
 
 async def handle_plan_ready(device_id: str, plan_ready: PlanReady) -> None:
@@ -1753,6 +1854,21 @@ async def handle_plan_ready(device_id: str, plan_ready: PlanReady) -> None:
     # to a chat webview that binds mid-create — no-op unless this is the create-phase
     # goal (an adaptation replan for an already-approved goal isn't cached).
     registry.capture_present_plan(device_id, plan_ready.goal_id, present_frame)
+
+    # v11.1 — the plan, then what it needs from you. TWO utterances on ONE screen
+    # (ProposalList renders inside PlanCard), and that is deliberate: kept separate, the
+    # UI's queue can drop the approvals line the moment the user starts tapping
+    # proposals, which a single merged 16-second string could not.
+    #
+    # Only for the create-phase goal — an adaptation re-plan days later lands on the
+    # board, where nobody asked to be read to.
+    if registry.create_phase_goal(device_id) == plan_ready.goal_id:
+        await emit_speech(
+            device_id, plan_ready.goal_id, "plan", speech_cues.plan_narration(payload)
+        )
+        await emit_speech(
+            device_id, plan_ready.goal_id, "approvals", speech_cues.approvals(payload)
+        )
 
     approval_frame = state.get("approval_frame")
     if approval_frame:
