@@ -80,7 +80,8 @@ run — the other two degrade to a deterministic fallback.
   `memory/store.py` (§ "Memory" below): `hard` is assembled by code only, `soft` is picked by a
   small relevance call with tag-matching as the fallback.
 - **`present_understanding`** — the **confirm-understanding gate**: second `interrupt()`.
-  Builds a short LLM-authored `thought` one-liner plus the `knew` hard-constraint chips
+  Builds a short DETERMINISTIC `thought` one-liner (LLM-authored until v11.2 — see
+  AGENTS.md) plus the `knew` hard-constraint chips
   and pauses (`kind: "understanding_confirmation"`) until the hub resumes it with the
   user's `understanding_response`. `route_after_understanding` sends a confirmed
   response to `build_contract`; a decline routes to `goal_declined`.

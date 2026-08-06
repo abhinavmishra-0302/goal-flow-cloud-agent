@@ -567,40 +567,33 @@ def _understanding_thought_fallback(intent: dict[str, Any], hard: dict[str, Any]
 
 
 def _understanding_thought(intent: dict[str, Any], hard: dict[str, Any], domain: str) -> str:
-    """Tiny LLM one-liner for the understanding gate, with a deterministic fallback."""
-    fallback = _understanding_thought_fallback(intent, hard, domain)
-    settings = get_settings()
-    max_tokens = settings.openrouter_max_tokens
-    thought_tokens = min(max_tokens, 60) if isinstance(max_tokens, int) and max_tokens > 0 else 60
-    try:
-        llm = build_chat(max_tokens=thought_tokens, timeout=15, max_retries=0, temperature=0.2)
-        with timed_llm("thought"):
-            response = llm.invoke(
-                [
-                    (
-                        "system",
-                        "Write one short sentence describing how GoalFlow will approach the user's goal. "
-                        "Keep it under 22 words. Do not mention internal systems or uncertainty.",
-                    ),
-                    (
-                        "human",
-                        "Objective: {objective}\nDomain: {domain}\nTime window: {time_window}\n"
-                        "Hard constraints: {hard}".format(
-                            objective=intent.get("objective", ""),
-                            domain=domain,
-                            time_window=intent.get("time_window") or {},
-                            hard=hard,
-                        ),
-                    ),
-                ]
-            )
-        thought = " ".join(str(getattr(response, "content", "") or "").split())
-        if len(thought) > 180:
-            thought = thought[:177].rstrip() + "..."
-        return thought if thought else fallback
-    except Exception:
-        logger.exception("understanding_thought_llm_failed")
-        return fallback
+    """The gate's one-liner. DETERMINISTIC since v11.2 — this used to be an LLM call.
+
+    IT WAS TWO LLM CALLS PER GOAL FOR A STRING NOBODY RENDERS, and all three parts of
+    that sentence are worth spelling out, because none of them is obvious from here:
+
+    1. NOBODY RENDERS IT. v9 stopped showing `thought` on the goal gate — the sentence
+       restated the heading, counted constraints the chips already showed, and promised
+       what the next screen would do. The chat UI now renders it ONLY when
+       `capture_only` is true, and the capture path builds its own text with
+       `_capture_thought()`, which is plain code. So this function's output has reached
+       no screen since v9. The board never read it either.
+    2. TWICE. LangGraph re-executes a node from the top when it resumes from
+       `interrupt()`, and the call sits above the interrupt in `present_understanding`.
+       Confirmed in every goal across two days of logs: `thought: 2`.
+    3. IT WAS ALREADY FALLING BACK. `max_tokens` was 60 on a REASONING model, where
+       reasoning tokens are billed against that same budget — so the response came back
+       `finish_reason: length` with empty or truncated content, and the deterministic
+       fallback below was what actually shipped. The LLM was paying for a sentence it
+       rarely got to write.
+
+    And it mattered beyond waste: two extra provider round trips per goal, inside the
+    interpretation window v8 spent a milestone shortening, are two more chances to draw
+    the 429 that was hanging the demo (see verify_no_hang.py, gate 33).
+
+    The wire field stays — the contract has it and a capture still uses it.
+    """
+    return _understanding_thought_fallback(intent, hard, domain)
 
 
 def _today(state: GraphState) -> date:

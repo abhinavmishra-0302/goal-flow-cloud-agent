@@ -42,8 +42,13 @@ Change `CONTRACT.md` first when the protocol moves.
   startup `llm_routing` log line are the places to look. `OPENROUTER_REASONING_EFFORT`
   exists and ships OFF — read the comment in `config.py` before setting it, `low` was
   measured to break the output outright.
-- Each LLM call logs `llm_call site=... elapsed_ms=...`. Four run per goal creation:
-  `interpret`, `detect_constraints`, `soft_select`, `thought`.
+- Each LLM call logs `llm_call site=... elapsed_ms=...`. **THREE** run per goal creation:
+  `interpret`, `detect_constraints`, `soft_select`. (v11.2 removed a fourth, `thought`.
+  It ran TWICE per goal — LangGraph re-executes a node from the top when resuming from
+  `interrupt()` — for a sentence no surface has rendered since v9, and at `max_tokens=60`
+  on a reasoning model it mostly came back `finish_reason: length` and fell back to the
+  deterministic version anyway. Two wasted round trips inside the interpretation window,
+  and two more chances to draw a provider 429.)
 
 ## Architecture / key files
 
