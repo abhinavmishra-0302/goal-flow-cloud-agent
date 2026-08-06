@@ -99,6 +99,10 @@ Change `CONTRACT.md` first when the protocol moves.
   every surface renders exactly as it did in v10. That is deliberate and it is the
   opposite of the LLM-only rule — read the package docstring before making a failure here
   loud. Gate: `scripts/verify_speech.py` (31).
+  **`SPEECH_ENABLED=false` silences it while leaving the key in place** — the dev
+  switch, because iterating on the UI with a key set means the fridge talks on every
+  reload. The startup `speech_routing` line names WHICH reason it is quiet (no key vs
+  switched off), so a silent run is never a mystery.
   **Autoplay is the UI's problem and it is real**: a browser refuses `audio.play()`
   without a user gesture, so the chat UI degrades to a "Hear this" tap
   (`goal-flow-agent-chat-ui/src/lib/speech.ts`). Do not "fix" that by assuming autoplay.

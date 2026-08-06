@@ -73,7 +73,11 @@ from goalflow_cloud.speech import (
     speech_enabled,
     stream_utterance,
 )
-from goalflow_cloud.speech.client import aclose as speech_aclose, describe_speech
+from goalflow_cloud.speech.client import (
+    aclose as speech_aclose,
+    describe_speech,
+    speech_off_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -936,8 +940,12 @@ async def speech_audio(filename: str) -> Response:
         logger.info("speech_serve id=%s cached=1 bytes=%d", utterance_id, len(utterance.audio))
         return Response(content=utterance.audio, media_type=media_type)
 
-    if not speech_enabled():
-        raise HTTPException(status_code=503, detail="speech is not configured")
+    off = speech_off_reason()
+    if off:
+        # The REASON goes in the detail: this 503 is read by whoever is wondering why
+        # the demo is quiet, and "speech is not configured" does not distinguish a
+        # missing key from a switch someone flipped last week.
+        raise HTTPException(status_code=503, detail=f"speech is off — {off}")
 
     async def body() -> AsyncIterator[bytes]:
         chunks: list[bytes] = []

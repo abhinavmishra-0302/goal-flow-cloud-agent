@@ -54,22 +54,46 @@ async def aclose() -> None:
         _http_client = None
 
 
-def speech_enabled() -> bool:
-    """Is there a key to speak with?
+#: What counts as "off" in SPEECH_ENABLED. Spelled out rather than `== "false"` because
+#: the value is typed by a human into a .env at speed, and being pedantic about which of
+#: `0` / `no` / `off` / `False` they picked would just be a silently-still-talking demo.
+_OFF_WORDS = frozenset({"false", "0", "off", "no"})
 
-    THE FEATURE FLAG IS THE KEY. There is no separate SPEECH_ENABLED, because a second
-    switch only creates a state where the key is present and the voice is mysteriously
-    off. No key ⇒ no ``speech`` frame is ever sent ⇒ every UI renders exactly as it did
-    in v10.
+
+def speech_off_reason() -> str:
+    """Why the voice is silent, or "" when it is not.
+
+    Two reasons, and they are DIFFERENT — which is the whole point of returning a string
+    rather than a bool. "no key" is an environment that was never set up; "switched off"
+    is a deliberate choice someone made and may have forgotten. A single "off" would
+    leave the developer who set SPEECH_ENABLED=false last week hunting a key that is
+    sitting right there.
     """
-    return bool(get_settings().fish_api_key.strip())
+    settings = get_settings()
+    if settings.speech_enabled.strip().lower() in _OFF_WORDS:
+        return "switched off (SPEECH_ENABLED)"
+    if not settings.fish_api_key.strip():
+        return "no FISH_API_KEY"
+    return ""
+
+
+def speech_enabled() -> bool:
+    """Can this process speak? Off ⇒ no ``speech`` frame is ever sent ⇒ every UI renders
+    exactly as it did in v10."""
+    return not speech_off_reason()
 
 
 def describe_speech() -> str:
-    """One line for startup logging: what the voice is, or why there isn't one."""
+    """One line for startup logging: what the voice is, or WHY there isn't one.
+
+    The "why" carries the weight. Silence is a legal state here, so the log is the only
+    thing standing between a deliberately quiet run and twenty minutes of debugging a
+    feature that is working exactly as configured.
+    """
     settings = get_settings()
-    if not settings.fish_api_key.strip():
-        return "off (no FISH_API_KEY)"
+    reason = speech_off_reason()
+    if reason:
+        return f"off — {reason}"
     voice = settings.fish_reference_id.strip() or "default voice"
     return f"model={settings.fish_model} voice={voice} format={settings.fish_format}"
 
@@ -107,9 +131,12 @@ async def stream_utterance(text: str) -> AsyncIterator[bytes]:
     connection and is not worth a second code path.
     """
     settings = get_settings()
+    # Checked HERE too, not just at the frame: a UI holding a URL from before the switch
+    # was flipped would otherwise still be able to make this process synthesize.
+    off = speech_off_reason()
+    if off:
+        raise SpeechUnavailable(off)
     key = settings.fish_api_key.strip()
-    if not key:
-        raise SpeechUnavailable("no FISH_API_KEY")
 
     url = f"{settings.fish_base_url.rstrip('/')}/v1/tts"
     headers = {

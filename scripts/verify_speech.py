@@ -42,6 +42,7 @@ from goalflow_cloud.speech import (  # noqa: E402
     speech_enabled,
     utterance_id_for,
 )
+from goalflow_cloud.speech.client import speech_off_reason  # noqa: E402
 from goalflow_cloud.speech.utterances import MAX_UTTERANCES, reset_utterances  # noqa: E402
 
 #: The shape present_understanding hands to the interrupt — objective, window, and the
@@ -73,18 +74,41 @@ def main() -> int:
         if not ok:
             failures.append(what)
 
-    # --- the key IS the feature flag -------------------------------------------------
+    # --- the key, and the off switch --------------------------------------------------
     previous = os.environ.pop("FISH_API_KEY", None)
+    previous_switch = os.environ.pop("SPEECH_ENABLED", None)
     try:
         check(speech_enabled() is False, "with no FISH_API_KEY, speech is off")
+        check("FISH_API_KEY" in speech_off_reason(),
+              "and the reason SAYS the key is missing — silence is legal here, so the "
+              "only thing between a quiet run and a debugging session is this string")
         os.environ["FISH_API_KEY"] = "   "
         check(speech_enabled() is False, "a whitespace-only key is not a key")
+
         os.environ["FISH_API_KEY"] = "test-key"
-        check(speech_enabled() is True, "a key turns the voice on with no second switch")
+        check(speech_enabled() is True, "a key alone turns the voice on")
+
+        # The v11.1 switch: silence WITHOUT vandalising a credential.
+        for word in ("false", "FALSE", "0", "off", "no", "  False  "):
+            os.environ["SPEECH_ENABLED"] = word
+            check(speech_enabled() is False, f"SPEECH_ENABLED={word!r} silences the voice")
+        check("SPEECH_ENABLED" in speech_off_reason(),
+              "and the reason distinguishes a FLIPPED SWITCH from a missing key — "
+              "otherwise the developer who set it last week hunts a key that is right there")
+
+        for word in ("", "true", "1", "on", "yes", "anything-else"):
+            os.environ["SPEECH_ENABLED"] = word
+            check(speech_enabled() is True, f"SPEECH_ENABLED={word!r} leaves it on")
+
+        # The switch must not be able to CONJURE a voice out of no key.
+        os.environ["SPEECH_ENABLED"] = "true"
+        os.environ["FISH_API_KEY"] = ""
+        check(speech_enabled() is False, "SPEECH_ENABLED=true cannot speak without a key")
     finally:
-        os.environ.pop("FISH_API_KEY", None)
-        if previous is not None:
-            os.environ["FISH_API_KEY"] = previous
+        for name, value in (("FISH_API_KEY", previous), ("SPEECH_ENABLED", previous_switch)):
+            os.environ.pop(name, None)
+            if value is not None:
+                os.environ[name] = value
 
     # --- what the gate says ----------------------------------------------------------
     spoken = _understanding_speech(GOAL_GATE)

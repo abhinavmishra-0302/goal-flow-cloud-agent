@@ -72,10 +72,23 @@ class Settings:
     )
 
     # --- v11: the voice (fish.audio TTS) ---
-    #: THE FEATURE FLAG IS THE KEY. Empty = the cloud never sends a `speech` frame and
-    #: every UI behaves exactly as it did in v10. There is deliberately no separate
-    #: SPEECH_ENABLED: a second switch only buys a state where the key is set and the
-    #: voice is mysteriously off.
+    #: The OFF SWITCH. `false`/`0`/`off`/`no` (any case) silences the voice while leaving
+    #: the key in place; anything else, including unset, leaves it on.
+    #:
+    #: v11.0 SHIPPED WITHOUT THIS AND ARGUED AGAINST IT — "the feature flag is the key,
+    #: a second switch only buys a state where the key is set and the voice is
+    #: mysteriously off". The argument was about MISCONFIGURATION and it was answering
+    #: the wrong question. Development is not misconfiguration: iterating on the UI with
+    #: a real key in `.env` meant the fridge talking on every reload, and the only way to
+    #: stop it was to comment out a credential and remember to put it back. A switch you
+    #: have to vandalise a secret to reach is not a switch.
+    #:
+    #: The original worry is answered by the LOG rather than by the absent flag: the
+    #: startup `speech_routing` line names WHICH reason the voice is off (no key vs
+    #: switched off), so "mysteriously" was always a logging problem.
+    speech_enabled: str = field(default_factory=lambda: os.getenv("SPEECH_ENABLED", ""))
+    #: The key. Empty = the cloud never sends a `speech` frame and every UI behaves
+    #: exactly as it did in v10.
     #:
     #: This is the ONE credential in this repo whose absence is not an error. Speech is
     #: a decoration on a gate that is already complete and actionable without it, so a
