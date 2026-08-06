@@ -71,6 +71,38 @@ class Settings:
         default_factory=lambda: os.getenv("OPENROUTER_REASONING_EFFORT", "")
     )
 
+    # --- v11: the voice (fish.audio TTS) ---
+    #: THE FEATURE FLAG IS THE KEY. Empty = the cloud never sends a `speech` frame and
+    #: every UI behaves exactly as it did in v10. There is deliberately no separate
+    #: SPEECH_ENABLED: a second switch only buys a state where the key is set and the
+    #: voice is mysteriously off.
+    #:
+    #: This is the ONE credential in this repo whose absence is not an error. Speech is
+    #: a decoration on a gate that is already complete and actionable without it, so a
+    #: missing key, an outage or a 429 must cost the demo nothing — the opposite of the
+    #: OPENROUTER_* settings above, which fail loudly on purpose.
+    fish_api_key: str = field(default_factory=lambda: os.getenv("FISH_API_KEY", ""))
+    fish_base_url: str = field(
+        default_factory=lambda: os.getenv("FISH_BASE_URL", "https://api.fish.audio")
+    )
+    #: s2.1-pro (production) | s2.1-pro-free (no TTFA guarantee) | s2-pro | s1.
+    #: Sent as an HTTP HEADER, not a body field — see speech/client.py.
+    fish_model: str = field(default_factory=lambda: os.getenv("FISH_MODEL", "s2.1-pro"))
+    #: A fish.audio voice model id. Empty = fish's default voice, which is a perfectly
+    #: good demo voice and one less thing to configure.
+    fish_reference_id: str = field(default_factory=lambda: os.getenv("FISH_REFERENCE_ID", ""))
+    #: wav | pcm | mp3 | opus. mp3 because every browser plays it from an <audio> src
+    #: with no decoding of our own.
+    fish_format: str = field(default_factory=lambda: os.getenv("FISH_FORMAT", "mp3"))
+    #: 64 | 128 | 192 kbps. 64 is transparent for speech and a third of the bytes.
+    fish_mp3_bitrate: int = field(
+        default_factory=lambda: int(os.getenv("FISH_MP3_BITRATE", "64"))
+    )
+    #: low | normal | balanced. `balanced` is the voice-agent setting; `normal` buys
+    #: quality with first-chunk latency, which is the wrong trade when someone is
+    #: waiting to be spoken to.
+    fish_latency: str = field(default_factory=lambda: os.getenv("FISH_LATENCY", "balanced"))
+
     # --- Household constraint store ---
     #: Where the household constraint store lives (v6). Empty = the repo's seed,
     #: `data/memory/family_profile.json`.

@@ -18,6 +18,10 @@ dependencies = [
     "langchain-openai",
     "python-dotenv",
     "pydantic",
+    # v11: the fish.audio TTS client. Present transitively already (langchain-openai
+    # pulls it in), but declared because this repo now IMPORTS it directly — an
+    # indirect dependency that a sibling could drop is not a dependency.
+    "httpx",
 ]
 
 [build-system]

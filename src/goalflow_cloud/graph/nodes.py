@@ -434,6 +434,107 @@ def _constraint_display(kind: str, value: Any) -> str:
     return str(value).replace("_", " ")
 
 
+# ---------------------------------------------------------------------------
+# v11 — what the gate SAYS OUT LOUD
+# ---------------------------------------------------------------------------
+
+#: How many constraints get named aloud before the sentence starts summarising. Three
+#: is where a spoken list stops being a list and becomes an inventory; the card beside
+#: it shows all of them anyway, so the voice's job is to make the reader look at it,
+#: not to replace it.
+SPOKEN_CONSTRAINT_LIMIT = 3
+
+
+def _speak_date(iso: str) -> str:
+    """"2026-08-04" -> "August 4". An ISO date read aloud is a string of digits.
+
+    fish.audio's ``normalize`` turns "August 4" into "August fourth"; it does NOT
+    rescue "2026-08-04", which comes out as the numbers. Formatting here rather than
+    trusting the synthesiser is the difference between a date and a serial number.
+    """
+    try:
+        parsed = date.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return ""
+    # Not %-d: that is glibc-only, and this file is imported by gates that must run
+    # anywhere. int() drops the leading zero just as well.
+    return f"{parsed.strftime('%B')} {int(parsed.strftime('%d'))}"
+
+
+def _speak_list(items: list[str], limit: int = SPOKEN_CONSTRAINT_LIMIT) -> str:
+    """["a", "b", "c", "d", "e"] -> "a, b, c and 2 more". Oxford-free: this is speech.
+
+    ONE OVER THE LIMIT IS NAMED, not summarised. "a, b, c and 1 more" is longer than
+    "a, b, c and d" AND tells you less — the summary only earns its place once it is
+    standing in for more than one thing.
+    """
+    present = [item for item in items if item]
+    named = present[: limit + 1] if len(present) == limit + 1 else present[:limit]
+    remaining = len(present) - len(named)
+    if not named:
+        return ""
+    if remaining > 0:
+        return ", ".join(named) + f" and {remaining} more"
+    if len(named) == 1:
+        return named[0]
+    return ", ".join(named[:-1]) + f" and {named[-1]}"
+
+
+def _understanding_speech(understanding: dict[str, Any]) -> str:
+    """The understanding gate, as a spoken sentence. Deterministic — NO LLM CALL.
+
+    WHY NOT THE LLM. It is right there, it writes the `thought` one-liner two functions
+    down, and a model would phrase this more warmly than a template does. It still
+    costs a round trip at the exact moment v8 spent a whole milestone deleting round
+    trips from — the interpretation window is the slowest, least explicable wait in the
+    product, and this sits at the end of it. The material is already structured and
+    already display-ready; there is no interpretation left to do, only assembly.
+
+    WHAT IT SAYS, and why in this order: the read first (that is the thing being
+    confirmed), the enforced rules second (they are what makes the read trustworthy),
+    the question last (it must be the most recent thing in the listener's ear when the
+    buttons are what answers it). The window is omitted rather than spoken for a
+    capture, which has no plan and therefore no window.
+    """
+    objective = str(understanding.get("objective") or "").strip().rstrip(".")
+
+    if understanding.get("capture_only"):
+        rules = _speak_list(
+            [
+                str(rule.get("label") or str(rule.get("kind") or "").replace("_", " ")).strip()
+                for rule in understanding.get("proposed_constraints") or []
+            ]
+        )
+        if not rules:
+            # A capture with nothing to capture should not have reached this gate, but
+            # a voice that says "you'd like me to remember ." is worse than silence.
+            return ""
+        return f"Got it. You'd like me to remember {rules}. Should I save that?"
+
+    if not objective:
+        return ""
+
+    parts = [f"Here's what I understood. {objective}."]
+
+    window = understanding.get("time_window") or {}
+    start = _speak_date(str(window.get("start") or ""))
+    end = _speak_date(str(window.get("end") or ""))
+    if start and end and start != end:
+        parts.append(f"That covers {start} through {end}.")
+    elif start or end:
+        parts.append(f"That's for {start or end}.")
+
+    labels = [str(row.get("label") or "").strip() for row in understanding.get("constraints") or []]
+    spoken = _speak_list(labels)
+    if spoken:
+        count = len([label for label in labels if label])
+        noun = "rule" if count == 1 else "rules"
+        parts.append(f"I'll hold {count} household {noun}: {spoken}.")
+
+    parts.append("Shall I go ahead and plan it?")
+    return " ".join(parts)
+
+
 def _understanding_thought_fallback(intent: dict[str, Any], hard: dict[str, Any], domain: str) -> str:
     tw = intent.get("time_window") or {}
     # Counted off the resolved block rather than a fixed list of five keys, so a new
@@ -1199,6 +1300,9 @@ def capture_gate(state: GraphState) -> GraphState:
         "proposed_constraints": proposed,
         "thought": _capture_thought(proposed),
     }
+    # v11: composed from the finished dict, so it can never describe a read the card is
+    # not showing. See _understanding_speech.
+    understanding["speech"] = _understanding_speech(understanding)
     incoming = interrupt(
         {
             "kind": "understanding_confirmation",
@@ -1291,6 +1395,13 @@ def present_understanding(state: GraphState) -> GraphState:
         "proposed_constraints": state.get("proposed_constraints") or [],
         "thought": _understanding_thought(intent, hard, domain),
     }
+    # v11: what this gate says out loud. Composed from the finished dict — the voice
+    # and the card are then guaranteed to be reading the same thing, which is the whole
+    # point of a confirmation. Note it is deliberately NOT recomposed after a captured
+    # rule re-resolves the constraints below: the sentence was already spoken by then,
+    # and rewriting it would leave the utterance registry holding audio that no longer
+    # matches its text.
+    understanding["speech"] = _understanding_speech(understanding)
     incoming = interrupt(
         {
             "kind": "understanding_confirmation",

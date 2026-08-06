@@ -25,7 +25,10 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from collections.abc import AsyncIterator
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response, StreamingResponse
 from pydantic import ValidationError
 
 from goalflow_cloud.board import BoardService
@@ -55,12 +58,22 @@ from goalflow_cloud.models.contract import (
     Proposal,
     Role,
     SelectDevice,
+    Speech,
+    SpeechPayload,
     Status,
     Understanding,
     UnderstandingPayload,
     UnderstandingResponse,
     UserGoal,
 )
+from goalflow_cloud.speech import (
+    SpeechUnavailable,
+    lookup_utterance,
+    mint_utterance,
+    speech_enabled,
+    stream_utterance,
+)
+from goalflow_cloud.speech.client import aclose as speech_aclose, describe_speech
 
 logger = logging.getLogger(__name__)
 
@@ -474,6 +487,14 @@ class ConnectionRegistry:
             if present_plan is None and understanding is not None:
                 log_frame("out", "ui", understanding)
                 await websocket.send_json(understanding)
+                # v11: AFTER the card, never before. The UI plays the audio against the
+                # gate it can see; arriving first it would be a voice describing an
+                # empty panel. Cleared the moment the gate is answered, so this only
+                # ever fires for a socket that binds while the question is still live.
+                speech = create_phase.get("speech")
+                if speech is not None:
+                    log_frame("out", "ui", speech)
+                    await websocket.send_json(speech)
             if present_plan is not None:
                 log_frame("out", "ui", present_plan)
                 await websocket.send_json(present_plan)
@@ -490,6 +511,10 @@ class ConnectionRegistry:
             "understanding": None,
             "present_plan": None,
             "notice": None,
+            # v11: the speech frame that accompanied the understanding, replayed with
+            # it and cleared with it. A voice-over is only ever wanted next to the card
+            # it is about — a gate the user already answered must not start talking.
+            "speech": None,
         }
 
     def create_phase_goal(self, device_id: str) -> str | None:
@@ -508,6 +533,13 @@ class ConnectionRegistry:
         cp = session.create_phase if session else None
         if cp and cp.get("goal_id") == goal_id:
             cp["understanding"] = frame
+
+    def capture_speech(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> None:
+        """Cache the speech frame as broadcast (create-phase goal only)."""
+        session = self._sessions.get(device_id)
+        cp = session.create_phase if session else None
+        if cp and cp.get("goal_id") == goal_id:
+            cp["speech"] = frame
 
     def resolve_understanding(self, device_id: str, goal_id: str) -> None:
         """The gate has been ANSWERED — stop replaying it.
@@ -529,6 +561,10 @@ class ConnectionRegistry:
         cp = session.create_phase if session else None
         if cp and cp.get("goal_id") == goal_id:
             cp["understanding"] = None
+            # ...and its voice with it, for the same reason: a socket rejoining during
+            # planning should rejoin the WORK, not be read a question it already
+            # answered out loud.
+            cp["speech"] = None
 
     def capture_present_plan(self, device_id: str, goal_id: str, frame: dict[str, Any]) -> None:
         """Cache the present_plan frame as broadcast (create-phase goal only)."""
@@ -833,6 +869,99 @@ async def emit_chat_ui_open(device_id: str, goal_id: str, goal_text: str = "") -
     await registry.send_to_uis(device_id, frame)
 
 
+async def emit_speech(device_id: str, goal_id: str, cue: str, text: str) -> None:
+    """Broadcast a ``speech`` frame for ``text`` — or, silently, nothing at all.
+
+    THREE WAYS THIS DOES NOTHING, all of them normal:
+
+    - no ``FISH_API_KEY`` — the whole feature is off, and every UI renders as it did
+      in v10;
+    - empty ``text`` — a gate with nothing worth saying (see ``_understanding_speech``,
+      which returns "" rather than voicing a half-sentence);
+    - the frame fails to build — logged at debug and dropped.
+
+    None of them is an error, and none of them may interrupt the create phase. This is
+    the one place in the hub that swallows rather than surfaces, and the reason is in
+    ``speech/__init__.py``: the card behind this voice is already complete.
+
+    Costs one dict and no network. Synthesis happens when a UI GETs the URL.
+    """
+    if not text.strip() or not speech_enabled():
+        return
+    try:
+        utterance = mint_utterance(goal_id, cue, text.strip())
+        extension = get_settings().fish_format or "mp3"
+        frame = Speech(
+            goal_id=goal_id,
+            payload=SpeechPayload(
+                utterance_id=utterance.id,
+                cue=cue,
+                text=utterance.text,
+                url=f"/speech/{utterance.id}.{extension}",
+            ),
+        ).model_dump(mode="json")
+    except Exception:
+        logger.debug("speech_frame_failed goal=%s cue=%s", goal_id, cue, exc_info=True)
+        return
+    await registry.send_to_uis(device_id, frame)
+    registry.capture_speech(device_id, goal_id, frame)
+
+
+@app.get("/speech/{filename}")
+async def speech_audio(filename: str) -> Response:
+    """Serve the audio for a minted utterance. THE ONLY HTTP ROUTE THIS HUB HAS.
+
+    Synthesis happens HERE, on the fetch, not when the frame was sent — so the
+    understanding gate never waits on fish.audio, and an utterance nobody plays is
+    never paid for.
+
+    The id is looked up, never trusted as content: only text the cloud itself minted is
+    reachable, so this cannot be used as a synthesis oracle against the account's
+    credits. An unknown id is a 404, which is also what a UI holding a frame from
+    before a restart gets — correct, because the utterance registry is process-local
+    by design (see speech/utterances.py).
+
+    Cached bytes are returned whole; a first fetch streams through while accumulating,
+    so the browser starts playing on fish's first chunk rather than after its last.
+    """
+    utterance_id = filename.rsplit(".", 1)[0]
+    utterance = lookup_utterance(utterance_id)
+    if utterance is None:
+        raise HTTPException(status_code=404, detail="unknown utterance")
+
+    media_type = {"mp3": "audio/mpeg", "wav": "audio/wav", "opus": "audio/opus"}.get(
+        get_settings().fish_format, "application/octet-stream"
+    )
+    if utterance.audio:
+        logger.info("speech_serve id=%s cached=1 bytes=%d", utterance_id, len(utterance.audio))
+        return Response(content=utterance.audio, media_type=media_type)
+
+    if not speech_enabled():
+        raise HTTPException(status_code=503, detail="speech is not configured")
+
+    async def body() -> AsyncIterator[bytes]:
+        chunks: list[bytes] = []
+        try:
+            async for chunk in stream_utterance(utterance.text):
+                chunks.append(chunk)
+                yield chunk
+        except SpeechUnavailable as exc:
+            # Nothing has been yielded yet when this fires before the first chunk, so
+            # the client sees an empty 200 rather than a 502 — Starlette has already
+            # sent the status line by the time a generator body can fail. An empty body
+            # is a decode error in the browser, the <audio> element's error handler
+            # runs, and the UI falls back to its silent state. That is the right
+            # outcome and it needs no code on the UI side beyond an onerror.
+            logger.warning("speech_unavailable id=%s reason=%s", utterance_id, exc)
+            return
+        # Cache only a COMPLETE synthesis. A truncated body cached here would be
+        # replayed forever as a sentence that stops halfway.
+        utterance.audio = b"".join(chunks)
+        logger.info("speech_serve id=%s cached=0 bytes=%d", utterance_id, len(utterance.audio))
+
+    return StreamingResponse(body(), media_type=media_type)
+
+
 async def emit_chat_ui_close(device_id: str, goal_id: str) -> None:
     """Close the create-phase bracket (v4.1), GUARDED: fires only while ``goal_id``
     is still the session's current create-phase goal (the replay-cache key). That
@@ -1081,6 +1210,9 @@ async def handle_user_goal(device_id: str, user_goal: UserGoal) -> None:
         # Cache the understanding exactly as broadcast, for replay to a chat webview
         # that binds mid-create.
         registry.capture_understanding(device_id, goal_id, understanding_frame)
+        # v11: and say it out loud. AFTER the card, and it cannot delay it — nothing is
+        # synthesized here, only a URL minted (speech/__init__.py, rule 2).
+        await emit_speech(device_id, goal_id, "understanding", understanding.get("speech") or "")
         # A CAPTURE is not a goal: no plan is coming and nothing will run, so it must
         # not put a card on the board. A board that showed "we've gone vegan" as a
         # goal card would leave a row nothing can ever complete.
@@ -1698,3 +1830,15 @@ setup_logging()
 # Always logged, on its own line: which provider serves a run is the difference between a
 # 1.5s call and a 50s one, and "why was that run slow" is unanswerable without it.
 logger.info("llm_routing %s model=%s", graph_nodes.describe_routing(), get_settings().openrouter_model)
+
+# v11: and whether this run has a voice. Logged unconditionally for the same reason —
+# "why was the demo silent" is otherwise a hunt through an .env, and the answer is
+# almost always that the key is not set. Silence is a legal state here, so it has to be
+# an announced one.
+logger.info("speech_routing %s", describe_speech())
+
+
+@app.on_event("shutdown")
+async def _close_speech_client() -> None:
+    """Release the shared fish.audio connection pool."""
+    await speech_aclose()

@@ -22,14 +22,17 @@ scripts/verify_constraints.py     # gate 15: constraints resolve per goal; the e
 scripts/verify_capture.py         # gate 16: a household rule is captured only when the user says yes
 scripts/verify_persistence.py     # gate 12: a goal survives a cloud restart at its gate
 scripts/verify_generic_gate.py    # gate 10: actionability is generic (needs an API key — the slow one)
+scripts/verify_speech.py          # gate 31: the voice says the right thing, and its absence costs nothing
 data/memory/family_profile.json   # household constraint store (sourced, scoped, expiring)
 src/goalflow_cloud/
-  config.py                       # Settings dataclass from env (OPENROUTER_*, WS_*, LOG_LEVEL)
+  config.py                       # Settings dataclass from env (OPENROUTER_*, FISH_*, WS_*, LOG_LEVEL)
   server.py                       # FastAPI WS hub: multi-session registry, routing, relays, graph driving, board pushes  ← start here
   board.py                        # BoardService: folds a goal's frames into one GoalSummary per goal (deterministic, no LLM)
   models/contract.py              # Pydantic mirror of every contract message (lenient extras)
   memory/store.py                 # constraint store: load, resolve per goal, append captures
   graph/nodes.py                  # the StateGraph: nodes, routers, interrupts, checkpointer
+  speech/client.py                # v11: the fish.audio TTS call (streamed; the ONE place we talk to it)
+  speech/utterances.py            # v11: id -> text/bytes, so a URL can never be a synthesis oracle
 ```
 
 ## The LangGraph StateGraph (`graph/nodes.py`)

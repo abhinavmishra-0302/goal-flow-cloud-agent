@@ -458,6 +458,43 @@ class Understanding(_ContractModel):
     payload: UnderstandingPayload
 
 
+# ---------------------------------------------------------------------------
+# speech (cloud -> ui) — v11
+# ---------------------------------------------------------------------------
+
+
+class SpeechPayload(_ContractModel):
+    """One thing the cloud wants said out loud, and where to fetch the audio."""
+
+    #: Opaque handle, deterministic per (goal_id, cue) — a create-phase replay must
+    #: resolve to the audio the UI was already promised, not mint a second one.
+    utterance_id: str
+    #: What moment this speaks for. "understanding" is the only cue in v11; the field
+    #: exists so the next one is a composer and a string, not another frame type.
+    cue: str
+    #: The spoken text, verbatim. Sent alongside the audio because it is the caption,
+    #: the accessibility fallback, and the only thing left when synthesis fails.
+    text: str
+    #: PATH, not an absolute URL — "/speech/<utterance_id>.mp3". The cloud does not
+    #: know which host:port the UI reached it on (a tablet, the Hub browser and a dev
+    #: laptop all differ), and guessing wrong yields a URL that resolves to nothing.
+    #: The UI derives the origin from the socket it is already connected on.
+    url: str
+
+
+class Speech(_ContractModel):
+    """Cloud -> ui: say this. ADDITIVE and IGNORABLE (v11).
+
+    A UI that has never heard of this frame drops it and renders exactly as it did in
+    v10 — which is the whole safety story for a voice-over: the understanding gate is
+    complete, legible and actionable in total silence.
+    """
+
+    type: Literal["speech"] = "speech"
+    goal_id: str
+    payload: SpeechPayload
+
+
 class UnderstandingResponsePayload(_ContractModel):
     confirmed: bool
     #: v6-M4: which proposed constraints the user actually said yes to. Absent or

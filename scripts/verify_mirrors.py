@@ -42,6 +42,11 @@ DEVICE_EXEMPT = {
     # the chat webview on open, closes it on close) is entirely upstream of the device;
     # it neither sends nor receives either frame.
     "chat_ui_open", "chat_ui_close",
+    # v11: the voice is a cloud↔ui concern. The device is upstream of every surface that
+    # has a speaker, and giving it a `speech` mirror would imply it might one day play
+    # one — which is a real option (Tizen.Multimedia on the Hub) but not this version's,
+    # and an unused mirror is how a contract starts lying.
+    "speech",
 }
 
 #: Frames NO ui ever handles inbound (ui→cloud only, or device↔cloud only).
@@ -81,12 +86,15 @@ UIS = [
         # longer a read-mostly slice). It SENDS control + approval now — so those are no
         # longer exempt and MUST appear in its mirror. It still never sends dispatch /
         # plan_ready (device↔cloud frames) or understanding_response (the chat's gate).
-        "types_exempt": {"dispatch", "plan_ready", "understanding_response"},
+        # v11 `speech`: the board is not a create-phase surface and has no gate to
+        # speak. Exempt on purpose — when a board cue is written, this line is what has
+        # to be deleted, which is the decision being made rather than drifting into.
+        "types_exempt": {"dispatch", "plan_ready", "understanding_response", "speech"},
         # It now RENDERS the raw device stream on a goal's detail page, so agent_event /
         # present_plan / proposal / status are handled, not ignored — and because it
         # renders agent_event, the AgentEvent-kind check below now applies to it too.
         # Still exempt: `capabilities` (no board surface), `understanding` (chat's gate).
-        "inbound_exempt": UI_INBOUND_EXEMPT | {"capabilities", "understanding"},
+        "inbound_exempt": UI_INBOUND_EXEMPT | {"capabilities", "understanding", "speech"},
     },
 ]
 

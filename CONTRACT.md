@@ -28,6 +28,7 @@ past.
 | v5.1 | `agent_event: harness`, `plan_progress.total` |
 | v6 | `constraints.hard`: `peak_hours`, `away_window`, `budget_envelope`; `understanding.constraints` (provenance) and `proposed_constraints`/`capture_only`; `understanding_response.accepted_constraint_ids` |
 | v7 | `control: constraints_changed` (+ `payload.hard`/`steer`/`note`) — the one adaptation path that does not ask; `status.plan_changed_note`; `GoalSummary.plan_changed_note`; `plan[].status`/`status_reason`; `notice.kind: updating_goals` (non-terminal); `understanding.preferences` (the soft half, one row per entry); `understanding.constraints[].kind`; store-side `display_to` narrows `knew`/`constraints` on both the gate and `present_plan` without touching what is dispatched or enforced; `agent_event: thinking` gains `kind`/`step`/`detail`; `plan_ready.payload` gains `considered`/`rejected` |
+| v11 | `speech` (cloud → ui) + the hub's `GET /speech/{utterance_id}.mp3` — the understanding gate said out loud. Additive and ignorable; absent entirely when the cloud has no TTS key |
 
 ## Transport
 
@@ -212,6 +213,50 @@ GOAL never implies a confirmed RULE. When the message is *only* a statement
 ("we've gone vegan"), `capture_only: true` says there is no plan coming and the gate
 is asking about the rules alone; confirming it ends with a `notice` of kind
 `captured`, and no board card is ever created.
+
+### `speech` (cloud → ui) — v11
+
+The cloud asking a surface to **say something out loud**. Sent immediately AFTER the
+frame it speaks for (today, only `understanding`), so a UI always has the card on
+screen before the voice describes it.
+
+```json
+{ "type": "speech", "goal_id": "...",
+  "payload": {
+    "utterance_id": "u-<goal_id>-understanding",
+    "cue": "understanding",
+    "text": "Here's what I understood. Plan a week of healthy family dinners that cut food waste. That covers August 4 through August 9. I'll hold 2 household rules: peanut allergy and low sodium. Shall I go ahead and plan it?",
+    "url": "/speech/u-<goal_id>-understanding.mp3"
+  } }
+```
+
+**Additive and ignorable.** A UI that has never heard of this frame drops it and
+renders exactly as it did in v10 — the understanding gate is complete, legible and
+answerable in silence. That is also the failure mode: no `FISH_API_KEY` on the cloud
+means the frame is **never sent at all**, so "no voice" is a normal state, not an error.
+
+- `url` is a **PATH, not an absolute URL**. The cloud does not know which `host:port` a
+  UI reached it on (a tablet, the Hub browser and a dev laptop all differ); the UI
+  resolves it against the origin of the socket it is already connected on.
+- `text` is the spoken words verbatim — the caption, the accessibility fallback, and
+  the only thing left when synthesis fails.
+- `utterance_id` is **deterministic** per (`goal_id`, `cue`): create-phase replay
+  re-sends this frame, and the same sentence must not be synthesized (or billed) twice.
+- `cue` names the moment. `understanding` is the only one in v11; the field exists so
+  the next moment is a string, not another frame type.
+
+**`GET /speech/{utterance_id}.mp3`** — the hub's only HTTP route. Synthesis happens on
+this fetch, not when the frame was sent, so the gate never waits on the TTS provider and
+an utterance nobody plays is never paid for. An unknown id is **404** (only text the
+cloud itself minted is reachable — the URL is not a synthesis oracle); no key is
+**503**; a provider failure closes the body early, which surfaces as the `<audio>`
+element's error handler. Every one of those is a UI that stays quiet.
+
+**Autoplay is the UI's problem, and it is a real one.** A browser rejects
+`audio.play()` with `NotAllowedError` unless the document has user activation, and a
+cross-origin webview additionally needs `allow="autoplay"` on its `<iframe>`. A UI that
+handles this frame MUST degrade to a tap-to-play affordance rather than assume it can
+speak. See the chat UI's `src/lib/speech.ts`.
 
 ### `understanding_response` (ui → cloud)
 
