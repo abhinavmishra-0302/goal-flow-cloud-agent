@@ -1841,6 +1841,39 @@ async def handle_plan_ready(device_id: str, plan_ready: PlanReady) -> None:
         )
     payload = plan_ready.payload.model_dump(mode="json")
     payload["knew"] = build_knew(dispatched_contracts.get(plan_ready.goal_id))
+
+    # v11.2 — A PLAN THAT COULD NOT BE MADE IS A MESSAGE, NOT AN EMPTY PLAN CARD.
+    #
+    # The device now always answers a dispatch, and when planning fails (a provider
+    # 429 being the case that started this) it answers with a precheck HOLD: a
+    # plan_ready carrying zero rows and `precheck.ok = false`. Relayed as a normal
+    # present_plan that renders as "Composed your plan · 0 steps", which is worse than
+    # the hang it replaced — it is a confident lie rather than a stall.
+    #
+    # A create-phase hold is therefore delivered as a terminal `notice`, which is a road
+    # this surface has already been down: the out-of-scope refusal (v7) built the
+    # readable-message-then-timed-close path, gate 27 covers it, and the reducer clears
+    # the stage on any non-`updating_goals` notice. The board still learns the goal is
+    # waiting, because the graph routes to precheck_wait either way.
+    #
+    # ONLY for the create phase. A precheck hold on an adaptation replan days later
+    # belongs on the board, and there is no webview to close.
+    precheck = payload.get("precheck") or {}
+    if precheck.get("ok") is False and registry.create_phase_goal(device_id) == plan_ready.goal_id:
+        reason = next(
+            (row.get("detail") for row in precheck.get("results") or [] if row.get("detail")),
+            payload.get("explanation") or "I couldn't finish this plan — try again in a moment.",
+        )
+        notice = Notice(goal_id=plan_ready.goal_id, kind="planning_held", message=reason)
+        notice_frame = notice.model_dump(mode="json")
+        logger.info("plan_held goal=%s reason=%s", plan_ready.goal_id, reason)
+        await registry.send_to_uis(device_id, notice_frame)
+        # Cached for the same reason the refusal is: a webview that binds late must not
+        # find an empty phase (see _replay_create_phase).
+        registry.capture_notice(device_id, plan_ready.goal_id, notice_frame)
+        await push_board(device_id, board.on_plan_ready(device_id, plan_ready.goal_id, payload))
+        asyncio.create_task(_close_after(device_id, plan_ready.goal_id, OUT_OF_SCOPE_DWELL_S))
+        return
     await push_board(device_id, board.on_plan_ready(device_id, plan_ready.goal_id, payload))
     present = PresentPlan(
         goal_id=plan_ready.goal_id,
