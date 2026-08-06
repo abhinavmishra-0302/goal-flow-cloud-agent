@@ -406,9 +406,28 @@ class BoardService:
             "subtitle": subtitle,
             "progress_pct": progress,
             "pending_tasks": 0 if done else summary.pending_tasks,
-            "next_step": None if done else summary.next_step,
+            # v9 — AN APPLIED ADAPTATION IS NOT "NEXT". `next_step` is set from the
+            # proposal's action when the adaptation is raised ("Swap tonight's dinner to use
+            # the fish"), which is right while it is waiting on a person. The moment the
+            # user approves it, the device sends back an `updated_plan` — the thing has
+            # HAPPENED — and leaving the same sentence under an ➡ arrow tells them it is
+            # still to come. It stayed there through every later tick, because on_status had
+            # no reason to overwrite it.
+            "next_step": None if (done or payload.get("updated_plan")) else summary.next_step,
             "alerts": alerts,
-            "activity": _push(summary.activity, payload.get("note")),
+            # v9 — THE STATUS NOTE IS NOT ACTIVITY. It reads "Executed 3 proposal(s). Goal
+            # 100% (7/7 steps done)." — a ledger entry about our own bookkeeping, in two
+            # sentences, sitting on the card's ✓ line where a family looks to see what
+            # happened to their week. Both halves are already on the card: the percentage
+            # is the bar and the number beside it, and "3 proposals" is a count of an
+            # internal object nobody outside this codebase has a name for.
+            #
+            # `activity` keeps its one true source — a COMPLETED TASK's title, written by
+            # the planner as a short human phrase ("Grocery delivery confirmed"). Gate 13
+            # already pins that rule; this line was the exception to it.
+            #
+            # The note itself is not lost: it still rides the status frame and still shows
+            # in the detail page's history, where a log belongs.
             "plan_changed_note": None if done else changed_note,
             "updated_at": _now(),
         }))

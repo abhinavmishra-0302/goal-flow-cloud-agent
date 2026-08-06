@@ -109,6 +109,32 @@ def main() -> int:
     check(s.alerts.count == 1, f"the answered adaptation clears; the new deferral stands, got {s.alerts.count}")
     check(s.alerts.severity == "warn", f"a deferral is the world's fault -> warn, got {s.alerts.severity!r}")
     check(s.state == "waiting", f"a deferred effect waits on the WORLD, got {s.state!r}")
+    # 5b (v9). A STATUS NOTE IS NOT ACTIVITY, and the case that motivated it is the one
+    # this gate could not see: the real note reads "Executed 3 proposal(s). Goal 100% (7/7
+    # steps done)." — our own bookkeeping, on the card's ✓ line, saying twice over what the
+    # progress bar beside it already says. 3b pins where activity DOES come from (a
+    # completed task's title); without this, the rule had a silent exception.
+    board.on_status(DEV, "g1", {
+        "task_status": "monitoring",
+        "payload": {"executed": [], "note": "Executed 3 proposal(s). Goal 100% (7/7 steps done)."},
+    })
+    s = board.snapshot(DEV)[1][0]
+    check(s.activity == ["Grocery delivery confirmed"],
+          f"a status note must not be logged as activity, got {s.activity}")
+
+    # 5c (v9). AN APPLIED ADAPTATION IS NOT "NEXT". Step 4 put the proposal's action in
+    # next_step, which is right while it waits on a person. Once the device returns an
+    # updated_plan the thing has happened, and the card was still showing it under ➡ —
+    # for every tick after, because nothing overwrote it.
+    board.on_proposal(DEV, "g1", {"payload": {"action": "Swap the nut cake for a fruit platter"}})
+    check(board.snapshot(DEV)[1][0].next_step == "Swap the nut cake for a fruit platter",
+          "a PENDING adaptation is what happens next")
+    board.on_status(DEV, "g1", {
+        "task_status": "monitoring",
+        "payload": {"executed": [], "updated_plan": [{"id": "s1", "title": "Fruit platter"}]},
+    })
+    check(board.snapshot(DEV)[1][0].next_step is None,
+          f"an APPLIED adaptation stops being next, got {board.snapshot(DEV)[1][0].next_step!r}")
 
     # 6. Completion wins over everything.
     board.on_status(DEV, "g1", {"task_status": "done", "payload": {"note": "All set for Sunday"}})

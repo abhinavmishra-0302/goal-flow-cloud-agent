@@ -1291,7 +1291,13 @@ async def _close_after(device_id: str, goal_id: str, seconds: float) -> None:
 #: decoration: the tap moved the goal from the chat to the board, and a hand-off with no
 #: visible moment reads as a crash. Long enough to register as a transition, short enough
 #: that nobody is waiting on it.
-SAVE_DWELL_S = 1.6
+#:
+#: v9: 1.6 -> 3.0. At 1.6 the screen was up for barely longer than it takes to focus on it,
+#: and the close reads as an interruption rather than an ending — the sentence under the
+#: spinner ("your Family Hub takes it from here…") is two lines nobody finished. This is
+#: the LAST thing the user sees of the create phase before the webview vanishes; it can
+#: afford three seconds. The chat's own floor stays above it (App.tsx MIN_SAVING_MS).
+SAVE_DWELL_S = 3.0
 
 #: How long the webview will hold open waiting for another goal to finish re-planning
 #: after a household change (v7). The re-plan is a real LLM call on the device, so this is
@@ -1499,7 +1505,12 @@ async def fan_out_household_change(device_id: str, approved_goal_id: str) -> lis
             f"\"you're away · from {source}\". Do not invent other wording for those two fields — they "
             "are read by a person who wants to know why a day is empty, not what the system called it.\n"
             "Then adjust the days immediately before and after if it helps: use up what would spoil "
-            "before leaving, and keep the first day back light, because the kitchen will be bare."
+            "before leaving, and keep the first day back light, because the kitchen will be bare.\n"
+            "Those two rows are still DINNERS. Give each one a real dish the household could cook "
+            "tonight — 'Spinach and paneer stir-fry', 'Lentil soup with toast' — using what the "
+            "kitchen actually has. 'Use up leftovers before away' and 'Light meal after away' are "
+            "descriptions of your own instruction, not meals; the reason goes in \"why\", never in "
+            "the title. This rule does NOT apply to the skipped rows above, whose title is fixed."
         )
         # ARM BEFORE SENDING. The device can answer faster than we can set this up, and a
         # waiter registered after the fact waits for an event that already fired.
