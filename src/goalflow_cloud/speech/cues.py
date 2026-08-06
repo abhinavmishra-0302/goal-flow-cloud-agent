@@ -74,6 +74,109 @@ CUE_EMOTION: dict[str, str] = {
 _TAG = re.compile(r"\[[^\]]*\]")
 
 
+#: Sentence boundary: a . ! or ? followed by whitespace and something that starts a new
+#: sentence — a capital, a quote, or a DIGIT ("...about $124. 2 quicker ones...").
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9“\"'])")
+
+#: Where a too-long sentence may be broken: an em-dash or a semicolon, both of which a
+#: reader already pauses at.
+_CLAUSE_BREAK = re.compile(r"\s+—\s+|;\s+")
+
+#: LAST RESORT for a sentence with no dash or semicolon — a comma.
+#:
+#: Held back rather than used first, because a comma is a weaker pause than a dash and a
+#: seam in the wrong place is more noticeable than a slightly longer wait. But the plan
+#: narration is written by the DEVICE's model, so its punctuation is not ours to choose,
+#: and in practice it produces exactly the long comma-list this rescues: "chicken three
+#: nights, fish on Thursday, and everything that would have spoiled...". At 119
+#: characters that is 4.6s of silence; split at its commas it starts in 1.5s.
+#:
+#: LOOKBEHIND, so the comma stays on the left-hand chunk. Splitting on `,\s+` swallowed
+#: it — "chicken three nights, fish on Thursday" came back as "...three nights" and the
+#: caption lost punctuation the reader needs. It matters for the audio too: the comma is
+#: a pause the synthesiser honours WITHIN a chunk.
+_COMMA_BREAK = re.compile(r"(?<=,)\s+")
+
+#: Chunks shorter than this merge forward. Low on purpose: "Here's what I understood."
+#: is 25 characters and SHOULD stand alone, because it is the chunk whose synthesis time
+#: the listener actually experiences as the delay before the voice starts.
+MIN_CHUNK_CHARS = 16
+
+#: Past this, a chunk is split at a clause break if it has one.
+#:
+#: Calibrated from the measurement in ``split_for_speech``: synthesis runs at roughly
+#: 0.035s per character plus ~0.4s of overhead, so 70 characters is ~2.8s. Chosen against
+#: the FIRST chunk, which is the only one whose synthesis the listener experiences as
+#: silence — every later chunk is warmed in parallel and covered by the previous one's
+#: audio.
+MAX_CHUNK_CHARS = 70
+
+
+def split_for_speech(text: str) -> list[str]:
+    """Split an utterance into sentence-sized pieces, longest-first-word intact.
+
+    WHY THIS EXISTS, and it is the difference between a voice and a buffer. MEASURED
+    against the live provider, same voice:
+
+        160 characters  ->  TTFA 684ms, COMPLETE 6.1s
+         32 characters  ->  TTFA 429ms, COMPLETE 1.0s
+
+    and a browser given a chunked mp3 with no Content-Length waits for the COMPLETE body
+    before it plays a note. So a three-sentence cue meant six seconds of silence while a
+    card sat on screen — long enough that the plan and approvals utterances were still
+    synthesizing when the webview closed, which is why they were never heard at all.
+
+    Splitting turns one 6.1s wait into a 1.0s wait plus background work: the first
+    sentence plays while the rest synthesize, and since a sentence's AUDIO (~1.6s) runs
+    longer than its synthesis (~1.0s), the queue stays ahead of the ear.
+
+    `fish`'s own `latency: low` was measured too — 5.4s against 6.1s. Not the lever.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    parts: list[str] = []
+    for sentence in (s.strip() for s in _SENTENCE_END.split(stripped) if s.strip()):
+        # A long sentence is broken at a clause boundary, but only as far as it needs to
+        # be: split() then re-join greedily, so a 120-character sentence with one dash
+        # becomes two chunks rather than however many dashes it happens to contain.
+        if len(sentence) <= MAX_CHUNK_CHARS:
+            parts.append(sentence)
+            continue
+        pieces = [p.strip() for p in _CLAUSE_BREAK.split(sentence) if p.strip()]
+        if max(len(p) for p in pieces) > MAX_CHUNK_CHARS:
+            # Still too long on dashes alone — fall back to commas.
+            pieces = [
+                q.strip()
+                for piece in pieces
+                for q in (_COMMA_BREAK.split(piece) if len(piece) > MAX_CHUNK_CHARS else [piece])
+                if q.strip()
+            ]
+        buffer = ""
+        for piece in pieces:
+            candidate = f"{buffer} {piece}".strip() if buffer else piece
+            if buffer and len(candidate) > MAX_CHUNK_CHARS:
+                parts.append(buffer)
+                buffer = piece
+            else:
+                buffer = candidate
+        if buffer:
+            parts.append(buffer)
+
+    merged: list[str] = []
+    for part in parts:
+        if merged and len(merged[-1]) < MIN_CHUNK_CHARS:
+            merged[-1] = f"{merged[-1]} {part}"
+        else:
+            merged.append(part)
+    # A trailing runt merges BACKWARDS — "Shall I go ahead?" is a legitimate chunk at 17
+    # characters and a deliberate one (it is the question), but "Ha." is not.
+    if len(merged) > 1 and len(merged[-1]) < 12:
+        merged[-2] = f"{merged[-2]} {merged.pop()}"
+    return merged
+
+
 def strip_tags(text: str) -> str:
     """Remove emotion cues, leaving the words a person would read.
 

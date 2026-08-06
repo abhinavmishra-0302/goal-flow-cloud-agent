@@ -503,8 +503,7 @@ class ConnectionRegistry:
             speech = create_phase.get("speech") or {}
 
             async def replay_speech(cue: str) -> None:
-                frame = speech.get(cue)
-                if frame is not None:
+                for frame in speech.get(cue) or []:
                     log_frame("out", "ui", frame)
                     await websocket.send_json(frame)
 
@@ -567,12 +566,16 @@ class ConnectionRegistry:
         webview rejoining mid-run should rejoin the WORK — which is what `chat_ui_open`
         plus the live stream already do.
         """
-        if frame.get("payload", {}).get("cue") not in REPLAYABLE_CUES:
+        cue = frame.get("payload", {}).get("cue")
+        if cue not in REPLAYABLE_CUES:
             return
         session = self._sessions.get(device_id)
         cp = session.create_phase if session else None
         if cp and cp.get("goal_id") == goal_id:
-            cp.setdefault("speech", {})[frame["payload"]["cue"]] = frame
+            # A LIST per cue: v11.2 splits a cue into one frame per sentence, and a slot
+            # would replay only the last one — a webview binding late would hear the end
+            # of a paragraph with no beginning.
+            cp.setdefault("speech", {}).setdefault(cue, []).append(frame)
 
     def resolve_understanding(self, device_id: str, goal_id: str) -> None:
         """The gate has been ANSWERED — stop replaying it.
@@ -928,25 +931,79 @@ async def emit_speech(device_id: str, goal_id: str, cue: str, text: str) -> None
         # fish.audio receives, with this cue's emotion cue on the front. A tag that
         # reaches the caption is a bug the user reads.
         caption = speech_cues.strip_tags(text)
-        spoken = speech_cues.apply_emotion(caption, cue)
         if not caption:
             return
-        utterance = mint_utterance(goal_id, cue, caption, spoken=spoken)
+        # v11.2 — ONE CUE BECOMES ONE FRAME PER SENTENCE.
+        #
+        # Measured: a 160-character utterance takes 684ms to first byte but 6.1s to
+        # COMPLETE, and a browser handed a chunked mp3 with no Content-Length waits for
+        # the complete body before playing a note. That six seconds of silence is the
+        # "the UI comes first and then the voice starts late" report — and it is also
+        # why the plan and approvals cues were never heard at all: they were still
+        # synthesizing when the webview closed 3.8s after approval.
+        #
+        # A single sentence completes in ~1.0s, so the first one starts almost at once
+        # and the rest are warmed underneath it. Nothing on the UI side had to change:
+        # the queue already plays equal-priority utterances in arrival order, so N
+        # frames of one cue simply play as one paragraph.
+        chunks = speech_cues.split_for_speech(caption)
         extension = get_settings().fish_format or "mp3"
-        frame = Speech(
-            goal_id=goal_id,
-            payload=SpeechPayload(
-                utterance_id=utterance.id,
-                cue=cue,
-                text=utterance.text,
-                url=f"/speech/{utterance.id}.{extension}",
-            ),
-        ).model_dump(mode="json")
+        frames = []
+        for index, chunk in enumerate(chunks):
+            # The FIRST chunk keeps the bare cue id, so a single-sentence cue mints
+            # exactly the id it always did and replay stays stable.
+            suffix = cue if index == 0 else f"{cue}-{index}"
+            utterance = mint_utterance(
+                goal_id, suffix, chunk, spoken=speech_cues.apply_emotion(chunk, cue)
+            )
+            frames.append(
+                Speech(
+                    goal_id=goal_id,
+                    payload=SpeechPayload(
+                        utterance_id=utterance.id,
+                        cue=cue,
+                        text=utterance.text,
+                        url=f"/speech/{utterance.id}.{extension}",
+                    ),
+                ).model_dump(mode="json")
+            )
     except Exception:
         logger.debug("speech_frame_failed goal=%s cue=%s", goal_id, cue, exc_info=True)
         return
-    await registry.send_to_uis(device_id, frame)
-    registry.capture_speech(device_id, goal_id, frame)
+
+    for frame in frames:
+        await registry.send_to_uis(device_id, frame)
+        registry.capture_speech(device_id, goal_id, frame)
+    # WARM THEM ALL NOW, in the background. The UI fetches the first chunk within a
+    # round trip, so that one is unavoidably synthesized on demand — but chunks 2..N
+    # would otherwise each start synthesizing only when the previous finished playing,
+    # putting a ~1s gap between every sentence. Warming makes them cache hits.
+    #
+    # This does spend synthesis on audio nobody may hear (v11.0 deliberately avoided
+    # that). The trade is deliberate and the demo is why: an utterance costs a fraction
+    # of a cent, and a paragraph delivered in stutters costs the moment.
+    for frame in frames:
+        asyncio.create_task(_warm_utterance(frame["payload"]["utterance_id"]))
+
+
+async def _warm_utterance(utterance_id: str) -> None:
+    """Synthesize an utterance ahead of the fetch. Never raises — see emit_speech."""
+    utterance = lookup_utterance(utterance_id)
+    if utterance is None or utterance.audio or utterance.inflight is not None:
+        return
+    utterance.inflight = asyncio.Event()
+    try:
+        chunks = [chunk async for chunk in stream_utterance(utterance.to_synthesize())]
+        utterance.audio = b"".join(chunks)
+        logger.info("speech_warmed id=%s bytes=%d", utterance_id, len(utterance.audio))
+    except SpeechUnavailable as exc:
+        logger.info("speech_warm_skipped id=%s reason=%s", utterance_id, exc)
+    except Exception:
+        logger.debug("speech_warm_failed id=%s", utterance_id, exc_info=True)
+    finally:
+        # ALWAYS fire, including on failure: a fetch waiting on this must be released to
+        # try for itself rather than hang until its own timeout.
+        utterance.inflight.set()
 
 
 @app.get("/speech/{filename}")
@@ -974,6 +1031,16 @@ async def speech_audio(filename: str) -> Response:
     media_type = {"mp3": "audio/mpeg", "wav": "audio/wav", "opus": "audio/opus"}.get(
         get_settings().fish_format, "application/octet-stream"
     )
+    # A warm may be in flight for this exact sentence (v11.2 warms every chunk of a cue
+    # the moment it is emitted, and the UI's fetch lands a round trip later). Waiting is
+    # both cheaper and FASTER than racing it: a second synthesis bills twice and still
+    # finishes no sooner than the one already running.
+    if not utterance.audio and utterance.inflight is not None:
+        try:
+            await asyncio.wait_for(utterance.inflight.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            logger.warning("speech_warm_wait_timeout id=%s", utterance_id)
+
     if utterance.audio:
         logger.info("speech_serve id=%s cached=1 bytes=%d", utterance_id, len(utterance.audio))
         return Response(content=utterance.audio, media_type=media_type)

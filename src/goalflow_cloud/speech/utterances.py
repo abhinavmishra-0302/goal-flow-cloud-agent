@@ -19,6 +19,7 @@ moment its gate is answered, so there is nothing here worth persisting across a 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -51,6 +52,14 @@ class Utterance:
     #: The complete mp3, populated after the first successful synthesis. Empty until
     #: then, and left empty if synthesis fails — a partial body is never cached.
     audio: bytes = field(default=b"", repr=False)
+    #: Set while a synthesis for THIS utterance is in flight, and fired when it ends.
+    #:
+    #: v11.2, and it exists to stop us paying twice. Chunks are warmed in the background
+    #: the moment a cue is emitted, and the UI fetches the first one a round trip later —
+    #: so without this the warm and the fetch synthesize the same sentence concurrently,
+    #: billing two calls and racing to fill the same field. The fetch now waits on the
+    #: warm instead.
+    inflight: asyncio.Event | None = field(default=None, repr=False)
 
     def to_synthesize(self) -> str:
         """What fish.audio should receive."""

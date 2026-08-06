@@ -25,6 +25,7 @@ not a hand-written one, so a field renamed in the graph fails here rather than o
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -302,6 +303,60 @@ def main() -> int:
         tagged = cues.apply_emotion("Some words.", cue_name)
         check(tagged.startswith("["), f"cue {cue_name!r} has an emotion")
         check(cues.strip_tags(tagged) == "Some words.", f"and cue {cue_name!r} strips clean")
+
+    # --- v11.2: chunking, which is what makes the voice feel immediate ----------------
+    #
+    # MEASURED, same voice, same sentence: unsplit the first audio arrives after 6.6s;
+    # split into four, after 1.0s, with every chunk warm by 2.5s. A browser handed a
+    # chunked mp3 with no Content-Length waits for the COMPLETE body, so utterance LENGTH
+    # is silence — and that silence is why the plan and approvals cues were never heard
+    # at all: they were still synthesizing when the webview closed 3.8s after approval.
+    gate_line = ("Here's what I understood. Plan healthy dinners for the family for the week "
+                 "— holding the peanut allergy and low sodium, plus two more rules. "
+                 "Shall I go ahead?")
+    chunks = cues.split_for_speech(gate_line)
+    check(len(chunks) >= 3, "a three-sentence cue splits into at least three chunks")
+    check(chunks[0] == "Here's what I understood.",
+          "the FIRST chunk is the short lead sentence — it is the only one whose synthesis "
+          "the listener experiences as silence")
+    check(len(chunks[0]) <= 40,
+          f"and it must stay short: ~0.035s per character, so {len(chunks[0])} chars is the wait")
+    check(chunks[-1] == "Shall I go ahead?", "the question survives as its own chunk")
+    # WORDS, not characters: an em-dash is a pause marker and the chunk boundary IS the
+    # pause, so the dash itself may go. A word may not.
+    words = lambda s: [w for w in re.sub(r"[^\w$]+", " ", s).split() if w]
+    check(words(" ".join(chunks)) == words(gate_line),
+          "NOTHING IS LOST OR REORDERED — every word survives, in order")
+    check(all(len(c) <= cues.MAX_CHUNK_CHARS for c in chunks),
+          "no chunk exceeds the cap, or the cap is not doing anything")
+
+    # A long single sentence with no dash — the shape the DEVICE's model writes.
+    plan_line = ("We have chicken three nights, fish on Thursday, and everything that would "
+                 "have spoiled gets used up before you go away.")
+    plan_chunks = cues.split_for_speech(plan_line)
+    check(len(plan_chunks) >= 2,
+          "a long comma-list splits too — the plan narration is model-written, so its "
+          "punctuation is not ours to choose")
+    check(words(" ".join(plan_chunks)) == words(plan_line), "losing no words")
+    check("nights," in " ".join(plan_chunks),
+          "and KEEPING the comma — splitting on it must not swallow it, or the caption "
+          "loses punctuation and the chunk loses a pause the synthesiser honours")
+    # The FIRST chunk is the one that must be under the cap: it is the only wait the
+    # listener experiences. A tail piece with nowhere left to split may run over.
+    check(len(plan_chunks[0]) <= cues.MAX_CHUNK_CHARS,
+          f"the first chunk is under the cap ({len(plan_chunks[0])} chars)")
+
+    check(cues.split_for_speech("") == [] and cues.split_for_speech("   ") == [],
+          "empty text yields no chunks, not one empty chunk")
+    check(cues.split_for_speech("Just one short line.") == ["Just one short line."],
+          "a short cue is left ALONE — chunking a 20-character sentence would add a round "
+          "trip to save nothing")
+    check(len(cues.split_for_speech("Saved. Ha.")) == 1,
+          "a runt trailing chunk merges backwards rather than costing its own request")
+    check("$124. 2 quicker" not in " | ".join(
+              cues.split_for_speech("Approve the order, about $124. 2 quicker ones as well.")),
+          "a sentence ending in a number splits from the next one — the boundary regex has "
+          "to accept a DIGIT starting a sentence, not just a capital")
 
     # --- the HTTP route --------------------------------------------------------------
     #
