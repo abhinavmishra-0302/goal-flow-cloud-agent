@@ -116,7 +116,12 @@ def main() -> int:
     spoken = _understanding_speech(GOAL_GATE)
     check(spoken.startswith("Here's what I understood."), "the read comes first")
     check(GOAL_GATE["objective"] in spoken, "the objective is spoken verbatim, not paraphrased")
-    check(spoken.rstrip().endswith("?"), "it ENDS on the question — that is what the buttons answer")
+    # v11.2 — THE VOICE NO LONGER ASKS. There is no speech recognition on this surface,
+    # so a spoken question invites a reply into a microphone that is not listening, and
+    # the two buttons underneath are already asking. The voice states; the screen asks.
+    check(not spoken.rstrip().endswith("?"),
+          "the goal gate does NOT ask out loud — nothing is listening for the answer")
+    check("Shall I" not in spoken, "and specifically does not say 'Shall I…'")
     check("2026-08-04" not in spoken, "an ISO date is never read aloud")
     # v11.1 CUT THE WINDOW, and the measurement says why it went first: v11.0 ran 15.0s,
     # naming all four rules is 12.0s, naming only the safety-critical ones is 10.6s, and
@@ -153,7 +158,7 @@ def main() -> int:
     )
     check(
         _understanding_speech({"objective": "Plan dinner", "constraints": []})
-        == "Here's what I understood. Plan dinner. Shall I go ahead?",
+        == "Here's what I understood. Plan dinner.",
         "no constraints still yields a whole, sayable sentence",
     )
 
@@ -257,14 +262,15 @@ def main() -> int:
     ]}
     spoken_approvals = cues.approvals(payload)
     check("2 things need your approval" in spoken_approvals, "firm proposals are counted")
-    check("place a grocery order" in spoken_approvals, "and NAMED — they spend money")
-    check("about $58" in spoken_approvals, "with the money spoken as words, not '58.2'")
-    check("20 cents" not in spoken_approvals and "58.20" not in spoken_approvals,
-          "and WITHOUT cents: the total is an estimate, and reading the cents aloud "
-          "claims a precision the number does not have")
+    check("place a grocery order" in spoken_approvals, "and NAMED — they are what needs a human")
+    check("$" not in spoken_approvals and "58" not in spoken_approvals,
+          "NO AMOUNTS. The figure is an ESTIMATE the card prints exactly, so speaking a "
+          "rounded version invites a decision on a number we just blurred")
     check("defrost the chicken" not in spoken_approvals,
           "auto proposals are never named — they already happened")
-    check("2 smaller" in spoken_approvals, "but they ARE counted, so nothing is hidden")
+    check("quicker" not in spoken_approvals and "smaller" not in spoken_approvals,
+          "and NO BOOKKEEPING: counting the light and auto rows lengthened the one "
+          "utterance the user must act on with numbers they cannot act on")
     check("One thing needs your approval" in cues.approvals(
         {"proposals": [{"tier": "firm", "action": "order groceries"}]}),
         "one firm proposal is singular, not '1 things'")
@@ -336,8 +342,7 @@ def main() -> int:
     # is silence — and that silence is why the plan and approvals cues were never heard
     # at all: they were still synthesizing when the webview closed 3.8s after approval.
     gate_line = ("Here's what I understood. Plan healthy dinners for the family for the week "
-                 "— holding the peanut allergy and low sodium, plus two more rules. "
-                 "Shall I go ahead?")
+                 "— holding the peanut allergy and low sodium, plus two more rules.")
     chunks = cues.split_for_speech(gate_line)
     check(len(chunks) >= 3, "a three-sentence cue splits into at least three chunks")
     check(chunks[0] == "Here's what I understood.",
@@ -345,7 +350,6 @@ def main() -> int:
           "the listener experiences as silence")
     check(len(chunks[0]) <= 40,
           f"and it must stay short: ~0.035s per character, so {len(chunks[0])} chars is the wait")
-    check(chunks[-1] == "Shall I go ahead?", "the question survives as its own chunk")
     # WORDS, not characters: an em-dash is a pause marker and the chunk boundary IS the
     # pause, so the dash itself may go. A word may not.
     words = lambda s: [w for w in re.sub(r"[^\w$]+", " ", s).split() if w]

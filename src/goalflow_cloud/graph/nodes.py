@@ -543,7 +543,11 @@ def _understanding_speech(understanding: dict[str, Any]) -> str:
     else:
         rules = ""
 
-    return f"Here's what I understood. {objective}{rules}. Shall I go ahead?"
+    # v11.2 — NO SPOKEN QUESTION. It read as the fridge waiting for an answer it could
+    # not hear: there is no speech recognition on this surface, so "Shall I go ahead?"
+    # invites a reply into a microphone that is not listening, and the two buttons
+    # underneath are already asking. The voice states the read; the screen asks.
+    return f"Here's what I understood. {objective}{rules}."
 
 
 def _understanding_thought_fallback(intent: dict[str, Any], hard: dict[str, Any], domain: str) -> str:

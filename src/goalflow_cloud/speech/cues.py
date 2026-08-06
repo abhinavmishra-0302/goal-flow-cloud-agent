@@ -387,42 +387,28 @@ def approvals(payload: dict[str, Any] | None) -> str:
     can be scheduled, and this one can be dropped when the user starts tapping.
     """
     proposals = (payload or {}).get("proposals") or []
-    firm, light, auto = [], 0, 0
-    for proposal in proposals:
-        tier = str(proposal.get("tier") or "").lower()
-        if tier == "firm":
-            firm.append(proposal)
-        elif tier == "auto":
-            auto += 1
-        else:
-            light += 1
+    firm = [p for p in proposals if str(p.get("tier") or "").lower() == "firm"]
 
-    parts: list[str] = []
-    if firm:
-        named = []
-        for proposal in firm:
-            action = str(proposal.get("action") or "").strip()
-            amount = _money((proposal.get("args") or {}).get("estimatedTotal"))
-            named.append(f"{action}, {amount}" if amount and action else action or amount)
-        count = len(firm)
-        parts.append(
-            f"{'One thing needs' if count == 1 else f'{count} things need'} your approval: "
-            f"{speak_list(named, limit=2)}."
-        )
-
-    quick = light
-    if quick:
-        parts.append(
-            f"{'One' if quick == 1 else str(quick)} quicker "
-            f"{'one' if quick == 1 else 'ones'} to okay as well."
-        )
-    if auto and not parts:
-        # Nothing to ask about at all — say so rather than saying nothing, because a
+    if not firm:
+        # Nothing the user has to decide. Said out loud rather than skipped, because a
         # silent plan screen and a broken voice look identical from the sofa.
-        return "Nothing needs your approval — I've handled it all."
-    if auto:
-        parts.append(f"{auto} smaller {'one' if auto == 1 else 'ones'} I've already handled.")
-    return " ".join(parts)
+        return "Nothing needs your approval — I've handled it all." if proposals else ""
+
+    # ONLY THE FIRM TIER, and no amounts.
+    #
+    # v11.1 also counted the light and auto proposals ("2 quicker ones to okay as well,
+    # 1 smaller one I've already handled"). That is bookkeeping: it lengthens the one
+    # utterance the user must act on with numbers they cannot act on, and the screen
+    # shows every row anyway. The voice's job here is to name what is waiting on a human.
+    #
+    # And the MONEY is gone from the sentence. "Place a grocery order, about $58" reads
+    # as a figure to check, but it is an ESTIMATE the plan card prints exactly — so the
+    # voice was inviting a decision on a number it had rounded. Say what the thing is;
+    # the amount is on screen, where it is precise.
+    named = [str(p.get("action") or "").strip() for p in firm]
+    count = len(firm)
+    lead = "One thing needs" if count == 1 else f"{count} things need"
+    return f"{lead} your approval: {speak_list(named, limit=2)}."
 
 
 # ---------------------------------------------------------------------------

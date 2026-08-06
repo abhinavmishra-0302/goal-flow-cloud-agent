@@ -1550,7 +1550,13 @@ async def _close_after(device_id: str, goal_id: str, seconds: float) -> None:
 #: spinner ("your Family Hub takes it from here…") is two lines nobody finished. This is
 #: the LAST thing the user sees of the create phase before the webview vanishes; it can
 #: afford three seconds. The chat's own floor stays above it (App.tsx MIN_SAVING_MS).
-SAVE_DWELL_S = 3.0
+#:
+#: v11.2: 3.0 -> 4.5, because the screen now SAYS something and was closing mid-sentence.
+#: Measured on the `saved` cue in the demo voice: the first chunk is ready 1.4s after the
+#: approval and the whole line runs 3.2s, so the voice finishes at ~4.6s against a 3.8s
+#: close — cut off by 0.8s, every time. A goodbye that stops halfway does not read as a
+#: timing bug; it reads as the surface crashing on its last frame.
+SAVE_DWELL_S = 4.5
 
 #: How long the webview will hold open waiting for another goal to finish re-planning
 #: after a household change (v7). The re-plan is a real LLM call on the device, so this is
