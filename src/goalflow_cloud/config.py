@@ -85,9 +85,18 @@ class Settings:
     fish_base_url: str = field(
         default_factory=lambda: os.getenv("FISH_BASE_URL", "https://api.fish.audio")
     )
-    #: s2.1-pro (production) | s2.1-pro-free (no TTFA guarantee) | s2-pro | s1.
+    #: s2.1-pro (production) | s2.1-pro-free | s2-pro | s1.
     #: Sent as an HTTP HEADER, not a body field — see speech/client.py.
-    fish_model: str = field(default_factory=lambda: os.getenv("FISH_MODEL", "s2.1-pro"))
+    #:
+    #: DEFAULTS TO THE FREE TIER, and the reason is a trap worth knowing: fish.audio's
+    #: **API credit is a separate balance from platform credit**, so an account with
+    #: money on it still answers every paid model with `HTTP 402: Insufficient API
+    #: credit`. Measured on this account: s2.1-pro, s2-pro and s1 all 402; s2.1-pro-free
+    #: synthesized fine. The free tier ships no TTFA or DPA guarantee, and measured
+    #: TTFA was 324-397ms with the whole 13-second utterance in 4.6s — comfortably
+    #: inside a gate the user is already reading. Move to s2.1-pro by topping up API
+    #: credit at https://fish.audio/app/developers; nothing else changes.
+    fish_model: str = field(default_factory=lambda: os.getenv("FISH_MODEL", "s2.1-pro-free"))
     #: A fish.audio voice model id. Empty = fish's default voice, which is a perfectly
     #: good demo voice and one less thing to configure.
     fish_reference_id: str = field(default_factory=lambda: os.getenv("FISH_REFERENCE_ID", ""))
