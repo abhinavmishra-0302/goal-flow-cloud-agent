@@ -254,7 +254,32 @@ def _money(value: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-def working_start(constraints: list[dict[str, Any]] | None) -> str:
+#: What the device is reading, per domain — because "checking your kitchen" is a strange
+#: thing to say about locking up before a holiday.
+#:
+#: Matched on SUBSTRINGS, and defaulting to the neutral phrasing, because domains are
+#: coined by the interpreter from whatever the device advertises: a new one must get a
+#: sentence that is merely general rather than one that is wrong.
+_WORKING_SUBJECT: list[tuple[str, str]] = [
+    ("meal", "your kitchen and your calendar"),
+    ("dinner", "your kitchen and your calendar"),
+    ("grocery", "your kitchen and what you've been spending"),
+    ("energy", "what's drawing power and when it's cheapest"),
+    ("vacation", "your home and what's on this week"),
+    ("birthday", "what you've got in and who's coming"),
+]
+_WORKING_SUBJECT_DEFAULT = "your home and what's on this week"
+
+
+def working_subject(domain: str) -> str:
+    lowered = (domain or "").lower()
+    for needle, subject in _WORKING_SUBJECT:
+        if needle in lowered:
+            return subject
+    return _WORKING_SUBJECT_DEFAULT
+
+
+def working_start(constraints: list[dict[str, Any]] | None, domain: str = "") -> str:
     """Grounding has really begun: what it is reading, and what it is holding.
 
     Fired on the device's own ``harness`` beat rather than on a timer, so it can never
@@ -267,10 +292,11 @@ def working_start(constraints: list[dict[str, Any]] | None) -> str:
         for row in constraints or []
         if _is_safety(str(row.get("kind") or ""), str(row.get("label") or ""))
     ]
+    subject = working_subject(domain)
     held = speak_list(safety, limit=2)
     if held:
-        return f"Checking your kitchen and your calendar, holding the {held}."
-    return "Checking your kitchen and your calendar."
+        return f"Checking {subject}, holding the {held}."
+    return f"Checking {subject}."
 
 
 def working_plan() -> str:
@@ -289,10 +315,14 @@ def working_plan() -> str:
 # Cue 3 — the plan. THE ONE AN LLM WRITES.
 # ---------------------------------------------------------------------------
 
-#: Longest narration we will speak from the device. A model told "two short sentences"
-#: mostly obliges, but "mostly" is not a contract, and an unbounded string here is a
-#: paragraph read aloud at a person who has been waiting.
-MAX_NARRATION_CHARS = 260
+#: Longest narration we will speak from the device.
+#:
+#: RAISED from 260 in v11.2, and the reason it can be raised is chunking: length used to
+#: mean silence (a 6s synthesis before a single word), so a long narration was a real
+#: cost. Split into sentences it is just more speaking, and the first word still arrives
+#: in ~1s. 420 characters is about fifteen seconds — past that a plan summary has stopped
+#: summarising.
+MAX_NARRATION_CHARS = 420
 
 
 def plan_narration(payload: dict[str, Any] | None) -> str:
@@ -309,11 +339,32 @@ def plan_narration(payload: dict[str, Any] | None) -> str:
     """
     narration = str((payload or {}).get("narration") or "").strip()
     if not narration:
+        # LOGGED, because "the plan said nothing" and "we threw away what it said" are
+        # indistinguishable from the sofa and were indistinguishable in the log too.
+        # This is the line that tells you the model omitted the field.
+        logger.info("plan_narration_absent — the compose call returned no narration")
         return ""
-    if len(narration) > MAX_NARRATION_CHARS:
-        logger.info("plan_narration_dropped chars=%d limit=%d", len(narration), MAX_NARRATION_CHARS)
-        return ""
-    return narration
+    if len(narration) <= MAX_NARRATION_CHARS:
+        return narration
+
+    # TOO LONG: keep whole sentences up to the budget rather than dropping the lot.
+    #
+    # v11.1 dropped it, on the reasoning that a sentence cut mid-clause is worse than no
+    # sentence. True — but that is an argument against TRUNCATING, not against keeping
+    # the sentences that do fit. Silence was the worst of the three options and it is
+    # what a meal plan, the richest domain and so the wordiest narration, kept getting.
+    kept: list[str] = []
+    used = 0
+    for sentence in split_for_speech(narration):
+        if used + len(sentence) > MAX_NARRATION_CHARS:
+            break
+        kept.append(sentence)
+        used += len(sentence) + 1
+    logger.info(
+        "plan_narration_trimmed chars=%d kept=%d sentences=%d",
+        len(narration), used, len(kept),
+    )
+    return " ".join(kept)
 
 
 # ---------------------------------------------------------------------------

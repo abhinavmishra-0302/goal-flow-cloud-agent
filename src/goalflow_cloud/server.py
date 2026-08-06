@@ -1871,26 +1871,43 @@ async def _speak_working_beat(device_id: str, goal_id: str, payload: dict[str, A
     cue = _SPOKEN_BEATS[str(payload["module"])]
     if cue == "working_start":
         contract = dispatched_contracts.get(goal_id) or {}
-        text = speech_cues.working_start(_speakable_constraints(contract))
+        text = speech_cues.working_start(
+            _speakable_constraints(contract), str(contract.get("domain") or "")
+        )
     else:
         text = speech_cues.working_plan()
     await emit_speech(device_id, goal_id, cue, text)
 
 
 def _speakable_constraints(contract: dict[str, Any]) -> list[dict[str, Any]]:
-    """The dispatched hard block as {kind, label} rows the cue engine can read.
+    """The rows this goal's composing beat may name — DOMAIN-FILTERED, authored labels.
 
-    Reads the CONTRACT rather than re-resolving the store: this must name what is
-    actually being enforced on this goal right now, and the store is a superset that
-    resolution has already narrowed once.
+    v11.2 — THIS USED TO READ THE DISPATCHED HARD BLOCK, and it was wrong in a way that
+    only shows up on a second goal. The enforced set is deliberately never narrowed
+    (v6): a home-preparation goal carries the household's allergens and medical rules
+    just like a meal goal does, because the safety gate must be able to block anything.
+    So the beat announced "holding the peanuts and rohan low sodium" while the user was
+    prepping the house for a trip — true of what is ARMED, absurd as a sentence, and
+    exactly the noise that teaches someone to stop listening.
+
+    The gate's chips already solved this: v7's store-side `display_to` narrows what a
+    domain SHOWS without touching what it enforces. The voice now reads the same
+    resolution, which also upgrades the labels — the raw block yields enforcement tokens
+    ("peanuts", "rohan low sodium") while the store carries the product-authored text
+    ("peanut allergy", "low sodium").
+
+    Returns [] rather than guessing when the store cannot be read: a beat that says only
+    what it is doing is fine, and one that names the wrong rules is not.
     """
-    hard = ((contract.get("constraints") or {}).get("hard")) or {}
-    rows: list[dict[str, Any]] = []
-    for kind, value in hard.items():
-        label = graph_nodes._constraint_display(kind, value)
-        if label:
-            rows.append({"kind": kind, "label": label})
-    return rows
+    domain = str(contract.get("domain") or "")
+    if not domain:
+        return []
+    try:
+        resolved = resolve_constraints(load_family_profile(), domain)
+    except Exception:  # noqa: BLE001 - a voice-over never fails a run
+        logger.debug("speakable_constraints_failed domain=%s", domain, exc_info=True)
+        return []
+    return graph_nodes._applied_constraints(resolved.get("applied") or [])
 
 
 async def handle_plan_ready(device_id: str, plan_ready: PlanReady) -> None:

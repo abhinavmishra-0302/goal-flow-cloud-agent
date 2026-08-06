@@ -227,12 +227,12 @@ def main() -> int:
         {"kind": "allergens", "label": "peanut allergy"},
         {"kind": "medical", "label": "low sodium"},
         {"kind": "dietary", "label": "no pork"},
-    ])
+    ], "meal_plan")
     check("peanut allergy" in held and "low sodium" in held,
           "the working beat names the SAFETY rules — it is the second time they are said, "
           "and the point is that they are being kept while the user watches something else")
     check("no pork" not in held, "and not the ones that cannot hurt anyone")
-    check(cues.working_start([]) == "Checking your kitchen and your calendar.",
+    check(cues.working_start([], "meal_plan") == "Checking your kitchen and your calendar.",
           "with no constraints it still says what it is doing")
     check("rules" in cues.working_plan(),
           "the planner beat promises the rules check — the harness's whole claim, in a "
@@ -244,9 +244,8 @@ def main() -> int:
     check(cues.plan_narration({}) == "" and cues.plan_narration(None) == "",
           "NO DETERMINISTIC FALLBACK — code can only count rows, and 'seven items, three "
           "needing approval' describes a data structure, not a week of dinners")
-    check(cues.plan_narration({"narration": "x" * 400}) == "",
-          "an over-long narration is DROPPED, not truncated — a sentence cut mid-clause "
-          "is worse than no sentence, and the plan is on screen either way")
+    check(cues.plan_narration({"narration": "x" * 900}) != "x" * 900,
+          "an over-long narration does not go out whole")
 
     # The approvals. Firm by name, everything else counted.
     payload = {"proposals": [
@@ -274,6 +273,31 @@ def main() -> int:
         "an all-auto plan SAYS so — a silent plan screen and a broken voice look "
         "identical from the sofa")
     check(cues.approvals({"proposals": []}) == "", "and no proposals at all says nothing")
+
+    # v11.2 — the composing beat must not name rules this DOMAIN does not display.
+    #
+    # The enforced set is deliberately never narrowed (v6), so a home-preparation goal
+    # carries the household's allergens exactly like a meal goal does. Reading that block
+    # aloud made a vacation goal announce "holding the peanuts and rohan low sodium" —
+    # true of what is armed, absurd as a sentence, and the kind of noise that teaches a
+    # listener to stop listening.
+    check("kitchen" in cues.working_start([], "meal_plan"),
+          "a meal goal is checking the kitchen")
+    check("kitchen" not in cues.working_start([], "vacation_prep"),
+          "a HOME-PREP goal is not — 'checking your kitchen' is a strange thing to say "
+          "about locking up before a holiday")
+    check("power" in cues.working_start([], "energy_saving"), "an energy goal reads the meter")
+    check(cues.working_start([], "some_domain_coined_next_year"),
+          "an unknown domain still gets a sentence — domains are coined by the interpreter, "
+          "so a new one must be merely general rather than wrong")
+
+    # v11.2 — a long narration is TRIMMED to whole sentences, never dropped.
+    long_narration = "We have chicken three nights and fish on Thursday. " * 12
+    trimmed = cues.plan_narration({"narration": long_narration})
+    check(trimmed != "", "an over-long narration is no longer silence — the meal plan is the "
+                         "wordiest domain and it kept losing its voice entirely")
+    check(len(trimmed) <= cues.MAX_NARRATION_CHARS + 1, "trimmed to the budget")
+    check(trimmed.rstrip().endswith("."), "and cut at a SENTENCE boundary, never mid-clause")
 
     # Saved.
     check("Family Board" in cues.saved(), "the close says where the goal went")
