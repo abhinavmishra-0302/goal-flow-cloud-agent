@@ -321,23 +321,25 @@ def working_subject(domain: str) -> str:
 
 
 def working_start(constraints: list[dict[str, Any]] | None, domain: str = "") -> str:
-    """Grounding has really begun: what it is reading, and what it is holding.
+    """Grounding has really begun: what it is reading.
 
     Fired on the device's own ``harness`` beat rather than on a timer, so it can never
-    describe a phase that has passed. The constraints are named a SECOND time here —
-    deliberately, and it is the only repetition in the whole flow: at the gate they were
-    a promise, and here they are being kept while the user watches something else happen.
+    describe a phase that has passed.
+
+    v11.6 — IT NO LONGER RE-NAMES THE CONSTRAINTS, and the reversal is worth recording
+    because the original was a considered decision, not an oversight. The argument was
+    that at the gate the rules are a promise and here they are being kept, so hearing
+    them twice is reassurance rather than repetition. Heard aloud in a real run it is
+    simply repetition: the user has just read those rules on a card, confirmed them with
+    a tap, and thirty seconds later the same three phrases come back. The voice is
+    serial and slow — every sentence it spends is a sentence it cannot spend on something
+    the screen is not already saying.
+
+    ``constraints`` is still accepted and still ignored, because the caller has it and a
+    future beat may want it; a signature change would ripple through server.py for no
+    behavioural gain.
     """
-    safety = [
-        str(row.get("label") or "").strip()
-        for row in constraints or []
-        if _is_safety(str(row.get("kind") or ""), str(row.get("label") or ""))
-    ]
-    subject = working_subject(domain)
-    held = speak_list(safety, limit=2)
-    if held:
-        return f"Checking {subject}, holding the {held}."
-    return f"Checking {subject}."
+    return f"Checking {working_subject(domain)}."
 
 
 def working_plan() -> str:

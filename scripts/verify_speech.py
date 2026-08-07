@@ -233,12 +233,20 @@ def main() -> int:
         {"kind": "medical", "label": "low sodium"},
         {"kind": "dietary", "label": "no pork"},
     ], "meal_plan")
-    check("peanut allergy" in held and "low sodium" in held,
-          "the working beat names the SAFETY rules — it is the second time they are said, "
-          "and the point is that they are being kept while the user watches something else")
-    check("no pork" not in held, "and not the ones that cannot hurt anyone")
+    # v11.6 — THE COMPOSING BEAT NO LONGER RE-NAMES THE CONSTRAINTS. Until now it did,
+    # deliberately: at the gate the rules are a promise, here they are being kept. Heard
+    # in a real run it is just repetition — the user read those rules on a card and
+    # confirmed them with a tap seconds earlier. Asserted as an ABSENCE so the
+    # well-argued original cannot quietly come back.
+    for label in ("peanut allergy", "low sodium", "no pork"):
+        check(label not in held,
+              f"the composing beat must not say {label!r} again — the gate already did, "
+              f"and the voice is serial: a sentence spent repeating the screen is a "
+              f"sentence it cannot spend on anything else")
     check(cues.working_start([], "meal_plan") == "Checking your kitchen and your calendar.",
           "with no constraints it still says what it is doing")
+    check(held == cues.working_start([], "meal_plan"),
+          "and constraints make NO difference to it any more")
     check("rules" in cues.working_plan(),
           "the planner beat promises the rules check — the harness's whole claim, in a "
           "family's words rather than 'Safety Policy Engine'")
