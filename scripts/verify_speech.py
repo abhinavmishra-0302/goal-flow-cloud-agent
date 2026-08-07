@@ -334,6 +334,32 @@ def main() -> int:
         check(tagged.startswith("["), f"cue {cue_name!r} has an emotion")
         check(cues.strip_tags(tagged) == "Some words.", f"and cue {cue_name!r} strips clean")
 
+    # --- v11.5: COMBINED tags -----------------------------------------------------------
+    #
+    # fish.audio takes up to three markers per sentence and charges nothing for them —
+    # stripped before synthesis, outside the token limit, no added latency. So the only
+    # reason to ship one tag was that nobody had read the docs.
+    #
+    # What this guards is the two ways the table goes wrong: a marker leaking into the
+    # caption (now that there are twice as many of them), and the tag list quietly
+    # growing past the vendor's own ceiling.
+    for cue_name, tags in cues.CUE_EMOTION.items():
+        check(len(tags) <= 3,
+              f"cue {cue_name!r} carries {len(tags)} markers — fish.audio recommends at "
+              f"most 3 per sentence")
+        check(len(set(tags)) == len(tags), f"cue {cue_name!r} repeats a marker")
+        tagged = cues.apply_emotion("Some words.", cue_name)
+        check(tagged == "".join(f"[{t}]" for t in tags) + " Some words.",
+              f"cue {cue_name!r} must emit every marker, at the FRONT — fish's own "
+              f"guidance is that sentence-level cues work best at the start")
+        check(cues.strip_tags(tagged) == "Some words.",
+              f"and ALL of cue {cue_name!r}'s markers are stripped from the caption")
+    check(cues.CUE_EMOTION["approvals"][1] != "emphasis",
+          "approvals asks the user for consent — emphatic is pushy, and a pushy ask is "
+          "worse than a flat one. Confident is the register that belongs here")
+    check("excited" not in cues.CUE_EMOTION["understanding"],
+          "the gate is never excited, however many markers it grows")
+
     # --- v11.2: chunking, which is what makes the voice feel immediate ----------------
     #
     # MEASURED, same voice, same sentence: unsplit the first audio arrives after 6.6s;

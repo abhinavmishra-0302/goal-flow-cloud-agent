@@ -61,14 +61,43 @@ logger = logging.getLogger(__name__)
 #: understanding gate — over a peanut allergy — would read as a system that does not
 #: understand what it is holding, and would erode the exact trust that gate exists to
 #: build. Enthusiasm about safety data is a tell.
-CUE_EMOTION: dict[str, str] = {
-    "understanding": "warm",
-    "working_start": "thoughtful",
-    "working_plan": "gentle",
-    "plan": "excited",
-    "approvals": "warm",
-    "saved": "cheerful",
+#: v11.5 — TWO TAGS, not one. fish.audio accepts up to three combined markers per
+#: sentence, and markers cost NOTHING: they are stripped before synthesis, count against
+#: no token limit, and add no latency. That last point is what makes this worth doing at
+#: all — v11.2 spent a whole round taking first-audio from 6.6s to 1.0s, so any
+#: expressiveness that is free at runtime is expressiveness worth having.
+#:
+#: The second tag is a MODIFIER, chosen for what each moment needs rather than for more
+#: of the same feeling — stacking two synonyms buys nothing:
+#:   - the gate is `calm` because it is reading safety rules back and must sound like it
+#:     knows what it is holding;
+#:   - progress lines are `soft`, which is honest: they are the least important thing
+#:     said on this surface and recede accordingly;
+#:   - `emphasis` lands on the plan, the one moment with actual news;
+#:   - approvals are `confident`, NOT emphatic — the user is being asked for consent, and
+#:     a pushy ask is worse than a flat one;
+#:   - the goodbye is `relaxed`, so the close is warm without being a sales pitch.
+#:
+#: NOTE ON VOCABULARY: of these, `excited`, `calm`, `confident`, `relaxed`, `soft` and
+#: `emphasis` are in fish's enumerated set; `warm`, `thoughtful`, `gentle` and `cheerful`
+#: are free-form, which S2 supports by design (their own example is "[warm and happy]").
+#: If one ever sounds flat, the nearest canonical swaps are relaxed / calm / satisfied /
+#: delighted.
+CUE_EMOTION: dict[str, tuple[str, ...]] = {
+    "understanding": ("warm", "calm"),
+    "working_start": ("thoughtful", "soft"),
+    "working_plan": ("gentle", "soft"),
+    "plan": ("excited", "emphasis"),
+    "approvals": ("warm", "confident"),
+    "saved": ("cheerful", "relaxed"),
 }
+
+#: fish.audio's own guidance: three combined markers per sentence is the recommended
+#: ceiling. Asserted rather than commented, because the table above is the kind of thing
+#: that grows one tag at a time.
+assert all(len(tags) <= 3 for tags in CUE_EMOTION.values()), (
+    "fish.audio recommends at most 3 combined emotion markers per sentence"
+)
 
 #: Anything in square brackets. Used to STRIP tags, never to find them.
 _TAG = re.compile(r"\[[^\]]*\]")
@@ -189,11 +218,23 @@ def strip_tags(text: str) -> str:
 
 
 def apply_emotion(text: str, cue: str) -> str:
-    """Prefix ``text`` with this cue's emotion, if it has one and none is present."""
+    """Prefix ``text`` with this cue's emotion markers, if it has any and none is present.
+
+    Applied PER SENTENCE, not per cue, because since v11.2 a cue is emitted as one frame
+    per sentence — and fish.audio's own guidance is that sentence-level cues work best at
+    the start of the sentence they govern. A tag on only the first chunk would leave the
+    rest of the utterance unmarked.
+
+    The already-tagged guard is not defensive noise: the plan narration is written by the
+    DEVICE's model, so it can arrive carrying its own tag, and a model that chose how to
+    say its own sentence should not be overruled by this table.
+    """
     if not text.strip() or _TAG.search(text):
         return text
-    emotion = CUE_EMOTION.get(cue)
-    return f"[{emotion}] {text}" if emotion else text
+    emotions = CUE_EMOTION.get(cue)
+    if not emotions:
+        return text
+    return "".join(f"[{emotion}]" for emotion in emotions) + f" {text}"
 
 
 # ---------------------------------------------------------------------------
