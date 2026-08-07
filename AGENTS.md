@@ -72,8 +72,14 @@ Change `CONTRACT.md` first when the protocol moves.
   `capabilities.domains[].id` values (the device routes on the EXACT string), coining
   a new slug only when none fit — there is NO `_canonical_domain()` normalizer (that
   was the pre-M4 keyword hack; removed). M7's device advertises `meal_plan`,
-  `guest_dinner`, `vacation_prep`, `birthday_party`. The meal-plan `time_window` is
-  pinned today..today+6 (the one remaining domain-specific carve-out in cloud code).
+  `guest_dinner`, `vacation_prep`, `birthday_party`.
+  **The dispatch `time_window` always STARTS at the device's today** (monitoring begins now,
+  for every goal); the END is the interpreter's, falling back to today+6 only when it gives
+  none or one at/before the start. There is NO meal-plan carve-out — this line used to claim
+  the meal window was "pinned today..today+6" and it is not, which sent a v11.2 bug hunt to
+  the wrong file. It matters: the interpreter reads "this week" as ending Sunday about half
+  the time, so a 7-day meal plan routinely runs under a 3-4 day window. The DEVICE reconciles
+  that (`ResolveLastDay` takes the later of window and plan), not the cloud.
 - `src/goalflow_cloud/models/contract.py` — Pydantic mirror of every wire message.
   `_ContractModel` uses `extra="allow"` so new nested device fields (e.g.
   `demo_events`, `updated_plan`) pass through without cloud changes.

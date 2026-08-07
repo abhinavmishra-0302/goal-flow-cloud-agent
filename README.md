@@ -137,6 +137,8 @@ scripts/verify_mirrors.py       # gate 14: the contract mirrors have not drifted
 scripts/verify_constraints.py   # gate 15: constraints resolve per goal; the enforced set is never narrowed
 scripts/verify_capture.py       # gate 16: a household rule is captured only when the user says yes
 scripts/verify_speech.py        # gate 31: the voice says the right thing, and its absence costs nothing
+scripts/verify_no_hang.py       # gate 33: a dispatch is always answered — no goal hangs the UI
+scripts/e2e_two_goals.py        # NOT a gate: drives the real two-goal demo headlessly (needs the stack up)
 src/goalflow_cloud/
   config.py                     # env-backed settings (OPENROUTER_*, FISH_*, WS_*, LOG_LEVEL)
   server.py                     # FastAPI WS hub: multi-session registry, routing, relays, graph driving, board pushes

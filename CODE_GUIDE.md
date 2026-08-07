@@ -23,6 +23,8 @@ scripts/verify_capture.py         # gate 16: a household rule is captured only w
 scripts/verify_persistence.py     # gate 12: a goal survives a cloud restart at its gate
 scripts/verify_generic_gate.py    # gate 10: actionability is generic (needs an API key — the slow one)
 scripts/verify_speech.py          # gate 31: the voice says the right thing, and its absence costs nothing
+scripts/verify_no_hang.py         # gate 33: a dispatch is always answered — no goal hangs the UI
+scripts/e2e_two_goals.py          # NOT a gate: the real two-goal demo, headless (needs the whole stack)
 data/memory/family_profile.json   # household constraint store (sourced, scoped, expiring)
 src/goalflow_cloud/
   config.py                       # Settings dataclass from env (OPENROUTER_*, FISH_*, WS_*, LOG_LEVEL)
