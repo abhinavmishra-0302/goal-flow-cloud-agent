@@ -1499,10 +1499,17 @@ async def handle_approval(device_id: str, approval: Approval) -> None:
     # goal changed the household, other goals are re-planning and the saving screen
     # stays up for 20-30s; a voice promising to "keep an eye on it" while the surface
     # is visibly still working would be describing a calm that has not started.
+    spoken_hold = 0.0
     if registry.create_phase_goal(device_id) == approval.goal_id:
-        await emit_speech(
-            device_id, approval.goal_id, "saved", speech_cues.saved(bool(waiting_on))
-        )
+        goodbye = speech_cues.saved(bool(waiting_on))
+        # v11.7 — HOW LONG THE GOODBYE ACTUALLY TAKES, so the close can outlast it.
+        # SAVE_DWELL_S was calibrated in v11.2 against a `saved` line that was ONE
+        # utterance of 3.2s. Chunking then split it into a sentence per frame and the
+        # constant was never revisited: measured on a real run, the second chunk starts
+        # ~3.3s after the first and the close fires while it is still speaking. The
+        # cross-goal variant is longer still, which is why a constant cannot serve here.
+        spoken_hold = speech_cues.spoken_seconds(goodbye)
+        await emit_speech(device_id, approval.goal_id, "saved", goodbye)
     # v4.1: the initial approval ends the create phase — the user's final tap, the
     # moment the board becomes the primary surface. Close the webview bracket. GUARDED
     # on "still the create-phase goal", so a board adaptation approval (whose goal is
@@ -1511,7 +1518,9 @@ async def handle_approval(device_id: str, approval: Approval) -> None:
     # NOT AWAITED: this handler runs inline on the UI's receive loop, and the close can
     # now be a minute away. Blocking here would stop that UI being heard from — the same
     # socket the user is about to press Advance day on.
-    asyncio.create_task(_close_when_saved(device_id, approval.goal_id, waiting_on))
+    asyncio.create_task(
+        _close_when_saved(device_id, approval.goal_id, waiting_on, spoken_hold)
+    )
 
 
 #: How long a refusal stays on the chat surface before the cloud closes it (v7).
@@ -1571,7 +1580,9 @@ CROSS_GOAL_WAIT_S = 180.0
 crossgoal_waiters: dict[str, asyncio.Event] = {}
 
 
-async def _close_when_saved(device_id: str, goal_id: str, waiting_on: list[str]) -> None:
+async def _close_when_saved(
+    device_id: str, goal_id: str, waiting_on: list[str], spoken_hold: float = 0.0
+) -> None:
     """Hold the create-phase webview until the save it announced is actually true.
 
     THE SCREEN HAS TO OUTLAST THE WORK IT DESCRIBES. In Act 1 that is the dwell floor —
@@ -1597,9 +1608,13 @@ async def _close_when_saved(device_id: str, goal_id: str, waiting_on: list[str])
             finally:
                 crossgoal_waiters.pop(other, None)
 
+        # The floor is whichever is longer: the hand-off dwell, or the time the voice
+        # needs to finish the sentence it started when this task was armed. Both are
+        # measured from the same instant, so a long cross-goal wait absorbs both.
+        floor = max(SAVE_DWELL_S, spoken_hold)
         elapsed = asyncio.get_running_loop().time() - started
-        if elapsed < SAVE_DWELL_S:
-            await asyncio.sleep(SAVE_DWELL_S - elapsed)
+        if elapsed < floor:
+            await asyncio.sleep(floor - elapsed)
         await emit_chat_ui_close(device_id, goal_id)
     except Exception:  # noqa: BLE001 - a background task must never take the process down
         logger.exception("deferred_close_failed goal=%s", goal_id)

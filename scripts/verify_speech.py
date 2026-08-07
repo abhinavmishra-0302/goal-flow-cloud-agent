@@ -247,6 +247,22 @@ def main() -> int:
           "with no constraints it still says what it is doing")
     check(held == cues.working_start([], "meal_plan"),
           "and constraints make NO difference to it any more")
+    # v11.7 — the close must outlast the goodbye, so the dwell has to KNOW how long the
+    # goodbye is. SAVE_DWELL_S was 4.5s, calibrated in v11.2 against a `saved` line that
+    # was one utterance; chunking then split it per sentence and the constant was never
+    # revisited. Measured on a real run: approve at :21, chunk two still speaking when
+    # the close fired at :25.
+    check(cues.spoken_seconds(cues.saved()) > 4.5,
+          "the fixed 4.5s dwell is SHORTER than the goodbye it exists to outlast — this "
+          "check is why the dwell is now derived from the line rather than constant")
+    check(cues.spoken_seconds(cues.saved(updating_others=True)) > cues.spoken_seconds(cues.saved()),
+          "the cross-goal goodbye is the longer one and must hold the screen longer")
+    check(cues.spoken_seconds("") > 1.0,
+          "there is a LEAD before the first sound (synthesis + the frame's trip); an "
+          "estimate that starts at zero would close the webview on the frame itself")
+    check(cues.spoken_seconds("x" * 100) > cues.spoken_seconds("x" * 50),
+          "and it must grow with the length, or it is a constant wearing a function's hat")
+
     check("rules" in cues.working_plan(),
           "the planner beat promises the rules check — the harness's whole claim, in a "
           "family's words rather than 'Safety Policy Engine'")

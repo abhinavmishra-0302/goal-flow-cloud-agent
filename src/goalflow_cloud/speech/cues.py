@@ -342,6 +342,29 @@ def working_start(constraints: list[dict[str, Any]] | None, domain: str = "") ->
     return f"Checking {working_subject(domain)}."
 
 
+def spoken_seconds(text: str) -> float:
+    """Roughly how long ``text`` takes to be SPOKEN, from the moment it is emitted.
+
+    Not decoration: it is the floor for how long a screen must stay on the wall. The
+    cloud closes the create-phase webview on a timer, and a timer that does not know how
+    much was said will cut the last sentence in half.
+
+    Two terms, both MEASURED on the demo voice rather than assumed:
+      - a LEAD of ~1.6s before the first sound. Chunked synthesis puts first audio at
+        1.0-1.4s (v11.2), plus the frame's own trip to the webview.
+      - ~8.5 characters per second. This is the number worth not re-deriving: it came
+        from the browser's own play() timestamps on a real run — chunk one of the
+        goodbye is 27 characters and ran 3.25s, gap to chunk two. A reading-speed guess
+        would have said 15-20 c/s and been half of what this voice actually takes,
+        because it is warm, deliberate, and carrying emotion markers. Reading speed is
+        not speaking speed.
+
+    Deliberately an over-estimate rather than an under-estimate. Being a second early
+    truncates a goodbye; being a second late costs a second nobody is waiting on.
+    """
+    return 1.6 + len(text) / 8.5
+
+
 def working_plan() -> str:
     """The planner has really begun.
 
