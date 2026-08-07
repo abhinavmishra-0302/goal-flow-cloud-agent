@@ -179,7 +179,25 @@ INPUT_SURFACE_FRAMES = frozenset(
 #: socket rebinds. Progress narration does not — "checking your kitchen" replayed after
 #: grounding has finished is a voice describing the past, and `saved` replayed is a
 #: promise about a surface that is closing. Those are spoken live or not at all.
-REPLAYABLE_CUES = frozenset({"understanding", "plan", "approvals"})
+#: v11.8 — NARROWED TO THE QUESTION ONLY. `plan` and `approvals` were here, and they are
+#: the exact frames behind the bug reported from a Tizen Hub: the approvals screen speaks
+#: once, the user presses Approve, and the approvals line plays again. Whatever replaced
+#: the document on that tap (a webview reload, a second webview binding) landed on a
+#: create phase whose plan was cached, and this set handed it the plan and approvals audio
+#: a second time.
+#:
+#: The asymmetry is the justification. `understanding` is a QUESTION — the run has stopped
+#: and will not move until it is answered, so a surface that binds while it is up must
+#: hear it or the user may never learn they are being asked. `plan` and `approvals`
+#: DESCRIBE a screen that is fully rendered and readable: the plan card is right there,
+#: the proposals are right there, and re-narrating them to someone who has been looking at
+#: them is at best noise and at worst — as reported — a voice that appears to restart
+#: itself when a button is pressed.
+#:
+#: Progress narration was never replayable: "checking your kitchen" after grounding has
+#: finished is a voice describing the past, and `saved` replayed is a promise about a
+#: surface that is closing. Those are spoken live or not at all.
+REPLAYABLE_CUES = frozenset({"understanding"})
 
 
 def wants(surface: str, frame_type: str | None) -> bool:
@@ -441,6 +459,37 @@ class ConnectionRegistry:
         # socket, in the send loop — no per-call-site routing table, no new send
         # paths. Every surface but "input" takes everything (unchanged from v3).
         frame_type = frame.get("type")
+
+        # v11.8 — SPEECH IS NOT BROADCASTABLE, and it is the only frame that isn't.
+        #
+        # Every other frame here can safely reach N surfaces: two boards rendering the
+        # same plan is a feature, and it is why ui sockets are deliberately never evicted
+        # (see ConnectionRegistry — one-socket-per-role caused a mutual-eviction storm).
+        # Audio does not work that way. There is ONE speaker in the kitchen, so a second
+        # surface that plays the same utterance is not a second view of it, it is an echo.
+        #
+        # This is a REAL failure, reported from a Tizen Hub and not reproducible on
+        # Ubuntu: the dev surrogate keys its iframe on goal_id and tears the old document
+        # down, so exactly one chat webview is ever alive. On the Hub the webview's
+        # lifetime belongs to native Bixby — a backgrounded EWK webview can stay alive,
+        # still connected and still able to play — so a new one binds beside the old one
+        # and BOTH speak. The chat UI's own guard cannot help: it dedupes utterance ids
+        # within a DOCUMENT, and these are two documents.
+        #
+        # So the newest chat surface speaks and the rest stay silent. Newest, not oldest:
+        # the live webview is the one the user is looking at, and it is the one that just
+        # bound.
+        if frame_type == "speech":
+            chats = [ws for ws in targets if (self._meta.get(ws) or ("", "", ""))[2] == "chat"]
+            if len(chats) > 1:
+                logger.warning(
+                    "speech_fanout_suppressed device_id=%s chat_surfaces=%d — only the "
+                    "newest speaks; an older chat webview is still bound and would echo",
+                    device_id,
+                    len(chats),
+                )
+            targets = chats[-1:]
+
         for websocket in targets:
             meta = self._meta.get(websocket)
             surface = meta[2] if meta else ""
@@ -503,7 +552,20 @@ class ConnectionRegistry:
             speech = create_phase.get("speech") or {}
 
             async def replay_speech(cue: str) -> None:
-                for frame in speech.get(cue) or []:
+                frames = speech.get(cue) or []
+                if not frames:
+                    return
+                # LOUD ON PURPOSE. A surface rebinding mid-phase and being re-spoken to
+                # is the shape of every "the voice repeated itself" report so far, and it
+                # is invisible in the frame log among the ordinary sends. If a Hub still
+                # repeats audio, this line is the first thing to grep for: present means
+                # something rebound; absent means the repeat came from the client.
+                logger.info(
+                    "speech_replayed goal=%s cue=%s frames=%d — a chat surface bound "
+                    "mid-phase and is being re-spoken to",
+                    goal_id, cue, len(frames),
+                )
+                for frame in frames:
                     log_frame("out", "ui", frame)
                     await websocket.send_json(frame)
 
