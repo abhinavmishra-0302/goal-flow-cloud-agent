@@ -243,7 +243,7 @@ def main() -> int:
               f"the composing beat must not say {label!r} again — the gate already did, "
               f"and the voice is serial: a sentence spent repeating the screen is a "
               f"sentence it cannot spend on anything else")
-    check(cues.working_start([], "meal_plan") == "Checking your kitchen and your calendar.",
+    check(cues.working_start([], "meal_plan") == "Checking your kitchen.",
           "with no constraints it still says what it is doing")
     check(held == cues.working_start([], "meal_plan"),
           "and constraints make NO difference to it any more")
@@ -263,9 +263,28 @@ def main() -> int:
     check(cues.spoken_seconds("x" * 100) > cues.spoken_seconds("x" * 50),
           "and it must grow with the length, or it is a constant wearing a function's hat")
 
-    check("rules" in cues.working_plan(),
-          "the planner beat promises the rules check — the harness's whole claim, in a "
-          "family's words rather than 'Safety Policy Engine'")
+    # v11.11 — THE PROGRESS BEATS MUST FIT THE PHASES THEY NARRATE.
+    #
+    # Measured on a real run: grounding->planner is ~3s and planner->plan is ~3s, giving
+    # about 6s of audible time for both beats. They used to need 12.8s between them, so
+    # the second was heard over a finished plan or chopped off mid-word — and it pushed
+    # the plan summary, the one line with news in it, behind two descriptions of work
+    # already done.
+    #
+    # The planner beat's "then I'll check it against your rules" was the biggest single
+    # cost at 8.1s, and it is gone. The promise it carried is NOT lost: the confirmation
+    # gate names the safety rules aloud before any of this, and the plan card shows the
+    # safety verdict when it lands. Asserted as a BUDGET rather than as wording, so the
+    # lines can be rewritten freely as long as they still fit.
+    budget = (len(cues.working_start([], "meal_plan")) + len(cues.working_plan())) / 8.5
+    check(budget <= 6.0,
+          f"the two progress beats need {budget:.1f}s of speech and the phases they "
+          f"describe last about 6s — a beat that cannot finish before its phase ends is "
+          f"not richer, it is late, and it delays the plan summary behind it")
+    for cue_text in (cues.working_start([], "meal_plan"), cues.working_plan()):
+        check(len(cue_text) <= 40,
+              f"{cue_text!r} is too long for a progress beat — these are the least "
+              f"important sentences on the surface and must not crowd out the plan")
 
     # The plan. The ONE cue an LLM writes, and the one with no fallback.
     check(cues.plan_narration({"narration": "Chicken three nights."}) == "Chicken three nights.",

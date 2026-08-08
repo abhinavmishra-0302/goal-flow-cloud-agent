@@ -21,11 +21,19 @@ and slow. Its job is to say WHEN YOU ARE NEEDED and WHAT CHANGED WHILE YOU WERE 
 LOOKING. Everything else is the screen's job, and saying it twice makes the voice noise
 that people learn to talk over.
 
+THE PROGRESS BEATS ARE BUDGETED, NOT WRITTEN (v11.11). Grounding->planner is ~3s and
+planner->plan is ~3s on a real run, so the two beats have about 6s of audible time
+between them. They once needed 12.8s, which meant the second was either chopped
+mid-word or still being spoken over a finished plan — and it delayed the ONE cue with
+real news, the plan summary, behind two descriptions of work already done. Gate 31
+asserts the budget rather than the wording, so these can be rewritten freely as long as
+they still fit the phase they narrate.
+
 The five cues:
 
     understanding   the read + the rules that could hurt someone + the question   ~10s
-    working_start   what it is doing, once grounding really begins                ~5s
-    working_plan    what it is doing now, once the planner really begins          ~4s
+    working_start   what it is doing, once grounding really begins              ~2.6s
+    working_plan    what it is doing now, once the planner really begins        ~3.2s
     plan            what this plan IS — the one cue an LLM writes (see below)     ~8s
     approvals       what needs a human, by name if it spends money                ~8s
     saved           closure                                                       ~5s
@@ -301,15 +309,23 @@ def _money(value: Any) -> str:
 #: Matched on SUBSTRINGS, and defaulting to the neutral phrasing, because domains are
 #: coined by the interpreter from whatever the device advertises: a new one must get a
 #: sentence that is merely general rather than one that is wrong.
+#:
+#: v11.11 — SHORTENED TO A SINGLE NOUN, and the reason is a stopwatch rather than taste.
+#: These subjects were written to be evocative and ran to five or six words; measured
+#: against the run they describe, they do not fit. Grounding to planner is ~3s and
+#: planner to plan is ~3s, while the two progress lines built on these subjects needed
+#: 12.8s between them. A phrase that cannot finish before the phase it narrates has
+#: ended is not richer, it is just late — and it pushes the plan summary, the one line
+#: with real news in it, behind two sentences describing work that is already done.
 _WORKING_SUBJECT: list[tuple[str, str]] = [
-    ("meal", "your kitchen and your calendar"),
-    ("dinner", "your kitchen and your calendar"),
-    ("grocery", "your kitchen and what you've been spending"),
-    ("energy", "what's drawing power and when it's cheapest"),
-    ("vacation", "your home and what's on this week"),
-    ("birthday", "what you've got in and who's coming"),
+    ("meal", "your kitchen"),
+    ("dinner", "your kitchen"),
+    ("grocery", "your kitchen"),
+    ("energy", "your power use"),
+    ("vacation", "your home"),
+    ("birthday", "what you've got in"),
 ]
-_WORKING_SUBJECT_DEFAULT = "your home and what's on this week"
+_WORKING_SUBJECT_DEFAULT = "your home"
 
 
 def working_subject(domain: str) -> str:
@@ -338,6 +354,9 @@ def working_start(constraints: list[dict[str, Any]] | None, domain: str = "") ->
     ``constraints`` is still accepted and still ignored, because the caller has it and a
     future beat may want it; a signature change would ripple through server.py for no
     behavioural gain.
+
+    v11.11 — the subject is now one noun, so this lands in ~2.6s. See _WORKING_SUBJECT
+    for the arithmetic that forced it.
     """
     return f"Checking {working_subject(domain)}."
 
@@ -368,13 +387,21 @@ def spoken_seconds(text: str) -> float:
 def working_plan() -> str:
     """The planner has really begun.
 
-    Says a rules check is coming WITHOUT naming the Safety Policy Engine. The two-tier
-    harness is what this product is, and a family should be able to hear that their
-    rules are enforced rather than suggested — but "Safety Policy Engine" is our word
-    for our machinery, and v9 spent a whole pass removing exactly that vocabulary from
-    the screens.
+    v11.11 — THE RULES CLAUSE IS GONE, and it was not dropped lightly.
+
+    This used to read "Now putting the week together, then I'll check it against your
+    rules" — deliberately, because the two-tier harness is what this product IS and a
+    family should hear that their rules are enforced rather than suggested. What killed
+    it was a stopwatch: the clause took 8.1s of the ~3s this phase actually lasts, so
+    the promise was either chopped off mid-word or still being spoken over a finished
+    plan. A claim nobody hears intact is not a claim.
+
+    THE PROMISE IS NOT LOST — it moved to where there is room for it. The confirmation
+    gate names the safety rules out loud, by name, before any of this starts, and the
+    plan card shows the safety verdict when it lands. This beat now does the one job the
+    screen cannot do in that three seconds: say that something is happening.
     """
-    return "Now putting the week together, then I'll check it against your rules."
+    return "Putting your week together."
 
 
 # ---------------------------------------------------------------------------
