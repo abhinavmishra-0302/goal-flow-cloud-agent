@@ -146,6 +146,28 @@ HITL approval → monitor. Both `meal_plan` and `guest_dinner` domains. The clou
 NO logic change for the event-driven meal demo — `trigger_event` control + device
 `demo_events`/`updated_plan` flow through by pass-through.
 
+## v12.2 — the cloud's 429 policy (gate 37)
+
+Every cloud LLM call goes through `invoke_llm(site, call)` in `graph/nodes.py`. It carries
+**two separate retry counters**, and separate is the point: a 429 is waited out (6 retries
+at 2s, 4s, 8s… capped at 20s, with jitter) and costs no ordinary attempt; a dropped socket
+is retried fast (2 retries at 0.4s, 0.8s) and costs no rate-limit attempt. Anything else —
+a bad key, a broken prompt — raises at once, because the LLM-only rule is to fail loudly.
+
+The numbers are copied from the device's v11.2 policy on purpose, so one set of
+measurements explains both tiers. Before this, `interpret_goal` had a single sub-second
+retry and the other two call sites had none; the provider's recovery window is about three
+seconds, so one 429 killed the goal before the confirmation card was drawn. A user hit
+exactly that in a pre-demo run.
+
+**`max_retries=1` at `interpret_goal` stays, and that was measured, not reasoned.** Setting
+it to 0 — so that only one layer owned retry — took `scripts/verify_dates.py` from 3 passes
+in 3 runs to 3 in 6, and restoring it returned 3 in 3. The two layers do different jobs at
+different time scales and both are wanted. Gate 37 asserts it. Re-run `verify_dates.py`
+several times before touching it; **one run of an LLM gate proves nothing**.
+
+Gate: `scripts/verify_rate_limit.py` (37) — offline, no key, no network.
+
 ## v7 gates
 
 `verify_crossgoal.py` (gate 17) is the newest and the one to read first if you touch the
