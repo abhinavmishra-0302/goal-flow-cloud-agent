@@ -42,8 +42,13 @@ Change `CONTRACT.md` first when the protocol moves.
   startup `llm_routing` log line are the places to look. `OPENROUTER_REASONING_EFFORT`
   exists and ships OFF — read the comment in `config.py` before setting it, `low` was
   measured to break the output outright.
-- Each LLM call logs `llm_call site=... elapsed_ms=...`. Four run per goal creation:
-  `interpret`, `detect_constraints`, `soft_select`, `thought`.
+- Each LLM call logs `llm_call site=... elapsed_ms=...`. **THREE** run per goal creation:
+  `interpret`, `detect_constraints`, `soft_select`. (v11.2 removed a fourth, `thought`.
+  It ran TWICE per goal — LangGraph re-executes a node from the top when resuming from
+  `interrupt()` — for a sentence no surface has rendered since v9, and at `max_tokens=60`
+  on a reasoning model it mostly came back `finish_reason: length` and fell back to the
+  deterministic version anyway. Two wasted round trips inside the interpretation window,
+  and two more chances to draw a provider 429.)
 
 ## Architecture / key files
 
@@ -67,8 +72,14 @@ Change `CONTRACT.md` first when the protocol moves.
   `capabilities.domains[].id` values (the device routes on the EXACT string), coining
   a new slug only when none fit — there is NO `_canonical_domain()` normalizer (that
   was the pre-M4 keyword hack; removed). M7's device advertises `meal_plan`,
-  `guest_dinner`, `vacation_prep`, `birthday_party`. The meal-plan `time_window` is
-  pinned today..today+6 (the one remaining domain-specific carve-out in cloud code).
+  `guest_dinner`, `vacation_prep`, `birthday_party`.
+  **The dispatch `time_window` always STARTS at the device's today** (monitoring begins now,
+  for every goal); the END is the interpreter's, falling back to today+6 only when it gives
+  none or one at/before the start. There is NO meal-plan carve-out — this line used to claim
+  the meal window was "pinned today..today+6" and it is not, which sent a v11.2 bug hunt to
+  the wrong file. It matters: the interpreter reads "this week" as ending Sunday about half
+  the time, so a 7-day meal plan routinely runs under a 3-4 day window. The DEVICE reconciles
+  that (`ResolveLastDay` takes the later of window and plan), not the cloud.
 - `src/goalflow_cloud/models/contract.py` — Pydantic mirror of every wire message.
   `_ContractModel` uses `extra="allow"` so new nested device fields (e.g.
   `demo_events`, `updated_plan`) pass through without cloud changes.
@@ -89,6 +100,23 @@ Change `CONTRACT.md` first when the protocol moves.
   `append_constraints` (tighten-only, append-only). A pure statement routes to
   `capture_gate` — the same understanding wire with `capture_only: true`, no board card,
   ending in a `notice` of kind `captured`. Gate: `scripts/verify_capture.py`.
+- `src/goalflow_cloud/speech/` — **v11, the voice.** The understanding gate said out loud
+  via fish.audio. `graph/nodes.py:_understanding_speech()` composes the sentence
+  DETERMINISTICALLY (no LLM call — it sits at the end of the interpretation window v8
+  spent a milestone shortening); the hub sends a `speech` frame carrying a URL, and
+  synthesis happens when a UI GETs `/speech/<id>.mp3` — the hub's only HTTP route. So
+  nothing about the gate waits on fish.audio, and an unplayed utterance is never billed.
+  **This is the one feature here that fails SILENTLY**: no `FISH_API_KEY` ⇒ no frame ⇒
+  every surface renders exactly as it did in v10. That is deliberate and it is the
+  opposite of the LLM-only rule — read the package docstring before making a failure here
+  loud. Gate: `scripts/verify_speech.py` (31).
+  **`SPEECH_ENABLED=false` silences it while leaving the key in place** — the dev
+  switch, because iterating on the UI with a key set means the fridge talks on every
+  reload. The startup `speech_routing` line names WHICH reason it is quiet (no key vs
+  switched off), so a silent run is never a mystery.
+  **Autoplay is the UI's problem and it is real**: a browser refuses `audio.play()`
+  without a user gesture, so the chat UI degrades to a "Hear this" tap
+  (`goal-flow-agent-chat-ui/src/lib/speech.ts`). Do not "fix" that by assuming autoplay.
 - `src/goalflow_cloud/board.py` — **`BoardService`**, the Agent Board fold: it folds every
   goal's frames (`understanding`/`plan_ready`/`task_update`/`status`/`proposal`) into one
   `GoalSummary` per goal and broadcasts `board_snapshot`/`board_update`. Deterministic, no

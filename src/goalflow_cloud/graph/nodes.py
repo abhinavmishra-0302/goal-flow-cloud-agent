@@ -52,6 +52,7 @@ from goalflow_cloud.memory.store import (
     soft_candidates,
 )
 from goalflow_cloud.models.contract import Dispatch
+from goalflow_cloud.speech import cues as speech_cues
 
 logger = logging.getLogger(__name__)
 
@@ -434,6 +435,121 @@ def _constraint_display(kind: str, value: Any) -> str:
     return str(value).replace("_", " ")
 
 
+# ---------------------------------------------------------------------------
+# v11 — what the gate SAYS OUT LOUD
+# ---------------------------------------------------------------------------
+
+#: How many constraints get named aloud before the sentence starts summarising. Three
+#: is where a spoken list stops being a list and becomes an inventory; the card beside
+#: it shows all of them anyway, so the voice's job is to make the reader look at it,
+#: not to replace it.
+SPOKEN_CONSTRAINT_LIMIT = 3
+
+
+def _speak_date(iso: str) -> str:
+    """"2026-08-04" -> "August 4". An ISO date read aloud is a string of digits.
+
+    fish.audio's ``normalize`` turns "August 4" into "August fourth"; it does NOT
+    rescue "2026-08-04", which comes out as the numbers. Formatting here rather than
+    trusting the synthesiser is the difference between a date and a serial number.
+    """
+    try:
+        parsed = date.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return ""
+    # Not %-d: that is glibc-only, and this file is imported by gates that must run
+    # anywhere. int() drops the leading zero just as well.
+    return f"{parsed.strftime('%B')} {int(parsed.strftime('%d'))}"
+
+
+def _speak_list(items: list[str], limit: int = SPOKEN_CONSTRAINT_LIMIT) -> str:
+    """["a", "b", "c", "d", "e"] -> "a, b, c and 2 more". Oxford-free: this is speech.
+
+    ONE OVER THE LIMIT IS NAMED, not summarised. "a, b, c and 1 more" is longer than
+    "a, b, c and d" AND tells you less — the summary only earns its place once it is
+    standing in for more than one thing.
+    """
+    present = [item for item in items if item]
+    named = present[: limit + 1] if len(present) == limit + 1 else present[:limit]
+    remaining = len(present) - len(named)
+    if not named:
+        return ""
+    if remaining > 0:
+        return ", ".join(named) + f" and {remaining} more"
+    if len(named) == 1:
+        return named[0]
+    return ", ".join(named[:-1]) + f" and {named[-1]}"
+
+
+def _understanding_speech(understanding: dict[str, Any]) -> str:
+    """The understanding gate, as a spoken sentence. Deterministic — NO LLM CALL.
+
+    WHY NOT THE LLM. It is right there, it writes the `thought` one-liner two functions
+    down, and a model would phrase this more warmly than a template does. It still
+    costs a round trip at the exact moment v8 spent a whole milestone deleting round
+    trips from — the interpretation window is the slowest, least explicable wait in the
+    product, and this sits at the end of it. The material is already structured and
+    already display-ready; there is no interpretation left to do, only assembly.
+
+    WHAT IT SAYS, and why in this order: the read first (that is the thing being
+    confirmed), the rules second (they are what makes the read trustworthy), the
+    question last (it must be the most recent thing in the listener's ear when the
+    buttons are what answers it).
+
+    v11.1 — SHORTER, AND THE MEASUREMENT SAYS WHERE THE TIME WENT. v11.0 spoke the date
+    window and named every rule, and ran 15.0s. Timed against the same voice: naming all
+    four rules is 12.0s, naming only the safety-critical ones and counting the rest is
+    10.6s, and a bare count is 8.2s. So the NAMES are the cost, not the window — the
+    window went first and bought 3s, and the rest comes from naming only what can hurt
+    someone. A peanut allergy has to be audible to a listener whose eyes are elsewhere;
+    "no pork" is on the card, and the card is where the button is.
+    """
+    objective = str(understanding.get("objective") or "").strip().rstrip(".")
+
+    if understanding.get("capture_only"):
+        rules = _speak_list(
+            [
+                str(rule.get("label") or str(rule.get("kind") or "").replace("_", " ")).strip()
+                for rule in understanding.get("proposed_constraints") or []
+            ]
+        )
+        if not rules:
+            # A capture with nothing to capture should not have reached this gate, but
+            # a voice that says "you'd like me to remember ." is worse than silence.
+            return ""
+        return f"Got it. You'd like me to remember {rules}. Should I save that?"
+
+    if not objective:
+        return ""
+
+    rows = understanding.get("constraints") or []
+    safety, other = [], 0
+    for row in rows:
+        label = str(row.get("label") or "").strip()
+        if not label:
+            continue
+        if speech_cues._is_safety(str(row.get("kind") or ""), label):
+            safety.append(label)
+        else:
+            other += 1
+
+    held = speech_cues.speak_list(safety, limit=2)
+    if held and other:
+        rules = f" — holding the {held}, plus {other} more {'rule' if other == 1 else 'rules'}"
+    elif held:
+        rules = f" — holding the {held}"
+    elif other:
+        rules = f", holding {other} household {'rule' if other == 1 else 'rules'}"
+    else:
+        rules = ""
+
+    # v11.2 — NO SPOKEN QUESTION. It read as the fridge waiting for an answer it could
+    # not hear: there is no speech recognition on this surface, so "Shall I go ahead?"
+    # invites a reply into a microphone that is not listening, and the two buttons
+    # underneath are already asking. The voice states the read; the screen asks.
+    return f"Here's what I understood. {objective}{rules}."
+
+
 def _understanding_thought_fallback(intent: dict[str, Any], hard: dict[str, Any], domain: str) -> str:
     tw = intent.get("time_window") or {}
     # Counted off the resolved block rather than a fixed list of five keys, so a new
@@ -455,40 +571,33 @@ def _understanding_thought_fallback(intent: dict[str, Any], hard: dict[str, Any]
 
 
 def _understanding_thought(intent: dict[str, Any], hard: dict[str, Any], domain: str) -> str:
-    """Tiny LLM one-liner for the understanding gate, with a deterministic fallback."""
-    fallback = _understanding_thought_fallback(intent, hard, domain)
-    settings = get_settings()
-    max_tokens = settings.openrouter_max_tokens
-    thought_tokens = min(max_tokens, 60) if isinstance(max_tokens, int) and max_tokens > 0 else 60
-    try:
-        llm = build_chat(max_tokens=thought_tokens, timeout=15, max_retries=0, temperature=0.2)
-        with timed_llm("thought"):
-            response = llm.invoke(
-                [
-                    (
-                        "system",
-                        "Write one short sentence describing how GoalFlow will approach the user's goal. "
-                        "Keep it under 22 words. Do not mention internal systems or uncertainty.",
-                    ),
-                    (
-                        "human",
-                        "Objective: {objective}\nDomain: {domain}\nTime window: {time_window}\n"
-                        "Hard constraints: {hard}".format(
-                            objective=intent.get("objective", ""),
-                            domain=domain,
-                            time_window=intent.get("time_window") or {},
-                            hard=hard,
-                        ),
-                    ),
-                ]
-            )
-        thought = " ".join(str(getattr(response, "content", "") or "").split())
-        if len(thought) > 180:
-            thought = thought[:177].rstrip() + "..."
-        return thought if thought else fallback
-    except Exception:
-        logger.exception("understanding_thought_llm_failed")
-        return fallback
+    """The gate's one-liner. DETERMINISTIC since v11.2 — this used to be an LLM call.
+
+    IT WAS TWO LLM CALLS PER GOAL FOR A STRING NOBODY RENDERS, and all three parts of
+    that sentence are worth spelling out, because none of them is obvious from here:
+
+    1. NOBODY RENDERS IT. v9 stopped showing `thought` on the goal gate — the sentence
+       restated the heading, counted constraints the chips already showed, and promised
+       what the next screen would do. The chat UI now renders it ONLY when
+       `capture_only` is true, and the capture path builds its own text with
+       `_capture_thought()`, which is plain code. So this function's output has reached
+       no screen since v9. The board never read it either.
+    2. TWICE. LangGraph re-executes a node from the top when it resumes from
+       `interrupt()`, and the call sits above the interrupt in `present_understanding`.
+       Confirmed in every goal across two days of logs: `thought: 2`.
+    3. IT WAS ALREADY FALLING BACK. `max_tokens` was 60 on a REASONING model, where
+       reasoning tokens are billed against that same budget — so the response came back
+       `finish_reason: length` with empty or truncated content, and the deterministic
+       fallback below was what actually shipped. The LLM was paying for a sentence it
+       rarely got to write.
+
+    And it mattered beyond waste: two extra provider round trips per goal, inside the
+    interpretation window v8 spent a milestone shortening, are two more chances to draw
+    the 429 that was hanging the demo (see verify_no_hang.py, gate 33).
+
+    The wire field stays — the contract has it and a capture still uses it.
+    """
+    return _understanding_thought_fallback(intent, hard, domain)
 
 
 def _today(state: GraphState) -> date:
@@ -1199,6 +1308,9 @@ def capture_gate(state: GraphState) -> GraphState:
         "proposed_constraints": proposed,
         "thought": _capture_thought(proposed),
     }
+    # v11: composed from the finished dict, so it can never describe a read the card is
+    # not showing. See _understanding_speech.
+    understanding["speech"] = _understanding_speech(understanding)
     incoming = interrupt(
         {
             "kind": "understanding_confirmation",
@@ -1291,6 +1403,13 @@ def present_understanding(state: GraphState) -> GraphState:
         "proposed_constraints": state.get("proposed_constraints") or [],
         "thought": _understanding_thought(intent, hard, domain),
     }
+    # v11: what this gate says out loud. Composed from the finished dict — the voice
+    # and the card are then guaranteed to be reading the same thing, which is the whole
+    # point of a confirmation. Note it is deliberately NOT recomposed after a captured
+    # rule re-resolves the constraints below: the sentence was already spoken by then,
+    # and rewriting it would leave the utterance registry holding audio that no longer
+    # matches its text.
+    understanding["speech"] = _understanding_speech(understanding)
     incoming = interrupt(
         {
             "kind": "understanding_confirmation",

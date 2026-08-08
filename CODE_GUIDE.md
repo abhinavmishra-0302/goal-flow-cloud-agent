@@ -22,14 +22,19 @@ scripts/verify_constraints.py     # gate 15: constraints resolve per goal; the e
 scripts/verify_capture.py         # gate 16: a household rule is captured only when the user says yes
 scripts/verify_persistence.py     # gate 12: a goal survives a cloud restart at its gate
 scripts/verify_generic_gate.py    # gate 10: actionability is generic (needs an API key — the slow one)
+scripts/verify_speech.py          # gate 31: the voice says the right thing, and its absence costs nothing
+scripts/verify_no_hang.py         # gate 33: a dispatch is always answered — no goal hangs the UI
+scripts/e2e_two_goals.py          # NOT a gate: the real two-goal demo, headless (needs the whole stack)
 data/memory/family_profile.json   # household constraint store (sourced, scoped, expiring)
 src/goalflow_cloud/
-  config.py                       # Settings dataclass from env (OPENROUTER_*, WS_*, LOG_LEVEL)
+  config.py                       # Settings dataclass from env (OPENROUTER_*, FISH_*, WS_*, LOG_LEVEL)
   server.py                       # FastAPI WS hub: multi-session registry, routing, relays, graph driving, board pushes  ← start here
   board.py                        # BoardService: folds a goal's frames into one GoalSummary per goal (deterministic, no LLM)
   models/contract.py              # Pydantic mirror of every contract message (lenient extras)
   memory/store.py                 # constraint store: load, resolve per goal, append captures
   graph/nodes.py                  # the StateGraph: nodes, routers, interrupts, checkpointer
+  speech/client.py                # v11: the fish.audio TTS call (streamed; the ONE place we talk to it)
+  speech/utterances.py            # v11: id -> text/bytes, so a URL can never be a synthesis oracle
 ```
 
 ## The LangGraph StateGraph (`graph/nodes.py`)
@@ -77,7 +82,8 @@ run — the other two degrade to a deterministic fallback.
   `memory/store.py` (§ "Memory" below): `hard` is assembled by code only, `soft` is picked by a
   small relevance call with tag-matching as the fallback.
 - **`present_understanding`** — the **confirm-understanding gate**: second `interrupt()`.
-  Builds a short LLM-authored `thought` one-liner plus the `knew` hard-constraint chips
+  Builds a short DETERMINISTIC `thought` one-liner (LLM-authored until v11.2 — see
+  AGENTS.md) plus the `knew` hard-constraint chips
   and pauses (`kind: "understanding_confirmation"`) until the hub resumes it with the
   user's `understanding_response`. `route_after_understanding` sends a confirmed
   response to `build_contract`; a decline routes to `goal_declined`.

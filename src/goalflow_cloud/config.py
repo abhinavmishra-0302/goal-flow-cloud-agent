@@ -71,6 +71,64 @@ class Settings:
         default_factory=lambda: os.getenv("OPENROUTER_REASONING_EFFORT", "")
     )
 
+    # --- v11: the voice (fish.audio TTS) ---
+    #: The OFF SWITCH. `false`/`0`/`off`/`no` (any case) silences the voice while leaving
+    #: the key in place; anything else, including unset, leaves it on.
+    #:
+    #: v11.0 SHIPPED WITHOUT THIS AND ARGUED AGAINST IT — "the feature flag is the key,
+    #: a second switch only buys a state where the key is set and the voice is
+    #: mysteriously off". The argument was about MISCONFIGURATION and it was answering
+    #: the wrong question. Development is not misconfiguration: iterating on the UI with
+    #: a real key in `.env` meant the fridge talking on every reload, and the only way to
+    #: stop it was to comment out a credential and remember to put it back. A switch you
+    #: have to vandalise a secret to reach is not a switch.
+    #:
+    #: The original worry is answered by the LOG rather than by the absent flag: the
+    #: startup `speech_routing` line names WHICH reason the voice is off (no key vs
+    #: switched off), so "mysteriously" was always a logging problem.
+    speech_enabled: str = field(default_factory=lambda: os.getenv("SPEECH_ENABLED", ""))
+    #: The key. Empty = the cloud never sends a `speech` frame and every UI behaves
+    #: exactly as it did in v10.
+    #:
+    #: This is the ONE credential in this repo whose absence is not an error. Speech is
+    #: a decoration on a gate that is already complete and actionable without it, so a
+    #: missing key, an outage or a 429 must cost the demo nothing — the opposite of the
+    #: OPENROUTER_* settings above, which fail loudly on purpose.
+    fish_api_key: str = field(default_factory=lambda: os.getenv("FISH_API_KEY", ""))
+    fish_base_url: str = field(
+        default_factory=lambda: os.getenv("FISH_BASE_URL", "https://api.fish.audio")
+    )
+    #: s2.1-pro (production) | s2.1-pro-free | s2-pro | s1.
+    #: Sent as an HTTP HEADER, not a body field — see speech/client.py.
+    #:
+    #: DEFAULTS TO THE FREE TIER, and the reason is a trap worth knowing: fish.audio's
+    #: **API credit is a separate balance from platform credit**, so an account with
+    #: money on it still answers every paid model with `HTTP 402: Insufficient API
+    #: credit`. Measured on this account: s2.1-pro, s2-pro and s1 all 402; s2.1-pro-free
+    #: synthesized fine. The free tier ships no TTFA or DPA guarantee, and measured
+    #: TTFA was 324-397ms with the whole 13-second utterance in 4.6s — comfortably
+    #: inside a gate the user is already reading. Move to s2.1-pro by topping up API
+    #: credit at https://fish.audio/app/developers; nothing else changes.
+    fish_model: str = field(default_factory=lambda: os.getenv("FISH_MODEL", "s2.1-pro-free"))
+    #: A fish.audio voice model id. Empty = fish's default voice.
+    #:
+    #: The DEMO's voice is set in `.env.example` (an id, not a secret) rather than here,
+    #: so a run with no configuration at all still speaks — with fish's default — instead
+    #: of failing on a voice this account may not own. Measured cost of the chosen voice
+    #: over the default, same sentence: TTFA 373ms → 990ms, total 4.6s → 5.1s.
+    fish_reference_id: str = field(default_factory=lambda: os.getenv("FISH_REFERENCE_ID", ""))
+    #: wav | pcm | mp3 | opus. mp3 because every browser plays it from an <audio> src
+    #: with no decoding of our own.
+    fish_format: str = field(default_factory=lambda: os.getenv("FISH_FORMAT", "mp3"))
+    #: 64 | 128 | 192 kbps. 64 is transparent for speech and a third of the bytes.
+    fish_mp3_bitrate: int = field(
+        default_factory=lambda: int(os.getenv("FISH_MP3_BITRATE", "64"))
+    )
+    #: low | normal | balanced. `balanced` is the voice-agent setting; `normal` buys
+    #: quality with first-chunk latency, which is the wrong trade when someone is
+    #: waiting to be spoken to.
+    fish_latency: str = field(default_factory=lambda: os.getenv("FISH_LATENCY", "balanced"))
+
     # --- Household constraint store ---
     #: Where the household constraint store lives (v6). Empty = the repo's seed,
     #: `data/memory/family_profile.json`.
