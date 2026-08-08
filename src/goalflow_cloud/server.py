@@ -345,6 +345,45 @@ class ConnectionRegistry:
         self._leave_session(websocket, keep=device_id)
 
         session = self._session(device_id)
+
+        # v11.9 — ONE CHAT WEBVIEW PER HOME, and the older one is closed rather than
+        # tolerated.
+        #
+        # UI sockets are deliberately never evicted, and that rule is right: it exists
+        # because evicting by ROLE made any two ui clients (a board and a chat) fight
+        # each other in a mutual-eviction storm. Evicting the prior CHAT of the SAME
+        # device is a different thing entirely — two chat webviews for one home is never
+        # something anyone asked for. It is the same rule the device socket already has.
+        #
+        # THIS IS THE ACTUAL BUG, not the echo it produced. On a Hub the webview's
+        # lifetime belongs to native Bixby, and a previous one stays alive and bound; the
+        # log said `chat_surfaces=2` on every tap. v11.8 answered that by suppressing
+        # speech to all but the newest, which stopped the cloud sending audio twice and
+        # did nothing about a live second webview holding its own audio element. A stale
+        # surface is not made safe by being ignored — it has to be told it has been
+        # replaced.
+        #
+        # 1012 is the code the chat UI already understands: it does NOT reconnect on it
+        # (see lib/ws.ts), precisely so the newest socket owns the slot.
+        if surface == "chat":
+            stale = [
+                ws
+                for ws in session.uis
+                if ws is not websocket and (self._meta.get(ws) or ("", "", ""))[2] == "chat"
+            ]
+            for ws in stale:
+                logger.info(
+                    "VOICE surface-evicted device=%s   <-- an older chat webview was "
+                    "closed (1012) because a newer one bound",
+                    device_id,
+                )
+                session.uis.remove(ws)
+                self._meta.pop(ws, None)
+                try:
+                    await ws.close(code=1012, reason="replaced by a newer chat webview")
+                except Exception:  # noqa: BLE001 — a socket that is already gone is fine
+                    logger.debug("chat_surface_close_failed", exc_info=True)
+
         if websocket not in session.uis:
             session.uis.append(websocket)
         self._meta[websocket] = ("ui", device_id, surface)
@@ -483,10 +522,9 @@ class ConnectionRegistry:
             chats = [ws for ws in targets if (self._meta.get(ws) or ("", "", ""))[2] == "chat"]
             if len(chats) > 1:
                 logger.warning(
-                    "speech_fanout_suppressed device_id=%s chat_surfaces=%d — only the "
-                    "newest speaks; an older chat webview is still bound and would echo",
-                    device_id,
-                    len(chats),
+                    "VOICE echo-guard chat_surfaces=%d device=%s   <-- more than one chat "
+                    "webview is bound; only the newest is sent the audio",
+                    len(chats), device_id,
                 )
             targets = chats[-1:]
 
@@ -561,9 +599,9 @@ class ConnectionRegistry:
                 # repeats audio, this line is the first thing to grep for: present means
                 # something rebound; absent means the repeat came from the client.
                 logger.info(
-                    "speech_replayed goal=%s cue=%s frames=%d — a chat surface bound "
-                    "mid-phase and is being re-spoken to",
-                    goal_id, cue, len(frames),
+                    "VOICE replay cue=%s frames=%d goal=%s   <-- a surface rebound and "
+                    "is being re-spoken to",
+                    cue, len(frames), goal_id,
                 )
                 for frame in frames:
                     log_frame("out", "ui", frame)
@@ -1033,6 +1071,11 @@ async def emit_speech(device_id: str, goal_id: str, cue: str, text: str) -> None
         logger.debug("speech_frame_failed goal=%s cue=%s", goal_id, cue, exc_info=True)
         return
 
+    # The other half of the diagnosis. `VOICE send` is what the cloud decided to say;
+    # `VOICE fetch` is what a browser actually asked for. One send followed by one fetch
+    # per chunk is a healthy utterance; anything else is the bug, and which line repeats
+    # says whose bug it is.
+    logger.info("VOICE send cue=%s chunks=%d", cue, len(frames))
     for frame in frames:
         await registry.send_to_uis(device_id, frame)
         registry.capture_speech(device_id, goal_id, frame)
@@ -1104,7 +1147,14 @@ async def speech_audio(filename: str) -> Response:
             logger.warning("speech_warm_wait_timeout id=%s", utterance_id)
 
     if utterance.audio:
-        logger.info("speech_serve id=%s cached=1 bytes=%d", utterance_id, len(utterance.audio))
+        speech_serve_counts[utterance_id] = speech_serve_counts.get(utterance_id, 0) + 1
+        logger.info(
+            "VOICE fetch id=%s serves=%d bytes=%d%s",
+            utterance_id,
+            speech_serve_counts[utterance_id],
+            len(utterance.audio),
+            "   <-- FETCHED AGAIN" if speech_serve_counts[utterance_id] > 1 else "",
+        )
         return Response(content=utterance.audio, media_type=media_type)
 
     off = speech_off_reason()
@@ -1132,7 +1182,11 @@ async def speech_audio(filename: str) -> Response:
         # Cache only a COMPLETE synthesis. A truncated body cached here would be
         # replayed forever as a sentence that stops halfway.
         utterance.audio = b"".join(chunks)
-        logger.info("speech_serve id=%s cached=0 bytes=%d", utterance_id, len(utterance.audio))
+        speech_serve_counts[utterance_id] = speech_serve_counts.get(utterance_id, 0) + 1
+        logger.info(
+            "VOICE fetch id=%s serves=%d bytes=%d (first synthesis)",
+            utterance_id, speech_serve_counts[utterance_id], len(utterance.audio),
+        )
 
     return StreamingResponse(body(), media_type=media_type)
 
@@ -1640,6 +1694,16 @@ CROSS_GOAL_WAIT_S = 180.0
 #: goes down the wire (never after — the device can answer faster than we can arm) and
 #: fired by the status route when the re-planned goal reports back.
 crossgoal_waiters: dict[str, asyncio.Event] = {}
+
+#: utterance_id -> how many times a browser has FETCHED it.
+#:
+#: This counter is the diagnosis, not decoration. When a Hub reports "the voice repeated
+#: itself", exactly one question separates the two possible causes: did the client ask
+#: for the audio again? serves=2 means something called play() with that URL a second
+#: time — our bug. serves=1 with a repeat heard in the room means the audio never left
+#: the browser: the platform resumed a resource we left loaded — a device bug we work
+#: around. Nothing else in the log distinguishes those.
+speech_serve_counts: dict[str, int] = {}
 
 
 async def _close_when_saved(

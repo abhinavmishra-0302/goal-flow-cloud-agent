@@ -41,6 +41,10 @@ class FakeSocket:
     def __init__(self) -> None:
         self.sent: list[dict] = []
         self.client_state = None
+        self.closed: tuple[int, str] | None = None
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.closed = (code, reason)
 
     async def send_json(self, frame: dict) -> None:
         self.sent.append(frame)
@@ -72,20 +76,34 @@ async def run() -> None:
 
     await registry.send_to_uis(dev, SPEECH)
 
+    # v11.9 — the second chat bind EVICTS the first. This is the fix for the real bug:
+    # a Hub keeps the previous webview alive and bound, the log said chat_surfaces=2 on
+    # every tap, and a stale surface holding its own audio element is not made safe by
+    # being ignored. 1012 is the code the chat UI already understands as "you have been
+    # replaced" and deliberately does not reconnect from.
+    check(old_chat.closed is not None and old_chat.closed[0] == 1012,
+          f"binding a second chat webview must CLOSE the first with 1012 — got "
+          f"{old_chat.closed}")
+    check(old_chat not in registry._session(dev).uis,
+          "and drop it from the session, so nothing is routed to it at all")
+
     check(new_chat.types() == ["speech"],
           f"the NEWEST chat surface speaks — got {new_chat.types()}")
     check(old_chat.types() == [],
-          f"the older chat webview must stay silent, or the Hub echoes — got {old_chat.types()}")
+          f"the evicted webview receives nothing — got {old_chat.types()}")
     check(board.types() == [],
           f"a board surface has no business speaking — got {board.types()}")
 
-    # And the generosity must survive for everything else: this fix must not quietly
-    # turn into "only one surface gets frames", which would break the board mirror that
-    # ui-sockets-are-never-evicted exists to support.
+    # The eviction is narrow ON PURPOSE: same device, same `chat` surface. Ui sockets
+    # being un-evictable is a rule worth keeping — it exists because evicting by ROLE
+    # made a board and a chat fight each other — so a board in the same home must be
+    # untouched and must still receive everything.
+    check(board.closed is None, "a board surface is never evicted by a chat binding")
     await registry.send_to_uis(dev, PLAN)
-    for name, sock in (("old chat", old_chat), ("new chat", new_chat), ("board", board)):
-        check("present_plan" in sock.types(),
-              f"{name} must still receive non-speech frames — mirroring is a feature")
+    check("present_plan" in board.types(),
+          "the board still mirrors non-speech frames — that is the feature the "
+          "never-evict rule exists for")
+    check("present_plan" in new_chat.types(), "and so does the live chat")
 
     # A home with a board and no chat: speech has nowhere to go, and that is correct
     # rather than an error. It must not fall back to "send it to whoever is left".
