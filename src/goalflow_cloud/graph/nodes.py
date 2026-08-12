@@ -28,13 +28,15 @@ Key invariants:
 from __future__ import annotations
 
 import logging
+import random
 import sqlite3
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from operator import add
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, TypedDict, TypeVar
 from uuid import uuid4
 
 from langchain_openai import ChatOpenAI
@@ -55,6 +57,9 @@ from goalflow_cloud.models.contract import Dispatch
 from goalflow_cloud.speech import cues as speech_cues
 
 logger = logging.getLogger(__name__)
+
+#: Return type of the callable handed to ``invoke_llm``.
+_T = TypeVar("_T")
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +146,127 @@ def timed_llm(site: str):
         yield
     finally:
         logger.info("llm_call site=%s elapsed_ms=%d", site, (time.perf_counter() - started) * 1000)
+
+
+# ---------------------------------------------------------------------------
+# v12.2 — the cloud's 429 policy
+# ---------------------------------------------------------------------------
+#
+# THE BUG THIS FIXES. Every cloud LLM call ran on LangChain's own retry: one retry at
+# `interpret_goal`, and NONE at the other two. Its backoff is sub-second. The measured
+# recovery window on this provider is about THREE SECONDS (see the v11.2 work on the
+# device side), so a sub-second retry fires into the same closed window and a single 429
+# killed the goal before the confirmation card was ever drawn.
+#
+# The device already had this right — 6 retries at 2s, 4s, 8s. These numbers are copied
+# from it deliberately, so the two tiers fail the same way and one set of measurements
+# explains both.
+#
+# WHY A RATE LIMIT IS NOT A DROPPED SOCKET: a dropped socket is gone and retrying at once
+# is correct. A rate limit is a window that has not reopened yet, and retrying at once
+# spends the goal's remaining attempts inside the same shut window.
+
+#: Retries that a 429 gets on its own. It does NOT consume an ordinary attempt.
+RATE_LIMIT_RETRIES = 6
+RATE_LIMIT_BASE_S = 2.0
+RATE_LIMIT_MAX_S = 20.0
+
+
+def is_rate_limited(exc: BaseException) -> bool:
+    """Is this exception a 429?
+
+    Matched on TEXT, like the device's ``IsRateLimited``. The exception type depends on
+    which layer raised it — httpx, openai, or LangChain wrapping either — and pinning the
+    type is how a rate limit stops being recognised after a dependency bump.
+    """
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 429:
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return "429" in text or "too many requests" in text or "rate limit" in text or "rate-limit" in text
+
+
+def rate_limit_delay(attempt: int, exc: BaseException) -> float:
+    """Seconds to wait before retry ``attempt`` (1-based). Honours ``Retry-After``.
+
+    OpenRouter sends no ``Retry-After`` on this route — measured — so the exponential
+    curve is what actually runs. It is read anyway because a proxy in front of it may
+    send one, and a stated wait always beats a guessed one.
+    """
+    headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+    stated = headers.get("retry-after") or headers.get("Retry-After")
+    if stated:
+        try:
+            return min(float(stated), RATE_LIMIT_MAX_S)
+        except (TypeError, ValueError):
+            pass
+    backoff = min(RATE_LIMIT_BASE_S * (2 ** max(0, attempt - 1)), RATE_LIMIT_MAX_S)
+    # Jitter, because two goals rate-limited by the same window must not march back in
+    # step and re-close it together.
+    return backoff + random.uniform(0, 0.5)
+
+
+#: A dropped socket is not a shut window: retry it fast, and only twice.
+TRANSIENT_RETRIES = 2
+TRANSIENT_BASE_S = 0.4
+
+
+def is_transient(exc: BaseException) -> bool:
+    """A connection that broke, as opposed to a request that was refused.
+
+    Deliberately narrow. A 4xx, a bad key and an unparseable answer are NOT transient:
+    they do not get better by asking again, and the LLM-only rule is to fail loudly.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        word in text
+        for word in ("connection", "timeout", "timed out", "temporarily", "502", "503", "504")
+    )
+
+
+def invoke_llm(site: str, call: Callable[[], _T]) -> _T:
+    """Run one cloud LLM call, timed, with the retry policy above.
+
+    TWO counters, and they are separate on purpose — this is the v11.2 lesson from the
+    device, brought to the cloud. A rate limit used to spend an ordinary attempt, so a
+    429 storm exhausted the budget without the model ever seeing the request. Here a 429
+    is WAITED OUT and costs no transient attempt, and a dropped socket is retried fast
+    and costs no rate-limit attempt.
+
+    Everything else raises at once and becomes ``state["error"]``. A bad key and a broken
+    prompt do not improve if you ask six more times over a minute.
+    """
+    rate_limited = 0
+    transient = 0
+    while True:
+        try:
+            with timed_llm(site):
+                return call()
+        except Exception as exc:
+            if is_rate_limited(exc):
+                if rate_limited >= RATE_LIMIT_RETRIES:
+                    raise
+                rate_limited += 1
+                delay = rate_limit_delay(rate_limited, exc)
+                logger.warning(
+                    "llm_rate_limited site=%s attempt=%d/%d delay_ms=%d",
+                    site, rate_limited, RATE_LIMIT_RETRIES, int(delay * 1000),
+                )
+            elif is_transient(exc):
+                if transient >= TRANSIENT_RETRIES:
+                    raise
+                transient += 1
+                delay = TRANSIENT_BASE_S * transient
+                logger.warning(
+                    "llm_transient_retry site=%s attempt=%d/%d delay_ms=%d error=%s",
+                    site, transient, TRANSIENT_RETRIES, int(delay * 1000), type(exc).__name__,
+                )
+            else:
+                raise
+            # Blocking on purpose. Every graph node runs inside `asyncio.to_thread`
+            # (see server.handle_user_goal), so this holds one worker thread and the
+            # goal's own lock — never the hub's event loop.
+            time.sleep(delay)
 
 
 def describe_routing() -> str:
@@ -699,12 +825,27 @@ def interpret_goal(state: GraphState) -> GraphState:
     try:
         # max_tokens caps the RESERVATION: left unset OpenRouter reserves the model max
         # (~65k) and a low-credit key hits HTTP 402. Configurable via OPENROUTER_MAX_TOKENS.
+        # max_retries STAYS AT 1, AND THAT WAS MEASURED, NOT REASONED.
+        #
+        # v12.2 first set this to 0, on the argument that `invoke_llm` should be the only
+        # layer holding a retry policy — LangChain's own backoff is sub-second, which is
+        # the wrong order of magnitude for a rate limit by a factor of a thousand. The
+        # argument was clean and the conclusion was wrong. Gate 28 in the cloud
+        # (`scripts/verify_dates.py`, 16 live date resolutions) went from 3 passes in 3
+        # runs to 3 in 6 with the retry removed, and back to 3 in 3 when it was restored.
+        #
+        # The two layers do DIFFERENT jobs and both are wanted. This one absorbs a
+        # transport hiccup inside a single call, at millisecond scale. `invoke_llm` waits
+        # out a shut rate-limit window, at second scale. The cost of keeping both is one
+        # fast wasted attempt before the real wait begins, which is nothing.
+        #
+        # Do not "tidy" this to 0 again without re-running verify_dates several times.
+        # A single run of an LLM gate proves nothing in either direction.
         llm = build_chat(
             max_tokens=settings.openrouter_max_tokens, timeout=45, max_retries=1, temperature=0
         )
         structured_llm = llm.with_structured_output(InterpretedIntent, method="function_calling")
-        with timed_llm("interpret"):
-            intent = structured_llm.invoke(
+        intent = invoke_llm("interpret", lambda: structured_llm.invoke(
                 [
                     (
                         "system",
@@ -767,7 +908,7 @@ def interpret_goal(state: GraphState) -> GraphState:
                     ),
                     ("human", goal_text),
                 ]
-            )
+            ))
         if intent is None:
             # The model replied in free text instead of returning structured intent —
             # it treated the input as a question/chit-chat, not an actionable goal.
@@ -953,8 +1094,7 @@ def _relevant_soft_ids(
     try:
         llm = build_chat(max_tokens=selection_tokens, timeout=20, max_retries=0, temperature=0)
         structured_llm = llm.with_structured_output(_SoftSelection, method="function_calling")
-        with timed_llm("soft_select"):
-            selection = structured_llm.invoke(
+        selection = invoke_llm("soft_select", lambda: structured_llm.invoke(
                 [
                     (
                         "system",
@@ -983,7 +1123,7 @@ def _relevant_soft_ids(
                         ),
                     ),
                 ]
-            )
+            ))
         ids = [str(i) for i in (getattr(selection, "ids", None) or []) if str(i).strip()]
         known = {entry["id"] for entry in candidates}
         # Drop hallucinated ids rather than letting them silently select nothing —
@@ -1086,8 +1226,7 @@ def detect_constraints(state: GraphState) -> GraphState:
     try:
         llm = build_chat(max_tokens=capture_tokens, timeout=20, max_retries=0, temperature=0)
         structured_llm = llm.with_structured_output(_CaptureResult, method="function_calling")
-        with timed_llm("detect_constraints"):
-            result = structured_llm.invoke(
+        result = invoke_llm("detect_constraints", lambda: structured_llm.invoke(
                 [
                     (
                         "system",
@@ -1118,7 +1257,7 @@ def detect_constraints(state: GraphState) -> GraphState:
                     ),
                     ("human", goal_text),
                 ]
-            )
+            ))
         proposed = [c.model_dump(mode="json") for c in (getattr(result, "constraints", None) or [])]
         proposed = [c for c in proposed if _capture_is_sane(c)]
         proposed = _dedupe_captures(proposed)
