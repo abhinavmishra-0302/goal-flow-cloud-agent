@@ -1,156 +1,186 @@
 # goal-flow-cloud-agent
 
-Cloud agent for **GoalFlow v3** — a two-tier, **general goal-based agent** for the
-Samsung Family Hub. GoalFlow is not a meal app: meal planning and guest dinner prep
-are just *domains* riding the same domain-agnostic harness. The cloud tier owns
-**conversation + memory**, LLM-interprets the user's fuzzy goal into a **generic
-Task Contract**, drives an advanced **LangGraph StateGraph** (conditional edges,
-`interrupt()`-based HITL, checkpointer), dispatches to the on-device agent, and
-relays its live `agent_event` stream to the UI.
+The **cloud tier** of [GoalFlow](https://github.com/ashuksingh11/goal-flow-agents) — a two-tier,
+general goal-based agent for the Samsung Family Hub.
+
+GoalFlow is not a meal application. Meal planning and guest-dinner preparation are just *domains*
+riding the same domain-agnostic harness.
+
+This tier owns the **goal**: it interprets fuzzy text into a generic Task Contract, resolves
+household policy, drives a **LangGraph** state graph with durable human gates, dispatches to the
+on-device agent, and relays its live stream to the surfaces.
+
+**It is also the hub.** Every frame in the system routes through here.
+
+---
 
 ## Role in the system
 
 ```
-UI (tablet chat)  <--WS-->  CLOUD (this repo, hub)  <--WS-->  DEVICE agent (SK planner)
+Bixby · Chat UI · Board UI   <--WS-->   CLOUD (this repo)   <--WS-->   DEVICE agent
 ```
 
-- The cloud is the **WebSocket hub/server**. The UI and the device each open one
-  outbound WS to it and register a role via a `hello` frame.
-- **The UI and the device NEVER talk directly** — everything routes through here.
-- Cloud owns talk/memory/HITL; device owns local truth, the SK function-calling
-  planner, capability modules, and the deterministic Safety filter.
-- Two distinct gates — **"LLM plans, code checks"**:
-  - **Safety gate**: deterministic *code on the device*; enforces only
-    `constraints.hard`; *blocks*.
-  - **Approval gate**: the *user via the cloud* (a durable LangGraph
-    `interrupt()`); *waits*.
+- The cloud is the **WebSocket server**. Every other process opens **one** outbound socket to it
+  and registers with a `hello` frame.
+- **A surface and the device never talk directly.**
+- The cloud owns the goal; the device owns the plan, local truth and the actuators.
 
-The shared protocol is **`CONTRACT.md`** — see [`CONTRACT.md`](CONTRACT.md) (this file
-is the canonical copy; the UI and device repos mirror it as typed definitions). The
-protocol is **generic and domain-agnostic**: no meal-specific fields anywhere. A
-`domain` string (`"meal_plan"`, `"guest_dinner"`, ...) names the use case; domain
-specifics live in the device's capability modules plus the free-form
-`scope` / `context` objects.
+Two gates, and they are different in kind — **"LLM plans, code checks"**:
 
-## What the cloud does per goal
+| Gate | Where | Behaviour |
+|---|---|---|
+| **Safety** | Deterministic code, on the device | It **blocks**. It enforces `constraints.hard` and nothing else |
+| **Approval** | The user, through a durable LangGraph `interrupt()` | It **waits** |
 
-1. **Interprets** the natural-language goal via a real LLM structured-output call
-   (OpenRouter) into `{domain, objective, success_criteria, scope, time_window}` —
-   the time window computed **relative to real today**, never hardcoded.
-2. **Resolves the household constraint store** (`data/memory/family_profile.json`)
-   **for this goal**: every constraint carries its source, scope and expiry, and the
-   **hard** block is assembled by code — allergens/medical/dietary unioned across the
-   whole store (never narrowed), caps and windows picked per domain, so a vacation
-   goal carries a travel cap and an away window instead of the weekly grocery cap.
-   The LLM never generates, edits, or paraphrases the safety policy; its only say is
-   which **soft** preferences are relevant, and those only bias planning.
-3. **Presents its understanding and waits**: the confirm-understanding gate. The
-   graph parks at a durable `interrupt()` (`present_understanding`) and sends the
-   UI an `understanding` frame — a short LLM-authored summary plus the `knew`
-   hard-constraint chips. Nothing is dispatched to the device until the user's
-   `understanding_response` resumes it; a decline ends the goal (`goal_declined`)
-   before any planning happens.
-4. **Builds + validates** the generic `dispatch` Task Contract and sends it to the
-   device, which does the actual planning (SK auto function calling).
-5. **Relays the live stream**: the device's `agent_event` frames (thinking,
-   tool calls, plan progress) pass through to the UI untouched.
-6. **Presents the plan**: on `plan_ready`, resumes the graph, adds the
-   personalization `knew` block ("what it knew"), and sends `present_plan` to the UI.
-7. **Holds the HITL pause**: the graph parks at `interrupt()` with the tiered
-   proposals; the user's `approval` resumes it and is forwarded to the device.
-   Nothing firm executes until approval.
-8. **Monitors + adapts**: `status` / `proposal` frames relay to the UI and feed the
-   graph's monitor node; a material change re-enters the approval loop.
+The shared protocol is **[`CONTRACT.md`](CONTRACT.md)**, and **this is the canonical copy**. The
+surfaces and the device mirror it as typed definitions. It is generic: a `domain` string names
+the use case, and domain specifics live in the device's capability modules plus the free-form
+`scope` and `context` objects.
 
-## The Agent Board (the board fold)
+---
 
-Alongside the per-goal conversation and the family memory, the cloud runs a **third
-tier**: the **board fold** (`src/goalflow_cloud/board.py`, `BoardService`). Every
-other frame is about *one* goal; the board is the *session-level* view of *all* goals
-at once. The hub already sees every frame a goal produces, so `BoardService` folds
-each goal's frames (`understanding` / `dispatch` / `plan_ready` / `task_update` /
-`status` / `proposal`) into **one `GoalSummary` per goal**, and broadcasts a
-`board_snapshot` (every goal, on UI bind or `board_get`) plus a `board_update` (one
-changed goal) to the Agent Board UI. The fold is **deterministic — no LLM, no I/O** —
-so every number on a board card (`state`, `progress_pct`, `alerts`, `activity`,
-`next_step`) is *derived* here from something the device actually said, never guessed.
-See `CODE_GUIDE.md` § "The board fold" for the derivation rules.
+## What the cloud does, per goal
 
-**LLM-only, no fallbacks.** There is no scripted/mock planner behind the LLM call.
-If the LLM fails, the goal fails loudly with a structured error surfaced to the UI —
-it is never faked.
+1. **Interprets** the natural-language goal through a structured-output LLM call into
+   `{domain, objective, title, success_criteria, scope, time_window}`, with the window relative
+   to the day **the device is on** — never hardcoded, and never the hub machine's date.
+   It also returns an **actionability verdict**, judged against the capabilities the connected
+   device advertises rather than against a fixed list of topics.
+2. **Detects a stated household rule.** *"We've gone vegan"* is a statement, not a goal. It is
+   **proposed** for confirmation, never written on the model's say-so.
+3. **Resolves the household constraint store for this goal.** Every entry carries its source,
+   scope and expiry. The **hard** block is assembled **by code**: allergens, dietary and medical
+   rules unioned across the whole store and never narrowed by relevance; caps and windows picked
+   per domain. So a vacation goal carries a travel cap and an away window rather than the weekly
+   grocery cap. The model's only say is which **soft** preferences are relevant, and a soft
+   preference can never block anything.
+4. **Presents its understanding, and waits.** The graph parks at a durable `interrupt()`, and
+   the surface shows what it understood, which rules it will hold, and which preferences will
+   shape the plan. Nothing reaches the device until the user answers.
+5. **Builds and validates** the generic `dispatch` Task Contract and sends it to the device,
+   which does the actual planning.
+6. **Relays the live stream** — the device's `agent_event` frames pass through untouched.
+7. **Presents the plan** and **holds the approval pause**. Nothing firm executes before it.
+8. **Monitors and adapts.** A material change re-enters the approval loop.
 
-## How to run
+**LLM-only, no fallbacks.** There is no scripted planner behind the LLM call. A failure surfaces
+as a structured error. It is never faked.
 
-Requires Python 3.11+. For the **full three-service demo** (cloud + device + UI),
-follow `goal-flow-agents/docs/FINAL_DEMO.md` — the single source of truth for run
-commands. To run just the cloud hub:
+---
+
+## The board fold
+
+Alongside the per-goal graph and the household memory, the cloud runs a third tier: the **board
+fold** (`board.py`).
+
+Every other frame is about *one* goal. The board is the session-level view of *all* of them. The
+hub already sees every frame a goal produces, so it folds them into **one `GoalSummary` per
+goal** and broadcasts a snapshot on bind and a delta on change.
+
+> **The fold is deterministic — no LLM, no I/O.** Every number on a board card is *derived* here
+> from something the device actually said, never guessed.
+
+---
+
+## Run it
+
+Requires Python 3.11 or later.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
-cp .env.example .env          # set OPENROUTER_API_KEY (required — LLM-only)
-./run.sh                      # canonical launcher: uvicorn on 0.0.0.0:8000, loads .env
+cp .env.example .env          # set OPENROUTER_API_KEY — required, LLM-only
+./run.sh                      # uvicorn on 0.0.0.0:8000, loads .env
 ```
 
-Or directly:
-
-```bash
-uvicorn goalflow_cloud.server:app --host 0.0.0.0 --port 8000
-```
-
-Connect clients to `ws://localhost:8000/ws`. The first frame must be one of:
+Clients connect to `ws://localhost:8000/ws`, and the first frame must be a `hello`:
 
 ```json
-{ "type": "hello", "role": "ui" }
+{ "type": "hello", "role": "ui",     "surface": "board" }
+{ "type": "hello", "role": "device", "device_id": "9f3c…" }
 ```
 
-```json
-{ "type": "hello", "role": "device" }
-```
-
-Sanity-check the graph without the hub (runs interpret → memory → contract and
-prints the dispatched Task Contract for any goal text):
+Sanity-check the graph without the hub — it runs interpret, memory and contract, then prints the
+dispatched Task Contract for any goal text:
 
 ```bash
 python scripts/run_graph_demo.py "we've got 6 people over Saturday for dinner - sort it"
 ```
 
-## Environment variables
+**For the full five-process demonstration**, follow
+[`goal-flow-agents/docs/FINAL_DEMO.md`](https://github.com/ashuksingh11/goal-flow-agents/blob/master/docs/FINAL_DEMO.md)
+— the single source of truth for run commands.
 
-| Variable              | Default                        | Notes                                        |
-|-----------------------|--------------------------------|----------------------------------------------|
-| `OPENROUTER_API_KEY`  | —                              | **Required** — goal interpretation is LLM-only |
-| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint                   |
-| `OPENROUTER_MODEL`    | `openai/gpt-oss-120b`          | Any OpenRouter model id                      |
-| `WS_HOST`             | `0.0.0.0`                      |                                              |
-| `WS_PORT`             | `8000`                         |                                              |
-| `LOG_LEVEL`           | `INFO`                         | Structured, correlation-id-tagged logging    |
+### Environment
 
-## Repo layout
+| Variable | Default | Notes |
+|---|---|---|
+| `OPENROUTER_API_KEY` | — | **Required.** Interpretation is LLM-only |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | An OpenAI-compatible endpoint |
+| `OPENROUTER_MODEL` | `openai/gpt-oss-120b` | The `:free` variants are throttled and unusable |
+| `OPENROUTER_PROVIDER_ORDER` | — | **Pin it.** See below |
+| `OPENROUTER_PROVIDER_ALLOW_FALLBACKS` | — | `false`, deliberately |
+| `GOALFLOW_PROFILE_PATH` | — | Point the constraint store at a scratch copy |
+| `FISH_API_KEY` | — | Text to speech. Absent means the voice is simply never sent |
+| `SPEECH_ENABLED` | `true` | Silence the voice while leaving the key in place |
+| `WS_HOST` / `WS_PORT` | `0.0.0.0` / `8000` | |
+| `LOG_LEVEL` | `INFO` | Structured, correlation-id tagged |
+
+> **Pinning the provider is the whole difference.** Unpinned, OpenRouter load-balances this model
+> across nineteen endpoints spanning 39 times in throughput and lands on the slow ones —
+> interpretation measured **19.7 s unpinned against 2.3 s pinned**. Fallbacks are off because the
+> next-best provider measured 203 to 234 s on the real pipeline, *slower than sending no
+> preference at all*: a fallback here is a stall, not a degrade.
+
+---
+
+## Layout
 
 ```
-CONTRACT.md                     # canonical wire protocol (generic)
-scripts/run_graph_demo.py       # run the graph on a goal, print the contract
-scripts/verify_board.py         # gate 13: the board fold's numbers are derived and add up
-scripts/verify_mirrors.py       # gate 14: the contract mirrors have not drifted
-scripts/verify_constraints.py   # gate 15: constraints resolve per goal; the enforced set is never narrowed
-scripts/verify_capture.py       # gate 16: a household rule is captured only when the user says yes
-scripts/verify_speech.py        # gate 31: the voice says the right thing, and its absence costs nothing
-scripts/verify_no_hang.py       # gate 33: a dispatch is always answered — no goal hangs the UI
-scripts/e2e_two_goals.py        # NOT a gate: drives the real two-goal demo headlessly (needs the stack up)
+CONTRACT.md                       # THE canonical wire protocol
+data/memory/family_profile.json   # the household constraint store — one entry per fact
 src/goalflow_cloud/
-  config.py                     # env-backed settings (OPENROUTER_*, FISH_*, WS_*, LOG_LEVEL)
-  server.py                     # FastAPI WS hub: multi-session registry, routing, relays, graph driving, board pushes
-  board.py                      # BoardService: folds every goal's frames into one GoalSummary (deterministic, no LLM)
-  models/contract.py            # Pydantic mirror of every contract message
-  graph/nodes.py                # the LangGraph StateGraph: nodes, routers, interrupts
-  memory/store.py               # constraint store loader + per-goal resolution
-  speech/                       # v11: fish.audio TTS client + the utterance registry behind /speech/<id>.mp3
-data/memory/family_profile.json # household constraint store (sourced, scoped, expiring)
+  server.py                       # the WS hub: sessions, routing, the create bracket, speech
+  graph/nodes.py                  # the StateGraph: nodes, routers, four interrupts, retries
+  board.py                        # BoardService — the deterministic fold
+  models/contract.py              # the Pydantic mirror of every frame
+  memory/store.py                 # load, resolve per goal, append captures
+  config.py                       # env-backed settings
+  speech/                         # the cues, the client, and the utterance registry
+scripts/verify_*.py               # the gates — one script each
+scripts/e2e_two_goals.py          # NOT a gate: the real two-goal demo, headless
 run.sh
 ```
 
-See [`CODE_GUIDE.md`](CODE_GUIDE.md) for the code walkthrough. The system-level design — the
-two-tier split, the harness, the constraint model, the surfaces — lives in
-`../goal-flow-agents/docs/DESIGN.md`.
+---
+
+## Verify
+
+There is no test framework here, by choice. The gates are scripts that pin observable behaviour.
+
+```bash
+python scripts/verify_mirrors.py       # gate 14 — no mirror or allowlist has drifted
+python scripts/verify_constraints.py   # gate 15 — resolution per goal
+python scripts/verify_crossgoal.py     # gate 17 — the only path that changes a plan without asking
+```
+
+Everything except gates 10 and 12 runs with **no API key**. Gate 28's interpreter half needs one
+and **skips** without it, rather than passing — a gate that cannot run must not be able to pass.
+
+> **A gate you have not broken is a gate you do not trust.** Reintroduce the bug, watch it fail,
+> restore.
+
+---
+
+## Read more
+
+| Document | What it is |
+|---|---|
+| [`CONTRACT.md`](CONTRACT.md) | The canonical protocol. Change it **first** |
+| [`AGENTS.md`](AGENTS.md) | The coding-session guide: the run sheet, the traps, the conventions |
+| [`CODE_GUIDE.md`](CODE_GUIDE.md) | The code walkthrough |
+
+The system-level explanation lives in the GoalFlow wiki —
+[04 — The cloud graph](https://github.com/ashuksingh11/goal-flow-agents/blob/master/wiki/04-cloud-graph.md),
+[03 — The wire](https://github.com/ashuksingh11/goal-flow-agents/blob/master/wiki/03-the-wire.md),
+[05 — Constraints](https://github.com/ashuksingh11/goal-flow-agents/blob/master/wiki/05-constraints.md).
