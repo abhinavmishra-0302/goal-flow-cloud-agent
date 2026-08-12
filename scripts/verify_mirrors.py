@@ -99,6 +99,48 @@ UIS = [
 ]
 
 
+#: How many of each thing CONTRACT.md must still yield, as a FLOOR.
+#:
+#: WHY THIS EXISTS, and it was found by falsifying this gate rather than by reasoning.
+#: Every check below is driven by what the four parsers read OUT of CONTRACT.md, so a
+#: change that stops a parser matching removes work SILENTLY: the gate keeps reporting
+#: PASS while checking less. Demonstrated — rewriting the canonical
+#: `"event": "phase" | "thinking" | ...` line as prose took the agent_event check from
+#: seven kinds to ZERO, and the gate still passed. Nothing anywhere would have said so.
+#:
+#: A FLOOR, not an equality, because the two failure directions are not the same:
+#:
+#:   * GROWTH is the normal case. Every contract change to date has been additive, so a
+#:     new frame type or enum value must not need this file edited to be accepted.
+#:   * SHRINKAGE is a breaking change by the contract's own compatibility rules, and it
+#:     is exactly what this cannot be allowed to miss. Lowering a number here is then a
+#:     deliberate edit in the same commit — which is the decision being MADE rather than
+#:     drifted into.
+#:
+#: So: bump these when something is legitimately removed, and never to make a red gate
+#: green.
+CONTRACT_FLOORS: dict[str, int] = {
+    "frame types": 25,
+    "agent_event kinds": 7,
+    "control commands": 5,
+    "task states": 11,
+}
+
+
+def check_contract_floors(failures: list[str], parsed: dict[str, set[str]]) -> None:
+    """Every parser must still find what it found last time. See CONTRACT_FLOORS."""
+    for label, floor in CONTRACT_FLOORS.items():
+        found = len(parsed[label])
+        if found >= floor:
+            continue
+        failures.append(
+            f"CONTRACT.md now yields only {found} {label} (expected at least {floor}) — "
+            f"a parser stopped matching, so this gate is checking LESS than it was. "
+            f"Restore the canonical formatting, or lower the floor in CONTRACT_FLOORS "
+            f"in the same commit that removes them."
+        )
+
+
 def contract_types() -> set[str]:
     """Every frame `type` the canonical file defines, from its JSON examples."""
     return set(re.findall(r'"type"\s*:\s*"([a-z_]+)"', CONTRACT.read_text()))
@@ -181,7 +223,23 @@ def main() -> int:
     failures: list[str] = []
     types = contract_types()
     kinds = contract_event_kinds()
-    print(f"  CONTRACT.md defines {len(types)} frame types, {len(kinds)} agent_event kinds")
+    # Parsed ONCE and threaded through. It used to be re-read per mirror, which made the
+    # floor check below easy to apply to one call site and miss at another.
+    commands = contract_control_commands()
+    states = contract_task_states()
+    print(
+        f"  CONTRACT.md defines {len(types)} frame types, {len(kinds)} agent_event kinds, "
+        f"{len(commands)} control commands, {len(states)} task states"
+    )
+    check_contract_floors(
+        failures,
+        {
+            "frame types": types,
+            "agent_event kinds": kinds,
+            "control commands": commands,
+            "task states": states,
+        },
+    )
 
     # --- Python ---
     py = PY_MIRROR.read_text()
@@ -191,7 +249,7 @@ def main() -> int:
     for k in sorted(kinds):
         if f'"{k}"' not in py:
             failures.append(f"python AgentEventKind is missing {k!r} — frames WILL be dropped at validation")
-    for c in sorted(contract_control_commands()):
+    for c in sorted(commands):
         if f'"{c}"' not in py:
             failures.append(
                 f"python Control.command Literal is missing {c!r} — the cloud cannot SEND this frame"
@@ -205,7 +263,7 @@ def main() -> int:
     for k in sorted(kinds):
         if f'"{k}"' not in cs:
             failures.append(f"C# is missing agent_event kind {k!r}")
-    for c in sorted(contract_control_commands()):
+    for c in sorted(commands):
         if f'"{c}"' not in cs:
             failures.append(f"C# ControlCommands is missing {c!r} — the device cannot ACT on this frame")
 

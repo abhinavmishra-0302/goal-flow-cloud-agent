@@ -1015,9 +1015,16 @@ awaiting_approval -> executing -> monitoring -> adapting -> done
 3. Run `python scripts/verify_mirrors.py`.
 4. Keep it **additive**. A new field is optional; an unknown value is ignored.
 
-> **Gate 14 parses this file.** It reads every frame type out of the JSON examples, the
-> `agent_event` kinds and the `control.command` values out of their alternation lines, and the
-> `task_update.state` list out of its fenced block. **Deleting an example or reformatting one of
-> those lines silently removes something from the checked set** — the gate keeps passing while
-> checking less. If you restructure, re-run the gate and confirm the counts it prints are the
-> ones you expect.
+> **Gate 14 parses this file**, so its FORMATTING is load-bearing. It reads:
+>
+> - every frame type out of the `"type": "…"` JSON examples;
+> - the `agent_event` kinds and the `control.command` values out of their **alternation lines**;
+> - the `task_update.state` list out of the fenced block after *"`state` is one of"*.
+>
+> **Deleting an example, or rewriting one of those lines as prose, removes something from the
+> checked set.** The gate now refuses to let that happen quietly: it prints all four counts and
+> **fails if any falls below the floor pinned in `CONTRACT_FLOORS`**.
+>
+> Growth is unaffected — an additive change raises a count and needs no edit there. A **removal**
+> is a breaking change by the rules above, so lowering a floor is a deliberate edit in the same
+> commit. **Never lower one to make a red gate green.**
