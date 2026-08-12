@@ -17,10 +17,10 @@ in the protocol or in any code path here.
 `AGENTS.md` (session guide, gotchas).
 
 **The system-level explanation** lives in the wiki:
-[04 — The cloud graph](https://github.com/ashuksingh11/goal-flow-agents/blob/master/wiki/04-cloud-graph.md) ·
-[03 — The wire](https://github.com/ashuksingh11/goal-flow-agents/blob/master/wiki/03-the-wire.md) ·
-[05 — Constraints](https://github.com/ashuksingh11/goal-flow-agents/blob/master/wiki/05-constraints.md) ·
-[02 — The goal lifecycle](https://github.com/ashuksingh11/goal-flow-agents/blob/master/wiki/02-goal-lifecycle.md).
+04 — The cloud graph (`../goal-flow-agents/wiki/04-cloud-graph.md`) ·
+03 — The wire (`../goal-flow-agents/wiki/03-the-wire.md`) ·
+05 — Constraints (`../goal-flow-agents/wiki/05-constraints.md`) ·
+02 — The goal lifecycle (`../goal-flow-agents/wiki/02-goal-lifecycle.md`).
 This guide is the code walkthrough; the wiki is the map.
 
 ---

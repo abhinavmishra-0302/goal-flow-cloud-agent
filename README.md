@@ -1,6 +1,6 @@
 # goal-flow-cloud-agent
 
-The **cloud tier** of [GoalFlow](https://github.com/ashuksingh11/goal-flow-agents) — a two-tier,
+The **cloud tier** of GoalFlow — a two-tier,
 general goal-based agent for the Samsung Family Hub.
 
 GoalFlow is not a meal application. Meal planning and guest-dinner preparation are just *domains*
@@ -108,7 +108,7 @@ python scripts/run_graph_demo.py "we've got 6 people over Saturday for dinner - 
 ```
 
 **For the full five-process demonstration**, follow
-[`goal-flow-agents/docs/FINAL_DEMO.md`](https://github.com/ashuksingh11/goal-flow-agents/blob/master/docs/FINAL_DEMO.md)
+`../goal-flow-agents/docs/FINAL_DEMO.md`
 — the single source of truth for run commands.
 
 ### Environment
@@ -181,6 +181,6 @@ and **skips** without it, rather than passing — a gate that cannot run must no
 | [`CODE_GUIDE.md`](CODE_GUIDE.md) | The code walkthrough |
 
 The system-level explanation lives in the GoalFlow wiki —
-[04 — The cloud graph](https://github.com/ashuksingh11/goal-flow-agents/blob/master/wiki/04-cloud-graph.md),
-[03 — The wire](https://github.com/ashuksingh11/goal-flow-agents/blob/master/wiki/03-the-wire.md),
-[05 — Constraints](https://github.com/ashuksingh11/goal-flow-agents/blob/master/wiki/05-constraints.md).
+04 — The cloud graph (`../goal-flow-agents/wiki/04-cloud-graph.md`),
+03 — The wire (`../goal-flow-agents/wiki/03-the-wire.md`),
+05 — Constraints (`../goal-flow-agents/wiki/05-constraints.md`).
