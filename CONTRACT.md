@@ -198,7 +198,7 @@ sequenceDiagram
 ```
 
 ```json
-{ "type": "hello", "role": "device", "device_id": "9f3c...", "device_name": "ashu@boxA" }
+{ "type": "hello", "role": "device", "device_id": "9f3c...", "device_name": "Kitchen Hub" }
 ```
 
 | Field | Who | Meaning |
@@ -234,8 +234,8 @@ because there is not exactly one device — and again whenever the connected set
 {
   "type": "devices",
   "devices": [
-    { "device_id": "9f3c...", "device_name": "ashu@boxA", "online": true },
-    { "device_id": "1a7d...", "device_name": "bob@boxB",  "online": true }
+    { "device_id": "9f3c...", "device_name": "Kitchen Hub", "online": true },
+    { "device_id": "1a7d...", "device_name": "Garage Hub", "online": true }
   ]
 }
 ```

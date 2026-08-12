@@ -17,7 +17,7 @@ other**.
 > `models/contract.py`, three `types/contract.ts` files and `Contracts/*.cs` in the device.
 > **Change `CONTRACT.md` first** when the protocol moves, then every mirror in one pass.
 
-Siblings, all under `~/ashu/git/`:
+Siblings, cloned alongside this one:
 
 | Repo | Role |
 |---|---|
