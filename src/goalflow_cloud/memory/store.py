@@ -109,10 +109,10 @@ def profile_path(path: Path | None = None) -> Path:
         resolved = Path(configured) if configured else DEFAULT_PROFILE_PATH
 
     if not resolved.is_absolute():
-        resolved = Path(__file__).resolve().parents[3] / resolved
+        resolved = Path.cwd() / resolved
 
     if not resolved.exists():
-        seed = Path(__file__).resolve().parents[3] / DEFAULT_PROFILE_PATH
+        seed = Path.cwd() / DEFAULT_PROFILE_PATH
         if resolved == seed:
             return resolved
         resolved.parent.mkdir(parents=True, exist_ok=True)
